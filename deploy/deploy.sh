@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Update Kintara Market on the Droplet to the latest code, then restart.
+# Update KinScan on the Droplet to the latest code, then restart.
 # Run as root on the Droplet:   bash /opt/kintara/deploy/deploy.sh
 # (If you push code with rsync instead of git, just rsync over /opt/kintara/ first,
 #  then run this — it'll skip the git pull and reinstall deps + restart.)

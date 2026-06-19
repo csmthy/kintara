@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Kintara Market Desk — arbitrage + history tracker.
+KinScan — Kintara arbitrage + history tracker.
 
 Two currencies trade on the Kintara marketplace:
   * KINS / token  -> priced in USD (priceUsd), highly liquid
@@ -1860,12 +1860,57 @@ def poll_loop(interval):
 # ---------------------------------------------------------------------------
 
 def make_app():
-    from flask import Flask, jsonify, request, Response
+    from flask import Flask, jsonify, request, Response, send_file
     app = Flask(__name__)
+
+    def _serve_cached_icon(item_type, status_on_error=502):
+        """Serve real Kintara HUD art from the same disk cache used by /icon/<item>."""
+        rel = icon_asset(item_type)
+        if not rel:
+            return Response(status=404)
+        ext = rel.rsplit(".", 1)[-1]
+        os.makedirs(ICON_DIR, exist_ok=True)
+        fp = os.path.join(ICON_DIR, f"{item_type}.{ext}")
+        if not os.path.exists(fp):
+            try:
+                import requests
+                r = requests.get(f"https://kintara.gg/assets/hud/{rel}",
+                                 headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
+                r.raise_for_status()
+                with open(fp, "wb") as f:
+                    f.write(r.content)
+            except Exception:
+                return Response(status=status_on_error)
+        return send_file(os.path.abspath(fp),
+                         mimetype="image/svg+xml" if ext == "svg" else f"image/{ext}",
+                         max_age=604800)
 
     @app.route("/")
     def index():
         return Response(INDEX_HTML, mimetype="text/html")
+
+    @app.route("/favicon.ico")
+    @app.route("/favicon.png")
+    @app.route("/apple-touch-icon.png")
+    def favicon():
+        return _serve_cached_icon("gold")
+
+    @app.route("/site.webmanifest")
+    def webmanifest():
+        return Response(json.dumps({
+            "name": "KinScan",
+            "short_name": "KinScan",
+            "description": "Kintara market intelligence for KINS, gold, listings, sales, and live world data.",
+            "start_url": "/",
+            "scope": "/",
+            "display": "standalone",
+            "background_color": "#0a0f1a",
+            "theme_color": "#0a0f1a",
+            "icons": [
+                {"src": "/favicon.png", "sizes": "any", "type": "image/png"},
+                {"src": "/apple-touch-icon.png", "sizes": "180x180", "type": "image/png"}
+            ]
+        }), mimetype="application/manifest+json")
 
     @app.route("/api/status")
     def status():
@@ -2127,26 +2172,7 @@ def make_app():
     def icon(item_type):
         """Real in-game item art, lazily downloaded from kintara and cached on
         disk so we only fetch each icon once. 404 -> frontend uses a fallback."""
-        from flask import send_file, Response
-        rel = icon_asset(item_type)
-        if not rel:
-            return Response(status=404)
-        ext = rel.rsplit(".", 1)[-1]
-        os.makedirs(ICON_DIR, exist_ok=True)
-        fp = os.path.join(ICON_DIR, f"{item_type}.{ext}")
-        if not os.path.exists(fp):
-            try:
-                import requests
-                r = requests.get(f"https://kintara.gg/assets/hud/{rel}",
-                                 headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
-                r.raise_for_status()
-                with open(fp, "wb") as f:
-                    f.write(r.content)
-            except Exception:
-                return Response(status=502)
-        return send_file(os.path.abspath(fp),
-                         mimetype="image/svg+xml" if ext == "svg" else f"image/{ext}",
-                         max_age=604800)
+        return _serve_cached_icon(item_type)
 
     @app.route("/worldmap.jpg")
     def worldmap():
@@ -2677,7 +2703,22 @@ def make_app():
 INDEX_HTML = r"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Kintara Market</title>
+<title>KinScan · Kintara Market Intelligence</title>
+<meta name="description" content="KinScan tracks Kintara marketplace prices, KINS/gold arbitrage, completed sales, merchant data, property ownership, and live world activity.">
+<meta name="application-name" content="KinScan">
+<meta name="theme-color" content="#0a0f1a">
+<meta property="og:site_name" content="KinScan">
+<meta property="og:title" content="KinScan · Kintara Market Intelligence">
+<meta property="og:description" content="Kintara market intelligence for KINS, gold, listings, sales, and live world data.">
+<meta property="og:type" content="website">
+<meta property="og:image" content="/favicon.png">
+<meta name="twitter:card" content="summary">
+<meta name="twitter:title" content="KinScan · Kintara Market Intelligence">
+<meta name="twitter:description" content="Kintara market intelligence for KINS, gold, listings, sales, and live world data.">
+<link rel="icon" type="image/png" href="/favicon.png">
+<link rel="shortcut icon" href="/favicon.ico">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Cinzel:wght@600;700;800&family=Fredoka:wght@400;500;600;700&display=swap');
 :root{
@@ -2700,11 +2741,17 @@ header{border-bottom:1px solid var(--line);
   background:linear-gradient(180deg,rgba(25,38,58,.5),transparent)}
 .hdr{display:flex;align-items:center;gap:16px;flex-wrap:wrap;
   max-width:1320px;margin:0 auto;padding:16px 28px}
+.brand{display:flex;align-items:center;gap:12px;margin-right:2px}
+.brand-mark{width:38px;height:38px;border-radius:11px;padding:5px;
+  background:linear-gradient(180deg,rgba(246,214,138,.20),rgba(232,181,74,.05));
+  border:1px solid rgba(232,181,74,.42);box-shadow:0 10px 26px rgba(0,0,0,.35)}
+.brand-copy{display:flex;flex-direction:column;gap:1px}
 h1{margin:0;font-family:'Cinzel',serif;font-weight:800;font-size:22px;letter-spacing:.08em;
   text-transform:uppercase;
   background:linear-gradient(180deg,#fbe9b6,#e8b54a 60%,#c98a2e);-webkit-background-clip:text;
   background-clip:text;color:transparent}
 h1 b{color:var(--gold)}
+.brand-sub{font:700 9.5px var(--mono);letter-spacing:.15em;text-transform:uppercase;color:var(--mut)}
 .meta{font:12px/1.4 var(--mono);color:var(--mut)}
 .dot{display:inline-block;width:7px;height:7px;border-radius:50%;background:var(--buy);
   box-shadow:0 0 8px var(--buy);margin-right:6px}
@@ -3183,7 +3230,13 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
 </style></head>
 <body>
 <header><div class="hdr">
-  <h1>Kintara Market</h1>
+  <div class="brand">
+    <img class="brand-mark" src="/favicon.png" alt="" width="38" height="38">
+    <div class="brand-copy">
+      <h1>KinScan</h1>
+      <div class="brand-sub">Kintara market intelligence</div>
+    </div>
+  </div>
   <div class="meta" id="status">connecting…</div>
   <span class="live-upd"><i class="d"></i><span id="upd">live</span></span>
   <button class="kbtn" id="cmdkBtn" data-tip="Search items, sellers &amp; tabs">🔍 Search <kbd>⌘K</kbd></button>
@@ -4795,7 +4848,7 @@ setInterval(loadStatus,6000); setInterval(loadServers,30000); setInterval(loadKi
 
 
 def main():
-    ap = argparse.ArgumentParser(description="Kintara Market Desk")
+    ap = argparse.ArgumentParser(description="KinScan")
     ap.add_argument("--interval", type=int, default=POLL_INTERVAL,
                     help=f"listing poll seconds (default {POLL_INTERVAL}; env POLL_INTERVAL)")
     ap.add_argument("--port", type=int, default=_envi("PORT", 8765),

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# One-time DigitalOcean Droplet bootstrap for Kintara Market.
+# One-time DigitalOcean Droplet bootstrap for KinScan.
 # Run as root on the Droplet:   bash setup.sh <git-repo-url>
 # (or, if you copied the code up with rsync instead of git, run:  bash setup.sh)
 set -euo pipefail

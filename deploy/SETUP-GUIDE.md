@@ -1,4 +1,4 @@
-# Kintara Market — laptop → live website with your domain (foolproof guide)
+# KinScan — laptop → live website with your domain (foolproof guide)
 
 You'll do three things: (1) put the code on GitHub, (2) set it up on your DigitalOcean
 Droplet, (3) point your domain at it with HTTPS. Copy/paste the commands exactly,
@@ -42,7 +42,7 @@ Lines you run **on your Mac** vs **on the Droplet (after SSH)** are labeled.
    git init
    git branch -M main
    git add .
-   git commit -m "Kintara Market"
+   git commit -m "KinScan"
    gh repo create kintara --public --source=. --remote=origin --push
    ```
    (Public so the Droplet can pull it with no extra login. Nothing secret is in the repo,

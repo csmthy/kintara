@@ -1,8 +1,8 @@
-# Kintara Market
+# KinScan
 
-A self-hosted tracker + arbitrage scanner + price-history desk for the **Kintara**
-MMO marketplace (kintara.gg). One Python file, one SQLite DB, a single-page web
-dashboard. Runs locally; you open it in a browser.
+KinScan is a self-hosted tracker + arbitrage scanner + price-history desk for the
+**Kintara** MMO marketplace (kintara.gg). One Python file, one SQLite DB, a
+single-page web dashboard. Runs locally or as a hosted site.
 
 > **For the AI assistant / future maintainer:** This README is the source of truth
 > for "what is this project and where is everything." Keep it current. **Whenever you
@@ -190,6 +190,9 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
 ## API routes
 
 - `GET /` — the dashboard (single HTML page).
+- `GET /favicon.ico`, `/favicon.png`, `/apple-touch-icon.png`, `/site.webmanifest` — site
+  identity assets for the hosted KinScan brand. The favicon/apple icon use the real
+  Kintara gold HUD icon through the same disk cache as `/icon/gold`.
 - `GET /api/status` — poller state, tracking-since, row count.
 - `GET /api/items` — distinct item types, categories, **labels** map, gold_item.
 - `GET/POST /api/settings` — get/set `gold_item`.
@@ -287,7 +290,9 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
 ## Frontend tabs (all in `INDEX_HTML`)
 
 Game-styled aesthetic site-wide (navy gradient, gold **Cinzel** headings, **Fredoka**
-body, gold pill tabs, rounded panels). Header reads **"Kintara Market"**.
+body, gold pill tabs, rounded panels). Public branding is **KinScan** with a Kintara
+gold-icon brand mark, browser title/description metadata, favicon/apple icon, and web
+manifest for a more polished hosted-site shell.
 
 1. **Arbitrage** (landing) — per-item table: `items/$` (green; shows `$X.XX` per item for
    items >$1 each), `per gold` (gold), **kins/gold** ($KINS to assemble 1 gold's worth, green when
@@ -470,6 +475,11 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Public branding pass:** renamed the hosted/site-facing brand from **Kintara Market**
+  to **KinScan** in the browser title and header; added a gold-icon brand mark, favicon
+  routes (`/favicon.ico`, `/favicon.png`, `/apple-touch-icon.png`), OpenGraph/Twitter
+  description metadata, theme color, and `/site.webmanifest`. The icon uses the real
+  Kintara `gold` HUD asset via the existing icon cache.
 - **Hosting-ready + 24/7 politeness:** added `Dockerfile`, `requirements.txt`, `.dockerignore`,
   `.gitignore`, and `DEPLOY.md` (DigitalOcean Droplet / Fly.io / Railway / Oracle-free-VM walkthroughs;
   Vercel/serverless explained as unsuitable). For the chosen **DigitalOcean Droplet** path there's a

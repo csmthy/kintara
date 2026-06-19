@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Add a domain + automatic HTTPS in front of Kintara Market, using Caddy.
+# Add a domain + automatic HTTPS in front of KinScan, using Caddy.
 # Run as root on the Droplet AFTER your domain's DNS A-records point at this Droplet:
 #     bash /opt/kintara/deploy/setup-domain.sh yourdomain.com
 # Caddy then listens on 80/443, auto-obtains a free Let's Encrypt certificate, and

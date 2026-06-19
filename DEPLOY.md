@@ -1,4 +1,4 @@
-# Deploying Kintara Market (24/7)
+# Deploying KinScan (24/7)
 
 This app is **stateful and always-on**: one long-running process serves the dashboard
 *and* runs the background pollers that build `kintara.db`. That rules out serverless
