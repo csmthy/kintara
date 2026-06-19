@@ -484,6 +484,9 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Merchant calculator color pass:** in the Merchant tab's profit summary, **Gold value (sell)**
+  is now gold-tinted and **Craft cost (buy)** is neutral white, leaving green/red reserved for the
+  actual profit and margin signal.
 - **Merchant campaign metal update:** the Merchant page now follows the current game code/API split:
   donation progress uses five resources from `/api/world/merchant-campaign` (`wood`, `stone`, `coal`,
   `cooked_fish_meat`, `metal`) via new `MERCHANT_CAMPAIGN_RESOURCES`, while the cost calculator remains

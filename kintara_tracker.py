@@ -2926,6 +2926,8 @@ td.isd{cursor:help}
 .spread-box.neg{border-color:rgba(240,106,106,.4);background:rgba(240,106,106,.06)}
 .spread-box .k{color:var(--mut);font:12px var(--ui)}
 .spread-box .v{text-align:right;font:700 15px var(--mono)}
+.spread-box .v.gold{color:var(--gold2)}
+.spread-box .v.plain{color:var(--ink)}
 .spread-box .v.pos{color:var(--buy)}.spread-box .v.neg{color:var(--sell)}
 .mintctl{display:flex;align-items:center;gap:9px;margin:2px 0 14px;color:var(--mut);font:13px var(--ui)}
 .mintctl input{width:96px}
@@ -4523,8 +4525,8 @@ function renderMerchant(){
     <div style="display:flex;justify-content:space-between;color:var(--mut);font:12px var(--mono);margin-top:7px">
       <span>avg ${fmtU(avg)}/gold</span><span>${eff>1?`${eff}th gold costs ${fmtU(marginal)}`:''}</span></div>
     <div class="spread-box ${pos?'pos':'neg'}">
-      <span class="k">Gold value (sell ${eff})</span><span class="v">${rateN==null?'—':fmtU(rateN)}</span>
-      <span class="k">Craft cost (buy)</span><span class="v">${craftN==null?'—':fmtU(craftN)}</span>
+      <span class="k">Gold value (sell ${eff})</span><span class="v gold">${rateN==null?'—':fmtU(rateN)}</span>
+      <span class="k">Craft cost (buy)</span><span class="v plain">${craftN==null?'—':fmtU(craftN)}</span>
       <span class="k">Profit</span><span class="v ${pos?'pos':'neg'}">${spreadN==null?'—':(pos?'+':'')+fmtU(spreadN)}</span>
       <span class="k">Margin</span><span class="v ${pos?'pos':'neg'}">${marginPct==null?'—':(marginPct>=0?'+':'')+marginPct.toFixed(1)+'%'}</span>
     </div>`}
