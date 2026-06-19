@@ -17,6 +17,8 @@ echo "==> updating deps"
 
 echo "==> fixing ownership + restarting"
 chown -R kintara:kintara "$CODE" /opt/kintara-data
+cp "$CODE/deploy/kintara.service" /etc/systemd/system/kintara.service
+systemctl daemon-reload
 systemctl restart kintara
 sleep 2
 systemctl --no-pager --full status kintara | head -n 5
