@@ -1,0 +1,17 @@
+# local runtime data — never commit; the hosted instance builds its own on the volume
+kintara.db
+kintara.db-wal
+kintara.db-shm
+*.db
+*.db-wal
+*.db-shm
+icons_cache/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# os / editor
+.DS_Store

@@ -1,0 +1,26 @@
+[Unit]
+Description=Kintara Market tracker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=kintara
+Group=kintara
+# code lives in /opt/kintara; the DB + icon cache live in /opt/kintara-data
+# (separate so a code update never touches your data)
+WorkingDirectory=/opt/kintara-data
+Environment=KINTARA_DB=/opt/kintara-data/kintara.db
+Environment=KINTARA_HOST=0.0.0.0
+# the app listens on 8765; Caddy (added with your domain) fronts it on 80/443 for HTTPS.
+# Before the domain step you can reach it directly at http://<DROPLET_IP>:8765 to verify.
+Environment=PORT=8765
+# 24/7 politeness (tweak if you ever see 403/429 in the logs)
+Environment=POLL_INTERVAL=90
+Environment=KINTARA_MIN_GAP=0.5
+ExecStart=/opt/kintara/venv/bin/python /opt/kintara/kintara_tracker.py --no-browser
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

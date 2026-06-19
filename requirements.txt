@@ -1,0 +1,6 @@
+flask>=3.0
+requests>=2.31
+websockets>=11.0
+# pillow is only needed to (re)generate the realm map PNGs via render_maps.py;
+# the PNGs are committed, so it is NOT required at runtime. Install separately if
+# you ever want to rebuild MapImages/:  pip install pillow

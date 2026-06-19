@@ -1,0 +1,16 @@
+# keep the image small + never bake local data into it
+kintara.db
+*.db
+*.db-wal
+*.db-shm
+icons_cache/
+__pycache__/
+*.pyc
+.venv/
+venv/
+.git/
+.gitignore
+.DS_Store
+render_maps.py
+DEPLOY.md
+README.md
