@@ -68,8 +68,18 @@ non-root `kintara` user under systemd, auto-restart + start-on-boot, bound to po
    ```
 3. It prints the URL. **Open `http://<DROPLET_IP>/` in any browser — that's your site.**
 
-### Updating later (one command)
-SSH in and run:
+### Updating later from your Mac (one command)
+After editing files locally, run:
+```bash
+bash deploy/publish.sh "what changed"
+```
+This commits local changes, pushes `main` to GitHub, SSHes into the Droplet, runs the
+server deploy script, and returns you to your Mac. It defaults to
+`root@159.203.132.20`; override with `KINSCAN_DEPLOY_HOST=root@<ip>` if the Droplet
+changes.
+
+### Updating later on the Droplet
+If you're already SSH'd into the Droplet, run:
 ```bash
 bash /opt/kintara/deploy/deploy.sh      # git pull (or your rsync) + deps + restart; data untouched
 ```

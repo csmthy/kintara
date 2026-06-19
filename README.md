@@ -42,6 +42,12 @@ Ships a `Dockerfile`, `requirements.txt`, `.dockerignore`. Run as the single
 `python kintara_tracker.py` process — **not** gunicorn (the loops are threads in `main()`;
 forking workers would multiply the pollers).
 
+**Publishing updates:** from the Mac repo, run `bash deploy/publish.sh "what changed"`.
+It stages/commits local changes, pushes `main`, SSHes to the DigitalOcean Droplet, and
+runs `/opt/kintara/deploy/deploy.sh` there. If there are no local changes, the same
+script can be run without a message to re-run the server deploy. Override the target
+with `KINSCAN_DEPLOY_HOST=root@<ip>` if the Droplet changes.
+
 Artifacts created in the working dir (or `KINTARA_DB`'s dir): `kintara.db` (SQLite, WAL
 mode) and `icons_cache/` (downloaded item art). Both are safe to delete; they rebuild.
 `world_map.jpg` ships alongside the script (the isometric world map, served at
@@ -483,6 +489,8 @@ sees the latest state at a glance.
   also pre-mark `/opt/kintara` as a Git safe directory before pulling, because the repo
   is intentionally handed from root to the non-root `kintara` service user, and `deploy.sh`
   reinstalls the systemd unit before restart so service metadata changes go live too.
+  Added `deploy/publish.sh`, a Mac-side one-command publish wrapper: commit local changes,
+  push `main`, SSH to the Droplet, run the server deploy, and return.
 - **Hosting-ready + 24/7 politeness:** added `Dockerfile`, `requirements.txt`, `.dockerignore`,
   `.gitignore`, and `DEPLOY.md` (DigitalOcean Droplet / Fly.io / Railway / Oracle-free-VM walkthroughs;
   Vercel/serverless explained as unsuitable). For the chosen **DigitalOcean Droplet** path there's a

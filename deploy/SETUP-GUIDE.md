@@ -115,14 +115,15 @@ first load can take ~30 seconds while the certificate is issued. Done! 🎉
 **On your Mac**, from the project folder:
 ```bash
 cd /Users/connorsmith/Desktop/kintara
-git add .
-git commit -m "what you changed"
-git push
+bash deploy/publish.sh "what you changed"
 ```
-**Then on the Droplet:**
+
+That one command commits your changes, pushes them to GitHub, SSHes into the Droplet,
+runs `/opt/kintara/deploy/deploy.sh`, restarts the service, and returns you to your Mac.
+If there are no local code changes and you only want to re-run the server deploy:
+
 ```bash
-ssh root@DROPLET_IP
-bash /opt/kintara/deploy/deploy.sh
+bash deploy/publish.sh
 ```
 The code updates and the service restarts; your collected data (`kintara.db`) is untouched.
 
