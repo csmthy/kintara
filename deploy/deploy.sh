@@ -8,6 +8,7 @@ CODE=/opt/kintara
 
 if [ -d "$CODE/.git" ]; then
   echo "==> git pull"
+  git config --global --add safe.directory "$CODE" || true
   git -C "$CODE" pull
 fi
 

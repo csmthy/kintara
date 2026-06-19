@@ -479,7 +479,9 @@ sees the latest state at a glance.
   to **KinScan** in the browser title and header; added a gold-icon brand mark, favicon
   routes (`/favicon.ico`, `/favicon.png`, `/apple-touch-icon.png`), OpenGraph/Twitter
   description metadata, theme color, and `/site.webmanifest`. The icon uses the real
-  Kintara `gold` HUD asset via the existing icon cache.
+  Kintara `gold` HUD asset via the existing icon cache. DigitalOcean deploy scripts now
+  also pre-mark `/opt/kintara` as a Git safe directory before pulling, because the repo
+  is intentionally handed from root to the non-root `kintara` service user.
 - **Hosting-ready + 24/7 politeness:** added `Dockerfile`, `requirements.txt`, `.dockerignore`,
   `.gitignore`, and `DEPLOY.md` (DigitalOcean Droplet / Fly.io / Railway / Oracle-free-VM walkthroughs;
   Vercel/serverless explained as unsuitable). For the chosen **DigitalOcean Droplet** path there's a

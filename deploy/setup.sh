@@ -18,6 +18,7 @@ mkdir -p "$DATA"
 
 echo "==> fetching code into $CODE"
 if [ -n "$REPO" ]; then
+  git config --global --add safe.directory "$CODE" || true
   if [ -d "$CODE/.git" ]; then git -C "$CODE" pull; else git clone "$REPO" "$CODE"; fi
 elif [ ! -d "$CODE" ]; then
   echo "!! No repo URL given and $CODE doesn't exist."
