@@ -277,10 +277,11 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   outfit), `connected`, `err`. Opens the socket on first hit, keeps it warm while polled.
 - `GET /api/live-search?q=<name>` — find a player by name **across all 12 servers**. Opens (and keeps
   warm) a spectate socket on every shard and returns current name matches as `results[]`
-  (`{shard, id, name, realm, level}`, exact-name matches first), plus `ready` = how many shards have a
-  populated roster yet. Rosters fill over ~20s after a socket opens, so the client polls this until
-  `ready == 12` or a match is found; the extra sockets idle-close ~75s after the search stops. **Be
-  gentle** — this fans out to all 12 read-fanout sockets, so it's an on-demand action, not polled.
+  (`{shard, id, name, realm, level}`, exact-name matches first), plus `connected` = how many shard
+  sockets are open and `ready` = how many shards have a populated roster yet. Rosters fill over ~20s
+  after a socket opens, so the client polls this quickly (~750ms) until `ready == 12` or a match is
+  found; the extra sockets idle-close ~75s after the search stops. **Be gentle** — this fans out to
+  all 12 read-fanout sockets, so it's an on-demand action, not polled.
 - `GET /api/property` — every mansion/house/trailer: owner, lock state, real map
   coordinates, plus a marketplace cross-reference (the owner's live listing count + total
   ask USD) and how many properties that owner holds.
@@ -469,7 +470,9 @@ A site-wide quality-of-life pass that sits under every tab:
 - **Live World** shows players in the spectator's *area of interest* (near the world hub),
   not all `onlineTotal` players — the game only streams nearby avatars to a spectator. The
   count is global; the radar/roster is the visible crowd. Switching shards opens a fresh
-  socket. If `websockets` isn't installed, the tab shows a one-line install hint.
+  socket. If `websockets` isn't installed, the tab shows a one-line install hint. The
+  WebSocket connector supports both old `websockets.connect(extra_headers=...)` and newer
+  `websockets.connect(additional_headers=...)` APIs.
 - **Merchant data** comes from kintara.gg's own `/api/world/merchant-campaign` (public, no
   auth). If the game rebalances the gold-trade recipe, update `MERCHANT_RECIPE` (its values
   live in `game.js`'s `MERCHANT_TRADE_COST`). If the donation campaign resources change, update
@@ -484,6 +487,11 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Live World search compatibility + speed:** fixed DigitalOcean/new-`websockets` failures where
+  `extra_headers` leaked into `BaseEventLoop.create_connection()` by selecting `additional_headers`
+  when the installed package expects it. `/api/live-search` now also reports `connected` socket count,
+  and the manual all-server search polls every ~750ms instead of ~1.8s so matches appear sooner while
+  the 12 shard rosters warm.
 - **Merchant calculator color pass:** in the Merchant tab's profit summary, **Gold value (sell)**
   is now gold-tinted and **Craft cost (buy)** is neutral white, leaving green/red reserved for the
   actual profit and margin signal.

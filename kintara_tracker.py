@@ -1310,9 +1310,15 @@ class SpectateHub:
             return
         url = SPECTATE_WS.format(shard=shard)
         try:
+            # websockets renamed `extra_headers` -> `additional_headers` in newer
+            # releases. DigitalOcean may install either, so select the supported
+            # spelling instead of letting kwargs leak into BaseEventLoop.
+            import inspect
+            headers = {"User-Agent": BROWSER_UA, "Origin": "https://kintara.gg"}
+            params = inspect.signature(websockets.connect).parameters
+            header_kw = "additional_headers" if "additional_headers" in params else "extra_headers"
             async with websockets.connect(
-                    url, extra_headers={"User-Agent": BROWSER_UA,
-                                        "Origin": "https://kintara.gg"},
+                    url, **{header_kw: headers},
                     open_timeout=15, max_size=2 ** 21, ping_interval=None) as ws:
                 await ws.send("ping")
                 with self.lock:
@@ -2629,15 +2635,17 @@ def make_app():
         """Find a player by name across ALL servers. Opens (and keeps warm) a spectate
         socket on every shard and returns the current name matches with the shard they're
         on. Rosters fill over ~20s after a socket opens, so the client polls this a few
-        times; `ready` = how many shards have a populated roster yet, so it knows when the
-        sweep is complete. The extra sockets idle-close ~75s after the search stops."""
+        times; `ready` = how many shards have a populated roster and `connected` = how
+        many sockets are open. The extra sockets idle-close ~75s after the search stops."""
         q = (request.args.get("q") or "").strip().lower()
         if not q:
             return jsonify({"ok": False, "error": "name required"})
-        results, ready = [], 0
+        results, ready, connected = [], 0, 0
         for shard in SHARDS:
             _spectate_hub.request(shard)          # ensure open + keep warm
             snap = _spectate_hub.snapshot(shard)
+            if snap.get("connected"):
+                connected += 1
             players = snap.get("players") or []
             if players:
                 ready += 1
@@ -2649,7 +2657,8 @@ def make_app():
         # exact matches first, then by shard
         results.sort(key=lambda r: (r["name"].lower() != q, r["shard"]))
         return jsonify({"ok": True, "q": q, "results": results,
-                        "shards": list(SHARDS), "ready": ready})
+                        "shards": list(SHARDS), "ready": ready,
+                        "connected": connected})
 
     @app.route("/api/property")
     def property_map():
@@ -4654,9 +4663,11 @@ async function searchAllServers(){
       catch(e){ break; }
       if(d&&d.ok&&d.results&&d.results.length){ found=d.results[0]; break; }
       const ready=d?d.ready:0, total=(d&&d.shards)?d.shards.length:12;
-      setStatus(`searching… swept ${ready}/${total} servers`);
+      const conn=d&&d.connected!=null?d.connected:null;
+      setStatus(conn==null?`searching… swept ${ready}/${total} servers`:
+        `searching… connected ${conn}/${total}, swept ${ready}/${total}`);
       if(ready>=total) break;                // all populated, no match → stop early
-      await new Promise(r=>setTimeout(r,1800));
+      await new Promise(r=>setTimeout(r,750));
     }
   } finally { state.liveSearchBusy=false; }
   if(found){
