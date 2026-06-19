@@ -110,18 +110,31 @@ KINTARAGOLD_URL = "https://kintaragold.xyz/"
 SERVERS_URL = "https://kintara.gg/api/servers"
 # kintara.gg's own traveling-merchant campaign state (public, no auth — the game
 # client reads it the same way via its read-fanout origin). Returns
-# {ok, mode, wood, stone, coal, cooked_fish_meat, goals:{...}, complete,
+# {ok, mode, wood, stone, coal, cooked_fish_meat, metal, goals:{...}, complete,
 #  goldTradeEnabled, goldStock, goldStockFull}.
 MERCHANT_URL = "https://kintara.gg/api/world/merchant-campaign"
-# Traveling-merchant gold-mint recipe = resources consumed per 1 gold minted,
-# taken from kintara.gg's own game.js (`MERCHANT_TRADE_COST`). The donation goals
-# are these same four resources; this also drives the cost calculator.
+# Traveling-merchant donation campaign resources, from kintara.gg game.js
+# (`MERCHANT_CAMPAIGN_GOALS`) and the live `/api/world/merchant-campaign` payload.
+# The server can override goal quantities in the payload; this tuple controls order
+# and labels for the progress tracker.
+# (key, label)
+MERCHANT_CAMPAIGN_RESOURCES = (
+    ("wood", "Wood"),
+    ("stone", "Stone"),
+    ("coal", "Coal"),
+    ("cooked_fish_meat", "Cooked Fish"),
+    ("metal", "Metal"),
+)
+# Traveling-merchant gold-trade recipe = resources consumed per 1 gold minted,
+# taken from kintara.gg's own game.js (`MERCHANT_TRADE_COST`). This is separate
+# from the donation goals; the donation drive now also includes metal, while the
+# current gold-trade recipe does not.
 # (key, label, qty per 1 gold)
 MERCHANT_RECIPE = (
     ("wood", "Wood", 2500),
     ("stone", "Stone", 1500),
     ("coal", "Coal", 700),
-    ("cooked_fish_meat", "Fish", 30),
+    ("cooked_fish_meat", "Cooked Fish", 30),
 )
 # Public live-spectator WebSocket (the game's own read-fanout host). Per shard,
 # plain JSON, no auth. Streams {t:"snap", region, onlineTotal, players:[{id,name,
@@ -2557,7 +2570,7 @@ def make_app():
         # per-resource progress (current vs goal, %). The official endpoint gives no
         # overall %, so we average the per-resource (capped) percentages.
         resources, pcts = [], []
-        for key, label, _qty in MERCHANT_RECIPE:
+        for key, label in MERCHANT_CAMPAIGN_RESOURCES:
             cur = raw.get(key)
             goal = goals.get(key)
             pct = (min(100.0, cur / goal * 100) if (cur is not None and goal) else None)
@@ -4500,7 +4513,7 @@ function renderMerchant(){
     </div>`; }).join("");
   const calc=`<section class="mpanel calc">
     <div class="mhead"><div class="mtitle" style="font-size:20px">Cost Calculator</div></div>
-    <div class="msub">Buy the resources the merchant wants on the open market, mint gold, sell at the live gold price. Cost walks the order book — bigger mints pay up as the cheap listings run out.</div>
+    <div class="msub">When gold trading is active, buy the trade recipe on the open market, mint gold, then compare against the live gold price. Cost walks the order book — bigger mints pay up as the cheap listings run out.</div>
     <div class="mintctl"><span>Mint</span>
       <input type="number" min="1" id="mintQty" value="${want}"> <span>gold${capped?` · <span style="color:var(--sell)">capped to ${eff} by liquidity</span>`:''}</span></div>
     ${!canCalc?`<div class="msub" style="color:var(--sell)">Not enough market liquidity (or gold price) to price a mint right now.</div>`:`
@@ -4515,7 +4528,7 @@ function renderMerchant(){
       <span class="k">Profit</span><span class="v ${pos?'pos':'neg'}">${spreadN==null?'—':(pos?'+':'')+fmtU(spreadN)}</span>
       <span class="k">Margin</span><span class="v ${pos?'pos':'neg'}">${marginPct==null?'—':(marginPct>=0?'+':'')+marginPct.toFixed(1)+'%'}</span>
     </div>`}
-    <div class="msub" style="margin-top:12px;font-size:12px">Gold price = our live rate (avg of the 3 cheapest per-gold asks). Resource cost = actually buying that many units cheapest-first across all live listings (gold listings converted at the gold rate); listed liquidity supports ~${maxMint.toLocaleString()} gold.</div>
+    <div class="msub" style="margin-top:12px;font-size:12px">Gold price = our live rate (avg of the 3 cheapest per-gold asks). Trade recipe = current game.js MERCHANT_TRADE_COST. Resource cost = actually buying that many units cheapest-first across all live listings (gold listings converted at the gold rate); listed liquidity supports ~${maxMint.toLocaleString()} gold.</div>
   </section>`;
   $("#view").innerHTML=`<div class="mwrap">${track}${calc}</div>`;
   const q=$("#mintQty");

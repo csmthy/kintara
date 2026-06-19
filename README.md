@@ -120,8 +120,8 @@ publicly exposed** (no kintara.gg supply/index API; game.js has no edition/suppl
 | **Gold USD price history (fallback)** | (ripped from `kintaragold.xyz` HTML) | The page embeds `"history":[{t,price}]` + `"spotPriceUsd"` in its RSC payload (escaped, can straddle chunk boundaries — we regex the `t`/`price` pairs). Independent gold-USD series (~10-min, ~25 days), NOT derived from KINS. `fetch_kintara_gold_history()`, cached ~3 min. Used **only to backfill the stretch before our own `gold_price` data begins** (see `gold_series_for_chart()`) and as the gold-rate fallback when no live gold listings exist. |
 | **KINS/USD price history** | `GET api.geckoterminal.com/api/v2/networks/solana/pools/<POOL>/ohlcv/<tf>?aggregate=&limit=&currency=usd&token=base` | Pool `F42tZnKPavq1VUcrL6ymhc6YqVpt84fWwgzbNTv2wb3W` (KINS/SOL on pumpswap). `currency=usd` already converts SOL→USD (no separate SOL feed needed). Valid aggregates: minute 1/5/15, hour 1/4/12, day 1. **Rate-limits if hammered** — we cache (see below). |
 | **Server list** | `GET kintara.gg/api/servers` | `{ok, servers:[{id, name, populationLabel, full, queueLength, minLevel}]}`. Live population + queue per game server. Drives the top status bar. `fetch_servers()`, cached ~30s (last-good on failure). |
-| **Traveling-merchant state** | `GET kintara.gg/api/world/merchant-campaign` | kintara.gg's **own** public endpoint (no auth; the game client reads it the same way via `KINTARA_READ_FANOUT_ORIGIN`, also reachable at `ktra-server-b.onrender.com`). Returns `{ok, mode, wood, stone, coal, cooked_fish_meat, goals:{...}, complete, goldTradeEnabled, goldStock, goldStockFull}`. **No overall %** — we compute it as the mean of the per-resource (capped) percentages. `fetch_merchant()`, cached ~60s (last-good on failure). |
-| **Merchant gold-mint recipe** | (from `kintara.gg/game.js` `MERCHANT_TRADE_COST`) | `MERCHANT_RECIPE` = resources consumed per 1 gold minted: 2500 wood + 1500 stone + 700 coal + 30 cooked_fish_meat. Same four resources as the donation goals; drives the cost calculator. |
+| **Traveling-merchant state** | `GET kintara.gg/api/world/merchant-campaign` | kintara.gg's **own** public endpoint (no auth; the game client reads it the same way via `KINTARA_READ_FANOUT_ORIGIN`, also reachable at `ktra-server-b.onrender.com`). Returns `{ok, mode, wood, stone, coal, cooked_fish_meat, metal, goals:{...}, complete, goldTradeEnabled, goldStock, goldStockFull}`. **No overall %** — we compute it as the mean of the five per-resource (capped) percentages. `fetch_merchant()`, cached ~60s (last-good on failure). |
+| **Merchant gold-mint recipe** | (from `kintara.gg/game.js` `MERCHANT_TRADE_COST`) | `MERCHANT_RECIPE` = resources consumed per 1 gold minted: 2500 wood + 1500 stone + 700 coal + 30 cooked_fish_meat. This is now separate from the **donation campaign** resources (`MERCHANT_CAMPAIGN_RESOURCES`: wood, stone, coal, cooked fish, **metal**); the cost calculator follows the current gold-trade recipe, while the left progress tracker follows the live campaign goals. |
 | **Property ownership** | `GET kintara.gg/api/property-signs/status` | Public. `{ok, mansions:{1..3}, houses:{1..5}, trailers:{1..8}}` each → `ownerName, ownerId, sold, locked`. `fetch_property_status()`, cached ~30s, last-good on failure. Drives the Property Map. |
 | **Property map coordinates** | (from `kintara.gg/game.js`: `MANSIONS`, `REGULAR_HOUSES`+`REGULAR_HOUSE_SLOT_TO_ID`, `TRAILERS`) | Each property's world-grid footprint `(col0,col1,row0,row1)`, baked into `PROPERTY_PLOTS`, so the map matches the in-game estate row. |
 | **Live world roster + positions** | `wss://kintara.gg/ws/spectate/sN` (per **server**, N = 1–12) | **Public spectator WebSocket, plain JSON, no auth.** Streams `{t:"snap", region, onlineTotal, players:[{id,name,x,z,ry,avg(level),eq(held item),bdg(badge),php(hp%),mov,outfit{hat,top,pants,shoe,skinTone,*C colors,aura,...}}]}`. **`sN` is the server number** (the same `s${shardId}` the game opens for queue/presence after you pick a server). All **12 servers** are separate worlds (zero player overlap). Note the read-fanout mirror (`ktra-server-b.onrender.com`) only carries servers 1–4 — kintara.gg itself serves all 12, so we use it. `onlineTotal` is the **global** count (identical across all 4). The spectator is only sent players in the **realm** it's subscribed to (set via `{t:"spec_reg",region}`), and within the big `world` realm only those near the hub camera. So `SpectateHub` **round-robins every realm** (`SPECTATE_REGIONS`: world/pond/beach/eldergrove/frostmere/arena/wild/mine/spider/…, lingering longer on `world`), accumulating a per-world roster tagged by realm — ~75–80 named players per world after a ~20s sweep, vs ~25 from the hub alone. Each player carries its `realm`. One socket per world, opened lazily on the first `/api/live` hit, closed after ~75s idle. Needs the `websockets` package. |
@@ -285,11 +285,12 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   coordinates, plus a marketplace cross-reference (the owner's live listing count + total
   ask USD) and how many properties that owner holds.
 - `GET /api/merchant` — traveling-merchant tracker **and** cost calculator in one payload:
-  `state` (per-resource current/goal/**pct**, overall %, mode, gold stock) and `calc`
-  (`gold_rate` + per-ingredient **order-book ladder** — cheapest-first `[unit_usd, qty]`
-  levels across both currencies, gold converted at the rate). The client walks the ladder
-  so larger mints cost more as cheap listings run out (**liquidity-aware**), reports avg &
-  marginal $/gold, and caps the mint to the listed liquidity.
+  `state` (five donation resources: wood, stone, coal, cooked fish, **metal** current/goal/**pct**,
+  overall %, mode, gold stock) and `calc` (`gold_rate` + the current `MERCHANT_TRADE_COST`
+  gold-trade recipe with per-ingredient **order-book ladder** — cheapest-first `[unit_usd, qty]`
+  levels across both currencies, gold converted at the rate). The client walks the ladder so larger
+  mints cost more as cheap listings run out (**liquidity-aware**), reports avg & marginal $/gold,
+  and caps the mint to the listed liquidity.
 
 ---
 
@@ -368,13 +369,13 @@ manifest for a more polished hosted-site shell.
 4. **Gold price** — kintaragold-style chart, now driven by our own `gold_price` series.
    Toggle **Gold (USD) ⇆ KINS/gold**, ranges 4H/1D/3D/7D/14D/ALL, % change pill, hover
    card, auto log-scale for extreme ranges.
-5. **Merchant** — traveling-merchant desk. Left: progress tracker (overall % + per-resource
-   current/goal bars **with a % next to each item**, mode badge donation/gold-trade, gold
-   stock). Right: **cost calculator** — the gold-mint recipe priced **liquidity-aware** (walks
-   the live order book, so each additional gold costs more as cheap listings are consumed),
-   with a "mint N gold" input, avg & marginal $/gold, craft cost vs gold value, profit/margin,
-   and a cap when the mint exceeds listed liquidity. Auto-refreshes ~30s (skips while the mint
-   field is focused).
+5. **Merchant** — traveling-merchant desk. Left: progress tracker (overall % + five donation-resource
+   current/goal bars **with a % next to each item**: wood, stone, coal, cooked fish, **metal**; mode
+   badge donation/gold-trade; gold stock). Right: **cost calculator** — the current gold-trade recipe
+   from `MERCHANT_TRADE_COST` priced **liquidity-aware** (walks the live order book, so each additional
+   gold costs more as cheap listings are consumed), with a "mint N gold" input, avg & marginal $/gold,
+   craft cost vs gold value, profit/margin, and a cap when the mint exceeds listed liquidity.
+   Auto-refreshes ~30s (skips while the mint field is focused).
 
 6. **Live World** — roster of who's online, per server, **grouped by area** (Overworld, Fishing
    Pond, The Shores, Eldergrove, Frostmere, dungeons…). Selector across **all 12 servers** (labeled
@@ -470,9 +471,11 @@ A site-wide quality-of-life pass that sits under every tab:
   count is global; the radar/roster is the visible crowd. Switching shards opens a fresh
   socket. If `websockets` isn't installed, the tab shows a one-line install hint.
 - **Merchant data** comes from kintara.gg's own `/api/world/merchant-campaign` (public, no
-  auth). If the game rebalances the gold-mint recipe, update `MERCHANT_RECIPE` (its values
-  live in `game.js`'s `MERCHANT_TRADE_COST`). The merchant cost calculator's liquidity cap
-  reflects only **listed** market depth — real fills may differ (whole-stack buys, slippage).
+  auth). If the game rebalances the gold-trade recipe, update `MERCHANT_RECIPE` (its values
+  live in `game.js`'s `MERCHANT_TRADE_COST`). If the donation campaign resources change, update
+  `MERCHANT_CAMPAIGN_RESOURCES` and this README; the live endpoint supplies the current goals.
+  The merchant cost calculator's liquidity cap reflects only **listed** market depth — real fills
+  may differ (whole-stack buys, slippage).
 
 ---
 
@@ -481,6 +484,12 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Merchant campaign metal update:** the Merchant page now follows the current game code/API split:
+  donation progress uses five resources from `/api/world/merchant-campaign` (`wood`, `stone`, `coal`,
+  `cooked_fish_meat`, `metal`) via new `MERCHANT_CAMPAIGN_RESOURCES`, while the cost calculator remains
+  tied to the current `MERCHANT_TRADE_COST` gold-trade recipe (wood/stone/coal/cooked fish; no metal in
+  the live trade-cost block as of 2026-06-19). Cooked fish labels were updated from "Fish" to
+  "Cooked Fish" and calculator copy now says it prices the gold-trade recipe.
 - **Public branding pass:** renamed the hosted/site-facing brand from **Kintara Market**
   to **KinScan** in the browser title and header; added a gold-icon brand mark, favicon
   routes (`/favicon.ico`, `/favicon.png`, `/apple-touch-icon.png`), OpenGraph/Twitter
@@ -688,7 +697,7 @@ sees the latest state at a glance.
   cheapest price.
 - Added a **server status bar** from `kintara.gg/api/servers`; a **Merchant tab** with a live
   traveling-merchant progress tracker; and a **merchant cost calculator** (gold-mint recipe:
-  2500 wood, 1500 stone, 700 coal, 30 fish per gold) priced vs our gold price. New routes
+  2500 wood, 1500 stone, 700 coal, 30 cooked fish per gold) priced vs our gold price. New routes
   `/api/servers` and `/api/merchant`. Inspired by kintaraai.xyz, rebuilt in our own style.
 - Gold price is now measured directly: `gold_price_loop` snapshots avg of the 3 cheapest
   per-gold asks into a new `gold_price` table every ~3 min; the gold chart and arbitrage
