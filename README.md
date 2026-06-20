@@ -181,21 +181,21 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
 - **`sales_daily`** — the daily archive (see above).
 - **`sales_events`** — **ACTUAL completed sales**, one row per sale, now with the real stack size,
   seller, total paid and time-on-market. Detection (`_archive_samples` → `_log_sales`): kintara's
-  `/stats` completed-sale **unit count** is the authoritative trigger (cancel-and-relist doesn't move it),
-  and it gives a marginal per-unit price. `_log_sales` consumes that unit delta by **matching it to the
-  listing(s) we watched vanish** (recently `removed_at`, `sold_claimed IS NULL`, ranked by how
+  `/stats` completed-sale **count** is the authoritative trigger (cancel-and-relist doesn't move it),
+  and it gives a marginal per-unit price. `_log_sales` consumes that sale-count delta by **matching it to
+  the listing(s) we watched vanish** (recently `removed_at`, `sold_claimed IS NULL`, ranked by how
   close `per_unit` is to the marginal sold price, so the genuinely-sold listing wins over a
   coincident cancellation) to recover `qty` (stack size), `total`, `seller_id/name`, `listing_ms`
   (time on market = `removed_at - created_at`) and `listing_id`. The matched listing is flagged
   `listings.sold_claimed=1` so it's never double-counted. The first time we ever see an item-day we
   only attribute **price-matching** recent removals and emit **no** synthetic rows (so pre-tracking
-  history is never replayed as "now"); confirmed-but-unmatched units (we missed the listing) get one
-  estimated stack row (`qty=remaining units`, `total=qty*price`, seller/time unknown) so materials still
-  display as qty x total paid instead of per-item `/ea` fragments. `units` mirrors the row quantity for
-  new rows. Items with a fresh unclaimed removal are **prioritised** in the stats queue
-  (`_next_stats_pair`) so high-value sales (e.g. a 500g aura) surface within a poll instead of waiting
-  out the cold-item cadence. Indexed on `ts` and `(item_type, ts)`; legacy count-semantics rows were
-  dropped on migration and the feed fills forward.
+  history is never replayed as "now"); confirmed-but-unmatched sales (we missed the listing) get
+  synthetic rows (`qty`/`seller` unknown) so we stop re-detecting. `units` is the completed-sale count
+  for that row, while `qty` is the real stack size when matched. Items with a fresh unclaimed removal are
+  **prioritised per item+currency** in the stats queue (`_next_stats_pair`), but only until stats have
+  been checked after that removal; urgent selection is aged fairly so constant wood churn cannot starve
+  stone/coal/fish/metal. Indexed on `ts` and `(item_type, ts)`; legacy count-semantics rows were dropped
+  on migration and the feed fills forward.
 - **`gold_price`** — our own measured gold-USD series: `ts` (epoch ms, PK), `usd` (USD per
   1 gold), `listings` (how many listings the avg used, ≤3). One row per ~3 min from
   `gold_price_loop`.
@@ -273,8 +273,8 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
 - `GET /api/sales-feed?limit=&item_type=&currency=&category=&q=` — **actual completed sales** from
   `sales_events`, newest first (cancellations excluded). Each row now carries the **real stack `qty`,
   `total` paid, per-unit `price`, `seller`, and `listing_ms`** (time the listing sat before it sold) —
-  recovered by matching each sale to the listing that vanished. If an older unmatched synthetic row is
-  encountered, the route coalesces those per-unit fragments into one estimated stack row when possible.
+  recovered by matching each sale to the listing that vanished. Fully matched rows are ordered ahead of
+  unmatched synthetic rows so the UI prefers the normal `qty x total paid + seller + time-listed` display.
   Drives the **Sales feed** tab and the per-item **Recent sales** panel in the Index expand.
 - `GET /icon/<item_type>` — real item art, lazily downloaded + disk-cached; 404 → UI
   falls back to a category emoji.
@@ -601,12 +601,12 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
-- **Material recent-sales stack fix:** `/stats` sale deltas are sold **units**, not row counts. `_log_sales`
-  now consumes that unit delta by matched listing quantity, so a 1,900-wood sale logs one `qty=1900`
-  transaction instead of hundreds of `/ea` fragments. Unmatched units are written as one estimated stack
-  row (`qty`, `total=qty*price`, seller/time unknown), and `/api/sales-feed` coalesces older synthetic
-  per-unit rows so Cooked Fish/stone/coal/metal recent sales render like wood: `qty x total paid` plus
-  seller/time when captured.
+- **Sales feed starvation fix:** the urgent stats queue was item-level and liquidity-sorted, so constant
+  wood removals kept wood urgent and starved stone/coal/cooked-fish/metal for ~40 minutes. Urgency is now
+  tracked per item+currency, expires once stats have been checked after that removal, and urgent selection
+  uses stats age before liquidity so busy wood cannot monopolize `/stats`. Also reverted the mistaken
+  assumption that `/stats.sales` is item units; it is completed-sale count, with real stack quantity coming
+  only from matched vanished listings. `/api/sales-feed` now orders matched rows ahead of synthetic rows.
 
 - **USD floor = raw USD listings only (no gold conversion):** the USD floor was `min(token_usd,
   gold_floor×rate)`, so an item listed only in gold showed its gold price *converted* to USD (weird

@@ -1166,7 +1166,7 @@ def _marginal_price(old_sales, old_avg, new_sales, new_avg, delta):
 
 
 def _log_sales(con, it, cur, d, delta, marginal, strict):
-    """Attribute `delta` CONFIRMED sold units (the /stats sale-count rise — cancellations don't
+    """Attribute `delta` CONFIRMED sales (the /stats sale-count rise — cancellations don't
     move it) to recently-captured, unclaimed REMOVED listings of (it,cur), recovering the
     real stack quantity, seller, price and time-on-market. Candidates are ranked by how
     close their per-unit is to the marginal sold price, so the genuinely-sold listing wins
@@ -1189,15 +1189,11 @@ def _log_sales(con, it, cur, d, delta, marginal, strict):
             return 1e9
         return abs(pu - marginal) / marginal
 
-    remaining = int(delta or 0)
     logged = 0
     for r in sorted(cands, key=closeness):
-        if remaining <= 0:
+        if logged >= delta:
             break
         if strict and closeness(r) > SALE_PRICE_TOL:
-            continue
-        q = int(r["quantity"] or 1)
-        if q > remaining:
             continue
         pu = r["per_unit"]
         total = r["price_gold"] if cur == "gold" else r["price_usd"]
@@ -1209,22 +1205,20 @@ def _log_sales(con, it, cur, d, delta, marginal, strict):
             """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
                seller_id,seller_name,listing_ms,listing_id,day,ts)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (it, cur, q, q, pu if pu is not None else marginal, total,
+            (it, cur, 1, r["quantity"], pu if pu is not None else marginal, total,
              r["seller_id"], r["seller_name"], lms, r["id"], d, now))
         con.execute("UPDATE listings SET sold_claimed=1 WHERE id=?", (r["id"],))
-        logged += q
-        remaining -= q
+        logged += 1
     # confirmed-but-unmatched: we know a sale happened (count + price) but missed the
-    # listing capture — log one estimated stack row so we don't re-detect it. Never
+    # listing capture — log a synthetic row (qty unknown) so we don't re-detect it. Never
     # on the first baseline (that delta may be pre-tracking history we never witnessed).
-    if not strict and remaining > 0:
-        con.execute(
-            """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
-               seller_id,seller_name,listing_ms,listing_id,day,ts)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (it, cur, remaining, remaining, marginal,
-             (marginal * remaining) if marginal is not None else None,
-             None, None, None, None, d, now))
+    if not strict:
+        for _ in range(delta - logged):
+            con.execute(
+                """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
+                   seller_id,seller_name,listing_ms,listing_id,day,ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (it, cur, 1, None, marginal, None, None, None, None, None, d, now))
     return logged
 
 
@@ -1294,32 +1288,55 @@ def _next_stats_pair(con, stale_sec, retry_err_sec=300):
     # instead of waiting out the slow cold-item cadence.
     recent_iso = datetime.fromtimestamp(
         time.time() - SALE_MATCH_WINDOW_MS / 1000, timezone.utc).isoformat()
-    urgent = {r["item_type"] for r in con.execute(
-        "SELECT DISTINCT item_type FROM listings "
-        "WHERE active=0 AND sold_claimed IS NULL AND removed_at>=?", (recent_iso,))}
+    urgent = {}
+    for r in con.execute(
+            """SELECT item_type,currency,MAX(removed_at) removed_at
+               FROM listings
+               WHERE active=0 AND sold_claimed IS NULL AND removed_at>=?
+               GROUP BY item_type,currency""", (recent_iso,)):
+        urgent[(r["item_type"], r["currency"])] = r["removed_at"]
     now = time.time()
     best, best_key = None, None
     for it in items:
-        is_urgent = it in urgent
         for cur in ("gold", "token"):
             row = cached.get((it, cur))
+            urg_removed = urgent.get((it, cur))
             never = row is None
             if never:
                 age = 1e18
+                updated_ts = 0
             else:
                 got = row["day_sales"] is not None  # 0 = confirmed no-sales, still "got"
                 try:
-                    age = now - datetime.fromisoformat(row["updated_at"]).timestamp()
+                    updated_ts = datetime.fromisoformat(row["updated_at"]).timestamp()
+                    age = now - updated_ts
                 except Exception:
+                    updated_ts = 0
                     age = 1e18
                 # actively-traded items (lots of live listings) refresh much more often,
                 # so the actual-sales feed stays granular for the things that sell a lot;
                 # quiet items use the slower cadence. Both env-tunable. Urgent items
                 # (recent unclaimed removal) bypass the freshness skip entirely.
                 eff_stale = STATS_STALE_HOT if liq.get(it, 0) >= 15 else stale_sec
-                if not is_urgent and age < (eff_stale if got else retry_err_sec):
-                    continue  # fresh enough, skip
-            key = (is_urgent, liq.get(it, 0), never, age)  # urgent first, then liquidity, unfetched, age
+                if age < (eff_stale if got else retry_err_sec):
+                    if not urg_removed:
+                        continue  # fresh enough, skip
+                    try:
+                        removed_ts = datetime.fromisoformat(urg_removed).timestamp()
+                    except Exception:
+                        removed_ts = now
+                    if removed_ts <= updated_ts:
+                        continue  # already checked stats after this removal
+            if urg_removed:
+                try:
+                    removed_ts = datetime.fromisoformat(urg_removed).timestamp()
+                except Exception:
+                    removed_ts = now
+                # Urgent first, but use stats age before liquidity so constant wood
+                # churn cannot starve other items with fresh removals.
+                key = (1, age, removed_ts, liq.get(it, 0), never)
+            else:
+                key = (0, liq.get(it, 0), never, age)
             if best_key is None or key > best_key:
                 best_key, best = key, (it, cur)
     return best
@@ -2904,21 +2921,9 @@ def make_app():
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         con = connect(readonly=True)
         rows = con.execute(
-            f"""SELECT item_type,currency,
-                       CASE WHEN qty IS NULL AND seller_name IS NULL
-                            THEN SUM(COALESCE(units,1)) ELSE units END AS units,
-                       CASE WHEN qty IS NULL AND seller_name IS NULL
-                            THEN SUM(COALESCE(units,1)) ELSE qty END AS qty,
-                       price,
-                       CASE WHEN qty IS NULL AND seller_name IS NULL AND price IS NOT NULL
-                            THEN SUM(COALESCE(units,1)) * price ELSE total END AS total,
-                       seller_name,listing_ms,day,MAX(ts) AS ts
+            f"""SELECT item_type,currency,units,qty,price,total,seller_name,listing_ms,day,ts
                 FROM sales_events {where}
-                GROUP BY CASE WHEN qty IS NULL AND seller_name IS NULL
-                         THEN 's:' || item_type || ':' || currency || ':' ||
-                              COALESCE(price,'') || ':' || day || ':' || ts
-                         ELSE 'm:' || id END
-                ORDER BY ts DESC LIMIT ?""",
+                ORDER BY (seller_name IS NULL AND listing_ms IS NULL), ts DESC LIMIT ?""",
             params + [limit * 3]).fetchall()
         con.close()
         out = []
