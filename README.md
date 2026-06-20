@@ -34,6 +34,9 @@ kintara.gg requests, a shared pacer across all loops ⇒ ≈ ≤2 req/s total),
 `KINTARA_BACKOFF` (45 — pause after a 429/403), `STATS_STALE_HOT`/`STATS_STALE_COLD`
 (120/900 — per-item stats refresh cadence). All kintara.gg requests go through
 `pace_kintara()` so it can run continuously without bursting the marketplace.
+Historical-pipeline cadence (all DB-local, no kintara request): `SNAPSHOT_INTERVAL` (300 — order-book
+snapshot tick), `SNAPSHOT_RETENTION_DAYS` (14 — prune raw snapshots after roll-up), `MERCHANT_SNAP_INTERVAL`
+(300 — merchant campaign snapshot tick).
 
 **Hosting:** see `DEPLOY.md`. It's a stateful always-on process (serves the dashboard
 *and* runs the DB-building loops), so serverless (Vercel/etc.) won't work — use an
@@ -186,6 +189,27 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
 - **`gold_price`** — our own measured gold-USD series: `ts` (epoch ms, PK), `usd` (USD per
   1 gold), `listings` (how many listings the avg used, ≤3). One row per ~3 min from
   `gold_price_loop`.
+- **`orderbook_snapshots`** — **Substrate A**, the historical order book. One row per
+  `(ts, item_type, currency)` per snapshot tick (~5 min, `snapshot_loop`): `floor`/`floor2`/
+  `floor3` (cheapest three per-unit asks = undercut depth), `floor_usd` (floor converted to
+  USD at tick time), `listed_qty`, `listings`, `sellers`, `depth1/5/10/25` (units within
+  1/5/10/25% of floor), `reserved_qty`. Computed from our **own DB** (no kintara request).
+  This preserves the market's *shape over time*, which `reconcile()` otherwise overwrites.
+  Highest-write table → writes are batched one transaction per tick, cadence is coarser than
+  the poll loop, and raw rows are **pruned after `SNAPSHOT_RETENTION_DAYS` (14)** once rolled
+  into `item_daily_metrics`. Indexed on `(item_type, ts)` and `ts`.
+- **`item_daily_metrics`** — **Substrate B**, the durable daily roll-up (`rollup_loop`,
+  hourly, re-rolls today+yesterday). One row per `(item_type, day)`: `floor_usd_open/close/
+  min/max`, `floor_gold_close`, `listed_qty_avg`, `sellers_avg`, `volume_units`/`volume_usd`/
+  `sales_count` (from `sales_events`), `volatility` (stdev/mean of intraday floor),
+  `undercut_count` (downward floor moves). This is the cache the scorecard / floor-history
+  read from — **never aggregate raw snapshots per request**. Storage stays bounded because raw
+  snapshots are pruned once their day is rolled up here.
+- **`merchant_snapshots`** — traveling-merchant campaign history (`merchant_snapshot_loop`,
+  ~5 min, reuses `fetch_merchant()`'s 60s cache → no extra kintara load): `ts` (PK), `mode`,
+  `overall_pct`, `gold_stock`, `gold_trade`, `complete`, `resources` (JSON
+  `{key:{current,goal,pct}}`), `mint_usd` (cheapest $/gold to mint at tick time, walks the
+  live order book), `gold_rate`. Drives the Merchant tab's forecast.
 - **`polls`** — one row per listing poll (ts, active, removed, ok).
 - **`settings`** — key/value (notably `gold_item`).
 
@@ -253,6 +277,21 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
 - `GET /api/item-listings?item_type=` — up to the **5 cheapest buyable (non-reserved) live listings per
   currency** (gold + token/$KINS) for one item, each with per-unit price, stack size, seller; plus the
   current `gold_rate` and `kins_price` for cross-conversion. Drives the Index "Cheapest live listings" panel.
+  Each listing also carries **price-memory `badges`** (`cheapest-ever`/`cheapest-7d` vs the
+  `orderbook_snapshots` floor history, `below-sale-avg`/`above-fair`/`likely-overpriced` vs
+  `recent_fair_usd()`), and the response includes a `memory` block (`floor_ever/7d/1d_usd`, `fair_usd`).
+- `GET /api/scorecard?item_type=` — the **Item Scorecard** payload (the stock-page header in the
+  Index expand). Current floor in **gold/USD/KINS**, `change` (24h/7d/30d % vs `floor_usd_close` from
+  the rollup), `velocity` (units/day, 7d), `listed_supply`, `sellers`, `liquidity` (0–100 exit score =
+  `liquidity_score()`: velocity+depth+sellers+recency), `volatility`, `time_to_sell` (median/p25/p75
+  minutes from listing lifecycle, `removed_at−created_at` for listings created after tracking began,
+  plus a `sold_ratio` = sale-event units ÷ removed units calibration), `fair_usd`+`verdict`
+  (cheap/fair/expensive vs gold-anchored `recent_fair_usd()`) + `confidence`, `last_sale`. Reads the
+  durable metrics + a couple of cheap indexed live queries — never aggregates raw snapshots.
+- `GET /api/floor-history?item_type=&range=24H|3D|7D|30D|ALL` — floor-price history for the floor chart:
+  recent points from `orderbook_snapshots` (per-tick cheapest USD floor across both currencies), older
+  points from `item_daily_metrics` (one/day, for the stretch before snapshot coverage). Returns per-point
+  `{t, usd, gold, kins}` (gold/KINS derived from USD via `gold_daily_usd()`/`kins_daily_usd()`).
 - `GET /api/item-meta?item_type=` — Index info-panel metadata for one cosmetic/mount/pet: sourcing
   channel + **availability cadence** (weekly 7d vs daily 24h, from the game's shop-payload shapes),
   **ride speed** (mounts), special-feature flavor (`ITEM_DESC`), a **cheapest-ever-traded** source/floor
@@ -291,7 +330,14 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   gold-trade recipe with per-ingredient **order-book ladder** — cheapest-first `[unit_usd, qty]`
   levels across both currencies, gold converted at the rate). The client walks the ladder so larger
   mints cost more as cheap listings run out (**liquidity-aware**), reports avg & marginal $/gold,
-  and caps the mint to the listed liquidity.
+  and caps the mint to the listed liquidity. Also returns `forecast` (from `merchant_snapshots` via
+  `merchant_forecast()`): **completion ETA** (`eta_hours`/`eta_iso`, when the donation phase finishes =
+  gold-trade unlocks, from the recent overall-% donation velocity), the **bottleneck** resource
+  (finishes last at current donation rate → its demand is about to spike), per-resource
+  `velocity_per_hr`/`eta_hours`/`pressure` (frac of goal/hr), the **break-even gold price**
+  (`break_even_gold_usd` = current mint cost; `profitable` vs the live `current_gold_usd`), and
+  `profit_history` (mint profit $/gold over the campaign). `null` until the snapshot loop has logged
+  some history.
 
 ---
 
@@ -336,7 +382,15 @@ manifest for a more polished hosted-site shell.
    fills going forward).
 3. **Index** (was "Sales history") — game "index" layout: category **sidebar**, **Today / 7d / 30d**
    window selector, **Most/Least sales** sort, columns ITEM · SALES · AVG GOLD · AVG USD ·
-   $KINS. Click a row → expands to a **line chart** with a 4-way currency toggle
+   $KINS. Click a row → expands to a full **Item Scorecard** (stock-page) view:
+   - **Scorecard header** (`/api/scorecard`, `loadScorecard`/`scorecardHTML`): the floor in
+     **gold/USD/KINS** with a **cheap/fair/expensive verdict** pill, **24h/7d/30d %** change, and a
+     stat strip — **liquidity** (0–100 exit score, deep/ok/thin), **sells/day**, **time to sell**
+     (median, hover for sample size + sold-vs-cancelled ratio), **listed supply**, **sellers**, **volatility**.
+   - **Floor price chart** (`/api/floor-history`, `loadFloorHistory`/`floorChartHTML`): the cheapest
+     listing over time, with a **gold / USD / $KINS** unit toggle and **24H/3D/7D/30D/ALL** ranges
+     (inline SVG area chart; fills in as snapshots accumulate).
+   - Then the existing **line chart** with a 4-way currency toggle
    **USD ($KINS) ⇆ vs $KINS ⇆ Gold ⇆ Gold Standard**, hover card, + a cumulative stats panel.
    **Gold Standard** (`currency=goldstd`) values *every* sale in gold — gold sales as-is, USD/KINS sales
    converted to the gold they'd have bought that day — blended units-weighted into one all-sales gold
@@ -361,7 +415,9 @@ manifest for a more polished hosted-site shell.
      **5 cheapest buyable (non-reserved) listings per currency** — **gold** and **$KINS** side by side. Shows
      the **actual listing price** (the stack total, e.g. stone *1g ×13,251*, not the 0g per-unit), **sorted by
      cheapest per-unit**, with stack size, per-unit (for stacks), seller, and the cross-converted value
-     (gold→USD at the rate, USD→$KINS at spot). Many items have <5; that's fine.
+     (gold→USD at the rate, USD→$KINS at spot). Each listing is stamped with **price-memory badges**
+     (`cheapest ever`/`7d low` vs the floor history, `below sale avg`/`above fair`/`overpriced` vs recent
+     fair value) so Live Listings beats the in-game market. Many items have <5; that's fine.
    - **Every** item expand also shows a **Recent sales** panel (`loadRecentSales()`, `/api/sales-feed`):
      the item's latest **actual completed sales** (units × marginal price, currency, relative time),
      newest first — cancellations excluded. Empty until real sales are observed (it logs going forward).
@@ -376,7 +432,12 @@ manifest for a more polished hosted-site shell.
    from `MERCHANT_TRADE_COST` priced **liquidity-aware** (walks the live order book, so each additional
    gold costs more as cheap listings are consumed), with a "mint N gold" input, avg & marginal $/gold,
    craft cost vs gold value, profit/margin, and a cap when the mint exceeds listed liquidity.
-   Auto-refreshes ~30s (skips while the mint field is focused).
+   Auto-refreshes ~30s (skips while the mint field is focused). Below the tracker + calculator, a
+   full-width **Merchant Forecast** desk (`forecastHTML`, `/api/merchant` `forecast` block): **completion
+   ETA** (when the donation phase finishes / gold-trade unlocks), a **bottleneck** callout, a per-resource
+   **demand-pressure** list (donation rate/hr + time-to-goal + a pressure bar), a **break-even gold price /
+   live gold price / mint-profit-per-gold** economics row, and a **mint-profit-over-the-campaign** sparkline.
+   Empty until `merchant_snapshots` has logged some history.
 
 6. **Live World** — roster of who's online, per server, **grouped by area** (Overworld, Fishing
    Pond, The Shores, Eldergrove, Frostmere, dungeons…). Selector across **all 12 servers** (labeled
@@ -486,6 +547,30 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Historical order-book pipeline + Item Scorecard + Merchant Forecast (the "market memory" build):**
+  The DB now preserves the market's *shape over time*, not just current state. Three new tables +
+  background loops (all DB-local — no extra kintara.gg load): **`orderbook_snapshots`** (Substrate A,
+  `snapshot_loop` ~5 min: floor + 2nd/3rd asks, listed supply, sellers, 1/5/10/25% depth bands, reserved
+  supply, per item×currency — what `reconcile()` used to overwrite), **`item_daily_metrics`** (Substrate B,
+  `rollup_loop` hourly: durable daily roll-up of floor open/close/min/max, volume, velocity, volatility,
+  undercut count — the cache scorecard/floor-history read from), and **`merchant_snapshots`**
+  (`merchant_snapshot_loop` ~5 min). **Guardrails baked in:** snapshot writes are one batched transaction
+  per tick, raw snapshots are **pruned after 14d** once rolled up (storage stays bounded), the rollup
+  `wal_checkpoint(TRUNCATE)`s, and snapshot cadence is coarser than the poll loop. New endpoints:
+  **`/api/scorecard`** (floor in gold/USD/KINS, 24h/7d/30d change, liquidity 0–100 exit score, sells/day,
+  **time-to-sell** from listing lifecycle, volatility, listed supply, sellers, gold-anchored cheap/fair/
+  expensive verdict, last sale) and **`/api/floor-history`** (floor over time, gold/USD/KINS, ranges). The
+  Index expand is now a full **Item Scorecard** (header strip + **floor price chart** with unit toggle +
+  ranges) above the existing sales chart. `/api/item-listings` listings now carry **price-memory badges**
+  (cheapest-ever/7d-low/below-sale-avg/above-fair/overpriced). The Merchant tab gained a full-width
+  **Forecast desk**: completion ETA (gold-trade unlock), bottleneck resource, per-resource demand pressure,
+  break-even gold price + mint profitability, and a mint-profit-over-campaign sparkline. New helpers:
+  `compute_orderbook_rows`, `rollup_day`, `time_to_sell`, `recent_fair_usd`, `liquidity_score`,
+  `merchant_mint_cost`, `merchant_forecast`. Verified end-to-end against the live DB (snapshot tick →
+  168 books, rollup → 107 item-days; scorecard velocity/liquidity/time-to-sell; forecast math on synthetic
+  campaign data; all frontend render fns runtime-tested). Movers / seller-intelligence / watchlists /
+  Collectables overhaul intentionally deferred to later sessions.
 
 - **Live World search compatibility + speed:** fixed DigitalOcean/new-`websockets` failures where
   `extra_headers` leaked into `BaseEventLoop.create_connection()` by selecting `additional_headers`

@@ -43,7 +43,7 @@ import threading
 import time
 import webbrowser
 from collections import defaultdict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta as _td
 
 def _envf(name, default):
     try:
@@ -70,6 +70,12 @@ STATS_STALE_HOT = _envi("STATS_STALE_HOT", 120)   # re-check actively-traded ite
 STATS_STALE_COLD = _envi("STATS_STALE_COLD", 900) # re-check quiet items this often
 KINTARA_MIN_GAP = _envf("KINTARA_MIN_GAP", 0.5)   # global min gap between ANY two kintara.gg hits
 KINTARA_BACKOFF = _envf("KINTARA_BACKOFF", 45)    # pause this long after a 429/403 (rate-limited)
+# Historical order-book pipeline. Snapshots are computed from our OWN DB (no kintara
+# request) so the cadence is about write volume, not politeness — coarser than the
+# poll loop (order books don't reshape in 90s) to keep the highest-write table small.
+SNAPSHOT_INTERVAL = _envi("SNAPSHOT_INTERVAL", 300)         # order-book snapshot tick (~5 min)
+SNAPSHOT_RETENTION_DAYS = _envi("SNAPSHOT_RETENTION_DAYS", 14)  # prune raw snapshots after rollup
+MERCHANT_SNAP_INTERVAL = _envi("MERCHANT_SNAP_INTERVAL", 300)   # merchant campaign snapshot tick
 
 # A single shared pacer so EVERY background loop's requests to kintara.gg are spread
 # out — 24/7 operation then can't burst the marketplace no matter how the loops line
@@ -391,6 +397,79 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_se_ts ON sales_events(ts);
         CREATE INDEX IF NOT EXISTS idx_se_item ON sales_events(item_type, ts);
+
+        -- HISTORICAL ORDER-BOOK SNAPSHOTS (Substrate A). One row per
+        -- item_type+currency per snapshot tick (~5 min). Preserves the SHAPE of
+        -- the market over time, which reconcile() otherwise overwrites: the floor,
+        -- the 2nd/3rd cheapest (undercut depth), total listed supply, distinct
+        -- seller count, and how many units sit within 1/5/10/25% of the floor
+        -- (depth bands). `floor_usd` is the floor converted to USD at snapshot time
+        -- so a cross-currency floor chart can be built without re-deriving rates.
+        -- Raw rows are pruned after RETENTION days once rolled into
+        -- item_daily_metrics; this is the highest-write table so writes are batched
+        -- one transaction per tick and the cadence is coarser than the poll loop.
+        CREATE TABLE IF NOT EXISTS orderbook_snapshots (
+            ts            INTEGER,            -- epoch ms of the snapshot tick
+            item_type     TEXT,
+            currency      TEXT,               -- 'gold' | 'token'
+            floor         REAL,               -- cheapest per-unit, own currency
+            floor2        REAL,               -- 2nd cheapest per-unit
+            floor3        REAL,               -- 3rd cheapest per-unit
+            floor_usd     REAL,               -- floor converted to USD at tick time
+            listed_qty    INTEGER,            -- total buyable units
+            listings      INTEGER,            -- buyable listing count
+            sellers       INTEGER,            -- distinct sellers
+            depth1        INTEGER,            -- units within 1% of floor
+            depth5        INTEGER,            -- units within 5%
+            depth10       INTEGER,            -- units within 10%
+            depth25       INTEGER,            -- units within 25%
+            reserved_qty  INTEGER,            -- units locked in reservations
+            PRIMARY KEY (ts, item_type, currency)
+        );
+        CREATE INDEX IF NOT EXISTS idx_obs_item ON orderbook_snapshots(item_type, ts);
+        CREATE INDEX IF NOT EXISTS idx_obs_ts   ON orderbook_snapshots(ts);
+
+        -- DERIVED DAILY METRICS (Substrate B). Nightly roll-up of the snapshot
+        -- history + sales_events into one durable row per item per day. This is the
+        -- cache the scorecard / floor-history / movers read from — never aggregate
+        -- raw snapshots per request. Storage stays bounded because raw snapshots are
+        -- pruned once their day is rolled up here.
+        CREATE TABLE IF NOT EXISTS item_daily_metrics (
+            item_type        TEXT,
+            day              TEXT,            -- UTC YYYY-MM-DD
+            floor_usd_open   REAL,
+            floor_usd_close  REAL,
+            floor_usd_min    REAL,
+            floor_usd_max    REAL,
+            floor_gold_close REAL,
+            listed_qty_avg   REAL,
+            sellers_avg      REAL,
+            volume_units     INTEGER,         -- units sold (from sales_events)
+            volume_usd       REAL,            -- approx USD volume
+            sales_count      INTEGER,         -- # of sale events
+            volatility       REAL,            -- stdev(floor_usd)/mean over the day
+            undercut_count   INTEGER,         -- # of downward floor moves
+            PRIMARY KEY (item_type, day)
+        );
+        CREATE INDEX IF NOT EXISTS idx_idm_item ON item_daily_metrics(item_type, day);
+
+        -- TRAVELING-MERCHANT CAMPAIGN HISTORY. One row per merchant snapshot tick.
+        -- Lets the Merchant tab forecast: completion ETA from donation velocity,
+        -- which resource is the bottleneck, demand-pressure, and how mint
+        -- profitability moved over the campaign. `resources` is JSON
+        -- {key:{current,goal,pct}}; the scalar columns are pulled out for cheap
+        -- velocity math.
+        CREATE TABLE IF NOT EXISTS merchant_snapshots (
+            ts           INTEGER PRIMARY KEY, -- epoch ms
+            mode         TEXT,
+            overall_pct  REAL,
+            gold_stock   INTEGER,
+            gold_trade   INTEGER,
+            complete     INTEGER,
+            resources    TEXT,                -- JSON {key:{current,goal,pct}}
+            mint_usd     REAL,                -- cheapest $/gold to mint at tick time
+            gold_rate    REAL
+        );
         """
     )
 
@@ -1159,6 +1238,187 @@ def gold_series_for_chart(con):
 
 
 # ---------------------------------------------------------------------------
+# Historical order-book pipeline (Substrate A + B)
+#   snapshot_loop  -> orderbook_snapshots  (the market's shape over time)
+#   rollup_loop    -> item_daily_metrics   (durable daily roll-up) + prune
+# Both read our own DB; neither hits kintara.gg.
+# ---------------------------------------------------------------------------
+
+def compute_orderbook_rows(con, ts):
+    """Build one orderbook_snapshots row per (item_type, currency) from the current
+    buyable listings. Returns a list of tuples ready for executemany. Floor, the two
+    next-cheapest asks (undercut depth), total supply, distinct sellers, depth bands
+    (units within 1/5/10/25% of floor) and reserved supply — the full shape of each
+    book at this instant. Computed in Python from one scan so the depth bands (which
+    need the per-group floor first) are a single pass."""
+    rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
+    rclause, rparam = _buyable_clause()
+    books = defaultdict(lambda: {"asks": [], "qty": 0, "sellers": set()})
+    for r in con.execute(
+            f"""SELECT item_type, currency, per_unit, quantity, seller_id
+                FROM listings
+                WHERE active=1 AND per_unit IS NOT NULL AND quantity > 0{rclause}""",
+            (rparam,)):
+        b = books[(r["item_type"], r["currency"])]
+        b["asks"].append((r["per_unit"], r["quantity"]))
+        b["qty"] += r["quantity"] or 0
+        if r["seller_id"] is not None:
+            b["sellers"].add(r["seller_id"])
+    # reserved supply per (item, currency) — locked units freeing up later
+    reserved = defaultdict(int)
+    for r in con.execute(
+            """SELECT item_type, currency, SUM(quantity) q FROM listings
+               WHERE active=1 AND reserved_until IS NOT NULL
+                 AND reserved_until > ? GROUP BY item_type, currency""",
+            (ts,)):
+        reserved[(r["item_type"], r["currency"])] = r["q"] or 0
+
+    rows = []
+    for (item, cur), b in books.items():
+        asks = sorted(b["asks"], key=lambda x: x[0])
+        floor = asks[0][0]
+        floor2 = asks[1][0] if len(asks) > 1 else None
+        floor3 = asks[2][0] if len(asks) > 2 else None
+        floor_usd = floor if cur == "token" else (floor * rate if rate else None)
+        def band(mult):
+            cap = floor * mult
+            return sum(q for p, q in asks if p <= cap + 1e-12)
+        rows.append((
+            ts, item, cur, floor, floor2, floor3, floor_usd, b["qty"],
+            len(asks), len(b["sellers"]),
+            band(1.01), band(1.05), band(1.10), band(1.25),
+            reserved.get((item, cur), 0),
+        ))
+    return rows
+
+
+def snapshot_loop(interval=None):
+    interval = interval or SNAPSHOT_INTERVAL
+    while True:
+        try:
+            con = connect()
+            try:
+                ts = int(time.time() * 1000)
+                rows = compute_orderbook_rows(con, ts)
+                if rows:
+                    # one transaction for the whole tick (single writer lock acquire)
+                    con.executemany(
+                        """INSERT OR REPLACE INTO orderbook_snapshots
+                           (ts,item_type,currency,floor,floor2,floor3,floor_usd,
+                            listed_qty,listings,sellers,depth1,depth5,depth10,depth25,
+                            reserved_qty)
+                           VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", rows)
+                    con.commit()
+                    print(f"[{now_iso()}] orderbook snapshot: {len(rows)} books")
+            finally:
+                con.close()
+        except Exception as e:
+            print(f"[{now_iso()}] snapshot error: {e}")
+        time.sleep(interval)
+
+
+def _stdev(xs):
+    n = len(xs)
+    if n < 2:
+        return 0.0
+    mean = sum(xs) / n
+    return (sum((x - mean) ** 2 for x in xs) / (n - 1)) ** 0.5
+
+
+def rollup_day(con, day):
+    """Roll the raw snapshots + sales for one UTC day into item_daily_metrics
+    (UPSERT). Safe to re-run for the current (partial) day — it overwrites."""
+    lo = int(datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc).timestamp() * 1000)
+    hi = lo + 86400_000
+    # gather each item's intraday floor series + supply/seller series in time order
+    series = defaultdict(list)   # item -> [(ts, floor_usd, floor_gold, listed, sellers)]
+    for r in con.execute(
+            """SELECT ts, item_type, currency, floor, floor_usd, listed_qty, sellers
+               FROM orderbook_snapshots WHERE ts >= ? AND ts < ? ORDER BY ts""",
+            (lo, hi)):
+        series[r["item_type"]].append(
+            (r["ts"], r["currency"], r["floor"], r["floor_usd"],
+             r["listed_qty"] or 0, r["sellers"] or 0))
+    # sales for the day
+    sales = defaultdict(lambda: {"units": 0, "usd": 0.0, "n": 0})
+    for r in con.execute(
+            "SELECT item_type, units, price, currency FROM sales_events WHERE day=?", (day,)):
+        s = sales[r["item_type"]]
+        s["units"] += r["units"] or 0
+        s["n"] += 1
+        # rough USD volume (token sales are USD; gold sales left approximate)
+        if r["currency"] == "token":
+            s["usd"] += (r["price"] or 0) * (r["units"] or 0)
+
+    items = set(series) | set(sales)
+    out = []
+    for item in items:
+        pts = series.get(item, [])
+        # collapse to per-tick best (cheapest) USD floor across currencies
+        by_ts = {}
+        gold_close = None
+        for ts, cur, floor, fusd, listed, sellers in pts:
+            cell = by_ts.setdefault(ts, {"fusd": None, "listed": 0, "sellers": 0})
+            if fusd is not None and (cell["fusd"] is None or fusd < cell["fusd"]):
+                cell["fusd"] = fusd
+            cell["listed"] += listed
+            cell["sellers"] += sellers
+            if cur == "gold":
+                gold_close = floor
+        ordered = [by_ts[t] for t in sorted(by_ts)]
+        fusd = [c["fusd"] for c in ordered if c["fusd"] is not None]
+        f_open = fusd[0] if fusd else None
+        f_close = fusd[-1] if fusd else None
+        f_min = min(fusd) if fusd else None
+        f_max = max(fusd) if fusd else None
+        vol = (_stdev(fusd) / (sum(fusd) / len(fusd))) if len(fusd) > 1 and sum(fusd) else None
+        undercuts = sum(1 for a, b in zip(fusd, fusd[1:]) if b < a - 1e-12)
+        listed_avg = (sum(c["listed"] for c in ordered) / len(ordered)) if ordered else None
+        sellers_avg = (sum(c["sellers"] for c in ordered) / len(ordered)) if ordered else None
+        s = sales.get(item, {"units": 0, "usd": 0.0, "n": 0})
+        out.append((
+            item, day, f_open, f_close, f_min, f_max, gold_close,
+            listed_avg, sellers_avg, s["units"], s["usd"], s["n"],
+            vol, undercuts,
+        ))
+    if out:
+        con.executemany(
+            """INSERT OR REPLACE INTO item_daily_metrics
+               (item_type,day,floor_usd_open,floor_usd_close,floor_usd_min,floor_usd_max,
+                floor_gold_close,listed_qty_avg,sellers_avg,volume_units,volume_usd,
+                sales_count,volatility,undercut_count)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", out)
+        con.commit()
+    return len(out)
+
+
+def rollup_loop(interval=3600):
+    """Hourly: roll today + yesterday (UTC) into item_daily_metrics, then prune raw
+    snapshots older than the retention window (their days are already rolled up). The
+    rollup is done in SQL-fed Python streaming per day so memory stays flat."""
+    first = True
+    while True:
+        if not first:
+            time.sleep(interval)
+        first = False
+        try:
+            con = connect()
+            try:
+                today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                yday = (datetime.now(timezone.utc) - _td(days=1)).strftime("%Y-%m-%d")
+                n = rollup_day(con, yday) + rollup_day(con, today)
+                cutoff = int((time.time() - SNAPSHOT_RETENTION_DAYS * 86400) * 1000)
+                con.execute("DELETE FROM orderbook_snapshots WHERE ts < ?", (cutoff,))
+                con.commit()
+                con.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+                print(f"[{now_iso()}] rollup: {n} item-days; pruned snapshots < {SNAPSHOT_RETENTION_DAYS}d")
+            finally:
+                con.close()
+        except Exception as e:
+            print(f"[{now_iso()}] rollup error: {e}")
+
+
+# ---------------------------------------------------------------------------
 # servers + traveling merchant (external; cached, last-good on failure)
 # ---------------------------------------------------------------------------
 
@@ -1220,6 +1480,153 @@ def order_book_usd(con, item_type, gold_rate):
             levels.append([usd, r["quantity"]])
     levels.sort(key=lambda x: x[0])
     return levels, sum(q for _, q in levels)
+
+
+def merchant_mint_cost(con, n_gold=1, rate=None):
+    """Cheapest USD to mint `n_gold` gold right now by walking each ingredient's live
+    buy-side order book (liquidity-aware, same idea as the calculator). Returns
+    (total_usd, capped) — capped=True if the listed market can't supply the recipe."""
+    if rate is None:
+        rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
+    total = 0.0
+    for key, _label, per in MERCHANT_RECIPE:
+        need = per * n_gold
+        ladder, _avail = order_book_usd(con, key, rate)
+        got, cost = 0, 0.0
+        for usd, qty in ladder:
+            take = min(qty, need - got)
+            cost += take * usd
+            got += take
+            if got >= need:
+                break
+        if got < need:
+            return None, True
+        total += cost
+    return total, False
+
+
+def merchant_snapshot_loop(interval=None):
+    """Every ~5 min, log the traveling-merchant campaign state + the current cheapest
+    mint cost into merchant_snapshots, so the Merchant tab can forecast completion,
+    spot the bottleneck resource, and chart mint profitability over the campaign.
+    Reuses fetch_merchant()'s 60s cache, so this adds no extra kintara.gg load."""
+    interval = interval or MERCHANT_SNAP_INTERVAL
+    while True:
+        try:
+            m = fetch_merchant()
+            con = connect()
+            try:
+                raw = m or {}
+                goals = raw.get("goals") or {}
+                resources, pcts = {}, []
+                for key, _label in MERCHANT_CAMPAIGN_RESOURCES:
+                    cur, goal = raw.get(key), goals.get(key)
+                    pct = (min(100.0, cur / goal * 100) if (cur is not None and goal) else None)
+                    if pct is not None:
+                        pcts.append(pct)
+                    resources[key] = {"current": cur, "goal": goal, "pct": pct}
+                overall = round(sum(pcts) / len(pcts), 2) if pcts else None
+                rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
+                cost, _capped = merchant_mint_cost(con, 1, rate)
+                con.execute(
+                    """INSERT OR REPLACE INTO merchant_snapshots
+                       (ts,mode,overall_pct,gold_stock,gold_trade,complete,resources,
+                        mint_usd,gold_rate)
+                       VALUES(?,?,?,?,?,?,?,?,?)""",
+                    (int(time.time() * 1000), raw.get("mode"), overall,
+                     raw.get("goldStock"), 1 if raw.get("goldTradeEnabled") else 0,
+                     1 if raw.get("complete") else 0, json.dumps(resources),
+                     round(cost, 6) if cost is not None else None,
+                     round(rate, 6) if rate else None))
+                con.commit()
+            finally:
+                con.close()
+        except Exception as e:
+            print(f"[{now_iso()}] merchant snapshot error: {e}")
+        time.sleep(interval)
+
+
+def merchant_forecast(con, gold_rate):
+    """Forecast the traveling-merchant campaign from merchant_snapshots history:
+      * completion ETA (when the donation phase finishes / gold-trade unlocks) from
+        the recent overall-% donation velocity,
+      * the bottleneck resource (the one that, at its current donation rate, finishes
+        LAST — that's what gates the campaign and whose demand is about to spike),
+      * per-resource donation velocity + demand pressure (fraction of goal/hour),
+      * the current mint cost = the break-even gold price, and whether minting is
+        profitable right now, plus the mint-profit history over the campaign.
+    Returns None until at least one snapshot exists."""
+    rows = con.execute(
+        """SELECT ts, overall_pct, resources, mint_usd, gold_rate, complete, mode, gold_stock
+           FROM merchant_snapshots ORDER BY ts DESC LIMIT 200""").fetchall()
+    if not rows:
+        return None
+    rows = list(reversed(rows))                      # chronological
+    latest, first_all = rows[-1], rows[0]
+    # velocity window: the last ~3h (fall back to whatever we have)
+    cutoff = latest["ts"] - 3 * 3600 * 1000
+    win = [r for r in rows if r["ts"] >= cutoff] or rows
+    first = win[0]
+    dt_h = (latest["ts"] - first["ts"]) / 3600000.0
+
+    eta_h = overall_vel = None
+    if dt_h > 0.05 and latest["overall_pct"] is not None and first["overall_pct"] is not None:
+        overall_vel = (latest["overall_pct"] - first["overall_pct"]) / dt_h     # %/hr
+        if overall_vel > 0.01 and latest["overall_pct"] < 100:
+            eta_h = (100 - latest["overall_pct"]) / overall_vel
+
+    res_now = json.loads(latest["resources"] or "{}")
+    res_then = json.loads(first["resources"] or "{}")
+    resources = []
+    for key, label in MERCHANT_CAMPAIGN_RESOURCES:
+        n, t = res_now.get(key) or {}, res_then.get(key) or {}
+        cur, goal, pct = n.get("current"), n.get("goal"), n.get("pct")
+        vel = r_eta = pressure = None
+        if dt_h > 0.05 and cur is not None and t.get("current") is not None:
+            vel = (cur - t["current"]) / dt_h                                   # units/hr
+            remaining = (goal - cur) if (goal is not None and cur is not None) else None
+            if vel and vel > 0 and remaining is not None and remaining > 0:
+                r_eta = remaining / vel
+            if vel and goal:
+                pressure = vel / goal                                           # frac of goal/hr
+        resources.append({"key": key, "label": label, "current": cur, "goal": goal,
+                          "pct": pct, "velocity_per_hr": vel, "eta_hours": r_eta,
+                          "pressure": pressure})
+    # bottleneck = finishes last (max eta); else the one furthest from its goal
+    withe = [r for r in resources if r["eta_hours"] is not None]
+    if withe:
+        bottleneck = max(withe, key=lambda r: r["eta_hours"])["key"]
+    else:
+        withp = [r for r in resources if r["pct"] is not None]
+        bottleneck = min(withp, key=lambda r: r["pct"])["key"] if withp else None
+
+    mint_now, capped = merchant_mint_cost(con, 1, gold_rate)
+    profit = (gold_rate - mint_now) if (gold_rate and mint_now is not None) else None
+    # mint-profit history (downsample to ~80 points for the chart)
+    pts = [r for r in rows if r["mint_usd"] is not None or r["gold_rate"]]
+    step = max(1, len(pts) // 80)
+    hist = [{"t": r["ts"], "mint_usd": r["mint_usd"], "gold_rate": r["gold_rate"],
+             "profit": ((r["gold_rate"] - r["mint_usd"])
+                        if (r["gold_rate"] and r["mint_usd"] is not None) else None)}
+            for r in pts[::step]]
+
+    return {
+        "mode": latest["mode"], "complete": bool(latest["complete"]),
+        "samples": len(rows), "window_hours": round(dt_h, 2),
+        "overall_pct": latest["overall_pct"],
+        "overall_velocity_pct_hr": overall_vel,
+        "eta_hours": round(eta_h, 2) if eta_h is not None else None,
+        "eta_iso": (datetime.now(timezone.utc) + _td(hours=eta_h)).isoformat()
+                   if eta_h is not None else None,
+        "bottleneck": bottleneck, "resources": resources,
+        "mint_cost_usd": round(mint_now, 6) if mint_now is not None else None,
+        "mint_capped": capped,
+        "break_even_gold_usd": round(mint_now, 6) if mint_now is not None else None,
+        "current_gold_usd": round(gold_rate, 6) if gold_rate else None,
+        "mint_profit_usd": round(profit, 6) if profit is not None else None,
+        "profitable": bool(profit is not None and profit > 0),
+        "profit_history": hist,
+    }
 
 
 def fetch_property_status():
@@ -1679,6 +2086,94 @@ def gold_daily_usd(con):
 # value swings wildly, so they don't belong in the Collectables (CMP) mispricing scan.
 # Detected by high sales volume + low price; this explicit set is a belt-and-braces guard.
 FARMABLE_CMP = {"mount_wolf", "mount_dragon", "mount_whale"}
+
+
+def _parse_iso_ms(s):
+    """Epoch-ms from one of kintara's ISO timestamps ('…Z' or '…+00:00'). None on junk."""
+    if not s:
+        return None
+    try:
+        return int(datetime.fromisoformat(s.replace("Z", "+00:00")).timestamp() * 1000)
+    except (ValueError, TypeError):
+        return None
+
+
+def time_to_sell(con, item_type, days=21):
+    """Estimated how long a listing of this item sits before it clears. Uses the
+    lifecycle of listings we watched from creation to removal (removed_at − created_at,
+    restricted to listings created AFTER tracking began so we saw their full life), and
+    a sold-vs-delisted calibration (sale-event units ÷ removed units in the window) so
+    a market where things mostly get cancelled rather than bought is flagged as such.
+    Returns {median_min, p25_min, p75_min, n, sold_ratio} or None when too thin."""
+    cutoff = (datetime.now(timezone.utc) - _td(days=days)).isoformat()
+    track_start = con.execute("SELECT MIN(first_seen) m FROM listings").fetchone()["m"]
+    ts0 = _parse_iso_ms(track_start) or 0
+    spans = []
+    removed_units = 0
+    for r in con.execute(
+            """SELECT created_at, first_seen, removed_at, quantity FROM listings
+               WHERE item_type=? AND removed_at IS NOT NULL AND removed_at >= ?""",
+            (item_type, cutoff)):
+        removed_units += r["quantity"] or 0
+        created = _parse_iso_ms(r["created_at"])
+        gone = _parse_iso_ms(r["removed_at"])
+        if created is None or gone is None or created < ts0:
+            continue  # listing predated tracking → we didn't see its true start
+        span = (gone - created) / 60000.0
+        if span >= 0:
+            spans.append(span)
+    if len(spans) < 4:
+        return None
+    spans.sort()
+    def q(f):
+        return spans[min(len(spans) - 1, int(f * len(spans)))]
+    sold = con.execute(
+        "SELECT COALESCE(SUM(units),0) u FROM sales_events WHERE item_type=? AND ts>=?",
+        (item_type, ts0)).fetchone()["u"] or 0
+    sold_ratio = min(1.0, sold / removed_units) if removed_units else None
+    return {"median_min": q(0.5), "p25_min": q(0.25), "p75_min": q(0.75),
+            "n": len(spans), "sold_ratio": sold_ratio}
+
+
+def recent_fair_usd(con, item_type, days=14):
+    """Volume-weighted average USD sale price over the last `days`, from sales_events.
+    Gold sales are converted at the gold price on their own day. The 'fair value'
+    anchor for the scorecard's cheap/fair/expensive verdict. Returns (usd, units)."""
+    cutoff = (datetime.now(timezone.utc) - _td(days=days)).isoformat()[:10]
+    gusd = gold_daily_usd(con)
+    gdates = sorted(gusd)
+    def gold_on(d):
+        prior = [x for x in gdates if x <= d]
+        return gusd[prior[-1]] if prior else (gusd[gdates[0]] if gdates else None)
+    num = den = 0.0
+    for r in con.execute(
+            "SELECT currency, units, price, day FROM sales_events WHERE item_type=? AND day>=?",
+            (item_type, cutoff)):
+        u = r["units"] or 0
+        if not u or r["price"] is None:
+            continue
+        if r["currency"] == "token":
+            usd = r["price"]
+        else:
+            g = gold_on(r["day"])
+            usd = r["price"] * g if g else None
+        if usd is not None:
+            num += usd * u
+            den += u
+    return (num / den, den) if den else (None, 0)
+
+
+def liquidity_score(velocity, listed_qty, sellers, last_age_days):
+    """0–100 'can I actually exit this' score from sales velocity, available depth,
+    seller competition and recency of the last trade. Deliberately simple + monotone
+    so it's explainable; tune weights later from real outcomes."""
+    import math
+    v = min(1.0, math.log1p(max(0.0, velocity)) / math.log(50))      # ~50 sales/day saturates
+    d = min(1.0, math.log1p(max(0, listed_qty)) / math.log(100000))  # depth
+    s = min(1.0, (sellers or 0) / 15.0)                              # competition/robustness
+    rec = 1.0 if last_age_days is None else max(0.0, 1.0 - last_age_days / 21.0)
+    score = 100 * (0.40 * v + 0.20 * d + 0.15 * s + 0.25 * rec)
+    return round(score)
 
 
 def compute_mispricing(con, gold_item):
@@ -2447,11 +2942,187 @@ def make_app():
                         for r in rows]
 
             gold, token = cheapest("gold"), cheapest("token")
+            # --- price-memory references (so each listing can be badged vs history) ---
+            mem = con.execute(
+                """SELECT MIN(floor_usd) ever,
+                          MIN(CASE WHEN ts>=? THEN floor_usd END) d7,
+                          MIN(CASE WHEN ts>=? THEN floor_usd END) d1
+                   FROM orderbook_snapshots WHERE item_type=? AND floor_usd IS NOT NULL""",
+                (int((time.time() - 7 * 86400) * 1000),
+                 int((time.time() - 86400) * 1000), item)).fetchone()
+            fair_usd, _fn = recent_fair_usd(con, item)
         finally:
             con.close()
         kins_px = current_kins_usd()
+        floor_ever = mem["ever"] if mem else None
+        floor_7d = mem["d7"] if mem else None
+        floor_1d = mem["d1"] if mem else None
+
+        def badge(lst, cur):
+            """Attach price-memory badges to each cheapest-listing row (in place)."""
+            for L in lst:
+                pu = L["per_unit"]
+                usd = pu if cur == "token" else (pu * gold_rate if gold_rate else None)
+                tags = []
+                if usd is not None:
+                    if floor_ever is not None and usd <= floor_ever * 1.001:
+                        tags.append("cheapest-ever")
+                    elif floor_7d is not None and usd <= floor_7d * 1.001:
+                        tags.append("cheapest-7d")
+                    if fair_usd:
+                        if usd <= fair_usd * 0.92:
+                            tags.append("below-sale-avg")
+                        elif usd >= fair_usd * 2:
+                            tags.append("likely-overpriced")
+                        elif usd >= fair_usd * 1.15:
+                            tags.append("above-fair")
+                L["badges"] = tags
+        badge(gold, "gold")
+        badge(token, "token")
         return jsonify({"ok": True, "gold": gold, "token": token,
-                        "gold_rate": gold_rate, "kins_price": kins_px})
+                        "gold_rate": gold_rate, "kins_price": kins_px,
+                        "memory": {"floor_ever_usd": floor_ever, "floor_7d_usd": floor_7d,
+                                   "floor_1d_usd": floor_1d, "fair_usd": fair_usd}})
+
+    @app.route("/api/floor-history")
+    def floor_history():
+        """Floor-price history for one item, in gold / USD / KINS. Recent points come
+        from the fine-grained orderbook_snapshots (per-tick cheapest USD floor across
+        both currencies); older points fall back to item_daily_metrics (one/day) for
+        the stretch before snapshot coverage. Gold/KINS are derived from USD via the
+        gold-price and KINS daily series (same approach as the sales charts)."""
+        item = (request.args.get("item_type") or "").strip()
+        if not item:
+            return jsonify({"ok": False, "error": "item_type required"}), 400
+        rng = (request.args.get("range") or "7D").upper()
+        days = {"24H": 1, "3D": 3, "7D": 7, "30D": 30, "ALL": 3650}.get(rng, 7)
+        con = connect(readonly=True)
+        try:
+            lo = int((time.time() - days * 86400) * 1000)
+            ticks = {}
+            for r in con.execute(
+                    """SELECT ts, currency, floor, floor_usd FROM orderbook_snapshots
+                       WHERE item_type=? AND ts>=? ORDER BY ts""", (item, lo)):
+                c = ticks.setdefault(r["ts"], {"usd": None})
+                if r["floor_usd"] is not None and (c["usd"] is None or r["floor_usd"] < c["usd"]):
+                    c["usd"] = r["floor_usd"]
+            snap_start = min(ticks) if ticks else int(time.time() * 1000)
+            # older days from the durable rollup (before snapshot coverage)
+            older = []
+            for r in con.execute(
+                    """SELECT day, floor_usd_close FROM item_daily_metrics
+                       WHERE item_type=? AND floor_usd_close IS NOT NULL ORDER BY day""", (item,)):
+                dts = int(datetime.strptime(r["day"], "%Y-%m-%d")
+                          .replace(tzinfo=timezone.utc).timestamp() * 1000)
+                if lo <= dts < snap_start:
+                    older.append((dts, r["floor_usd_close"]))
+            gusd, kusd = gold_daily_usd(con), kins_daily_usd()
+        finally:
+            con.close()
+        gdates, kdates = sorted(gusd), sorted(kusd)
+        def carry(m, dates, d):
+            if d in m:
+                return m[d]
+            prior = [x for x in dates if x <= d]
+            return m[prior[-1]] if prior else None
+        pts = older + [(t, ticks[t]["usd"]) for t in sorted(ticks)]
+        series = []
+        for t, usd in pts:
+            if usd is None:
+                continue
+            d = datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d")
+            gu, ku = carry(gusd, gdates, d), carry(kusd, kdates, d)
+            series.append({"t": t, "usd": usd,
+                           "gold": (usd / gu) if gu else None,
+                           "kins": (usd / ku) if ku else None})
+        return jsonify({"ok": True, "item_type": item, "range": rng, "series": series})
+
+    @app.route("/api/scorecard")
+    def scorecard():
+        """The Item Scorecard payload: current floor (gold/USD/KINS), 24h/7d/30d
+        change, sales velocity, listed supply, seller count, liquidity score,
+        volatility, estimated time-to-sell, a gold-anchored fair value + cheap/fair/
+        expensive verdict, and the last sale. Reads the durable metrics + a couple of
+        cheap live queries — never aggregates raw snapshots per request."""
+        item = (request.args.get("item_type") or "").strip()
+        if not item:
+            return jsonify({"ok": False, "error": "item_type required"}), 400
+        con = connect(readonly=True)
+        try:
+            gold_item = get_setting(con, "gold_item")
+            rate, _ = gold_rate_usd(con, gold_item)
+            kp = current_kins_usd()
+            rclause, rparam = _buyable_clause()
+            # current floor across both currencies (cheapest buyable per-unit → USD)
+            floor_usd = None
+            for r in con.execute(
+                    f"""SELECT currency, MIN(per_unit) p FROM listings
+                        WHERE active=1 AND item_type=? AND per_unit IS NOT NULL{rclause}
+                        GROUP BY currency""", (item, rparam)):
+                if r["p"] is None:
+                    continue
+                u = r["p"] if r["currency"] == "token" else (r["p"] * rate if rate else None)
+                if u is not None and (floor_usd is None or u < floor_usd):
+                    floor_usd = u
+            # latest snapshot row aggregates (supply / sellers) — cheap, indexed
+            supply = sellers = None
+            srow = con.execute(
+                """SELECT SUM(listed_qty) q, SUM(sellers) s, MAX(ts) t
+                   FROM orderbook_snapshots
+                   WHERE item_type=? AND ts=(SELECT MAX(ts) FROM orderbook_snapshots
+                                             WHERE item_type=?)""", (item, item)).fetchone()
+            if srow and srow["t"]:
+                supply, sellers = srow["q"], srow["s"]
+            # % change vs floor_usd_close N days ago (from the rollup)
+            def change(n):
+                d = (datetime.now(timezone.utc) - _td(days=n)).strftime("%Y-%m-%d")
+                row = con.execute(
+                    """SELECT floor_usd_close c FROM item_daily_metrics
+                       WHERE item_type=? AND day<=? AND floor_usd_close IS NOT NULL
+                       ORDER BY day DESC LIMIT 1""", (item, d)).fetchone()
+                if row and row["c"] and floor_usd:
+                    return round((floor_usd - row["c"]) / row["c"] * 100, 1)
+                return None
+            changes = {"d1": change(1), "d7": change(7), "d30": change(30)}
+            # velocity = avg units/day sold over 7d; volatility = recent daily avg
+            vrow = con.execute(
+                """SELECT COALESCE(SUM(volume_units),0) u, AVG(volatility) v
+                   FROM item_daily_metrics WHERE item_type=? AND day>=?""",
+                (item, (datetime.now(timezone.utc) - _td(days=7)).strftime("%Y-%m-%d"))).fetchone()
+            velocity = (vrow["u"] / 7.0) if vrow else 0
+            volatility = vrow["v"] if vrow else None
+            last = con.execute(
+                """SELECT units, price, currency, day, ts FROM sales_events
+                   WHERE item_type=? ORDER BY ts DESC LIMIT 1""", (item,)).fetchone()
+            last_age = None
+            if last:
+                last_age = (time.time() * 1000 - last["ts"]) / 86400000.0
+            tts = time_to_sell(con, item)
+            fair_usd, fair_units = recent_fair_usd(con, item)
+        finally:
+            con.close()
+        liq = liquidity_score(velocity, supply or 0, sellers or 0, last_age)
+        # verdict: cheap/fair/expensive vs the gold-anchored fair value
+        verdict = conf = None
+        if fair_usd and floor_usd:
+            r = floor_usd / fair_usd
+            verdict = "cheap" if r <= 0.9 else ("expensive" if r >= 1.12 else "fair")
+            conf = "high" if fair_units >= 8 else ("med" if fair_units >= 3 else "low")
+        return jsonify({
+            "ok": True, "item_type": item, "label": item_label(item),
+            "category": categorize(item),
+            "floor": {"usd": floor_usd,
+                      "gold": (floor_usd / rate) if (floor_usd and rate) else None,
+                      "kins": (floor_usd / kp) if (floor_usd and kp) else None},
+            "gold_rate": rate, "kins_price": kp,
+            "change": changes,
+            "velocity": round(velocity, 2), "listed_supply": supply,
+            "sellers": sellers, "liquidity": liq, "volatility": volatility,
+            "time_to_sell": tts,
+            "fair_usd": fair_usd, "fair_units": fair_units,
+            "verdict": verdict, "confidence": conf,
+            "last_sale": (dict(last) if last else None),
+        })
 
     @app.route("/api/sales-summary")
     def sales_summary():
@@ -2605,10 +3276,11 @@ def make_app():
                 ladder, avail = order_book_usd(con, key, gold_rate)
                 recipe.append({"item_type": key, "label": label, "qty": qty,
                                "ladder": ladder, "available": avail})
+            forecast = merchant_forecast(con, gold_rate)
         finally:
             con.close()
         calc = {"gold_rate": round(gold_rate, 6) if gold_rate else None, "recipe": recipe}
-        return jsonify({"ok": True, "state": state, "calc": calc})
+        return jsonify({"ok": True, "state": state, "calc": calc, "forecast": forecast})
 
     @app.route("/api/live")
     def live():
@@ -2940,6 +3612,34 @@ td.isd{cursor:help}
 .spread-box .v.pos{color:var(--buy)}.spread-box .v.neg{color:var(--sell)}
 .mintctl{display:flex;align-items:center;gap:9px;margin:2px 0 14px;color:var(--mut);font:13px var(--ui)}
 .mintctl input{width:96px}
+/* merchant forecast desk (full-width panel under the tracker + calculator) */
+.mfc{margin-top:18px}
+.fc-eta{display:flex;align-items:baseline;gap:12px;margin:6px 0 16px;flex-wrap:wrap}
+.fc-eta .fc-num{font:800 30px 'Fredoka';color:var(--gold2);line-height:1}
+.fc-eta.done .fc-num{color:var(--buy)}
+.fc-eta .fc-lab{color:var(--mut);font:13px var(--ui)} .fc-eta .fc-lab b{color:var(--ink)}
+.fc-reshead{display:grid;grid-template-columns:1fr 130px 88px 64px;gap:10px;color:#7f93ad;
+  font:600 10px 'Fredoka';letter-spacing:.05em;text-transform:uppercase;margin-bottom:6px}
+.fc-reshead .r{text-align:right}
+.fc-res{display:grid;grid-template-columns:1fr 130px 88px 64px;gap:10px;align-items:center;
+  padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05);font:13px 'Fredoka'}
+.fc-res .nm{display:flex;align-items:center;gap:7px;color:#dbe5f0}
+.fc-res .nm .ico{width:20px;height:20px}
+.fc-res.bn .nm{color:var(--gold2);font-weight:600}
+.fc-tag{font:600 9px 'Fredoka';letter-spacing:.04em;text-transform:uppercase;color:#f06a6a;
+  border:1px solid #f06a6a55;background:#f06a6a14;border-radius:5px;padding:1px 5px}
+.fc-res .bar{height:7px;border-radius:4px;background:rgba(255,255,255,.06);overflow:hidden}
+.fc-res .bar .fill{display:block;height:100%;background:linear-gradient(90deg,#e8b54a,#f06a6a)}
+.fc-res .vv{text-align:right;color:#9fb1c8;font:12px var(--mono)}
+.fc-res .ee{text-align:right;color:#dbe5f0;font:12px var(--mono)}
+.fc-econ{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin:16px 0 4px}
+@media(max-width:680px){.fc-econ{grid-template-columns:1fr}}
+.fc-e{border:1px solid var(--line);border-radius:11px;padding:11px 13px;background:rgba(255,255,255,.02)}
+.fc-e .k{display:block;color:var(--mut);font:11px var(--ui)}
+.fc-e .v{display:block;font:800 19px 'Fredoka';margin:2px 0} .fc-e .v.gold{color:var(--gold2)}
+.fc-e .v.pos{color:var(--buy)} .fc-e .v.neg{color:var(--sell)}
+.fc-e .sub{color:#6f86a6;font:11px var(--ui)}
+.fc-spk{margin-top:16px}
 
 /* ===== live world (roster-first; per-player map dropdown) ===== */
 .lw-head{display:flex;align-items:center;gap:12px;flex-wrap:wrap;margin-bottom:8px}
@@ -3114,7 +3814,25 @@ td.isd{cursor:help}
 .gw-cseg button{border:0;background:rgba(255,255,255,.03);color:#9fb1c8;font:500 12.5px 'Fredoka';
   padding:6px 14px;cursor:pointer}
 .gw-cseg button.on{background:linear-gradient(180deg,rgba(232,181,74,.2),rgba(232,181,74,.05));color:var(--gold2)}
+.gw-cseg.sm button{padding:4px 10px;font-size:11.5px}
 .gw-empty{color:#6f86a6;font:400 13px 'Fredoka';padding:30px;text-align:center}
+/* Item Scorecard header (the stock-page strip at the top of the expand) */
+.gw-score{grid-column:1/-1;margin-bottom:6px}
+.sc-wrap{display:flex;flex-wrap:wrap;gap:14px 26px;align-items:center;
+  background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.01));
+  border:1px solid rgba(255,255,255,.08);border-radius:12px;padding:12px 16px}
+.sc-floors{display:flex;align-items:center;gap:20px}
+.sc-floor-main .sc-price{font:800 26px 'Fredoka';line-height:1.05} .sc-price .usd{color:#eaf1fa}
+.sc-floor-main .sc-sub{color:#8aa0bd;font:500 12.5px var(--mono);margin-top:2px}
+.sc-verdict{font:700 10px 'Fredoka';letter-spacing:.06em;padding:2px 7px;border-radius:6px;margin-left:8px;vertical-align:middle}
+.sc-chg{display:flex;gap:14px}
+.sc-stats{display:flex;flex-wrap:wrap;gap:12px 22px;margin-left:auto}
+.sc-stat .sc-k{color:#7f93ad;font:600 10px 'Fredoka';letter-spacing:.04em;text-transform:uppercase}
+.sc-stat .sc-v{color:#dbe5f0;font:700 15px 'Fredoka'}
+.sc-v .sc-mut,.sc-chg .sc-mut{color:#6f86a6;font-weight:500}
+.sc-v .up,.sc-chg .up{color:#34d39a} .sc-v .down,.sc-chg .down{color:#f06a6a}
+.gw-floor{grid-column:1/-1;margin-bottom:4px}
+.ll-badge{font:600 10px 'Fredoka';padding:1px 6px;border-radius:5px;border:1px solid;white-space:nowrap}
 /* item index info panel (cosmetic/mount/pet expand) */
 .gw-meta{margin-top:14px;border-top:1px solid rgba(255,255,255,.07);padding-top:13px}
 .gw-meta-h{font:700 12px 'Cinzel',serif;letter-spacing:.06em;color:var(--gold2);text-transform:uppercase;margin-bottom:7px}
@@ -4048,7 +4766,9 @@ async function openHist(it){
   const row=((SUMMARY&&SUMMARY.items)||[]).find(r=>r.item_type===it);
   const isMat=row&&row.category==='material';
   const showMeta=row&&['cosmetic','mount','pet'].includes(row.category);
-  exp.innerHTML=`<div class="gw-expinner">
+  exp.innerHTML=`<div id="gwscore" class="gw-score">${skel(1)}</div>
+    <div id="gwfloor" class="gw-floor"></div>
+    <div class="gw-expinner">
     <div style="min-width:0">
       <div class="gw-cseg">
         <button data-c="token" class="${cur==='token'?'on':''}">USD ($KINS)</button>
@@ -4065,10 +4785,99 @@ async function openHist(it){
   exp.querySelectorAll("[data-c]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.histCur=b.dataset.c;openHist(it);});
   exp.onclick=ev=>ev.stopPropagation();   // clicks inside don't collapse the row
   drawSalesChart(it, cur);
+  loadScorecard(it);
+  loadFloorHistory(it);
   if(isMat) loadLiquidity(it);
   if(showMeta) loadItemMeta(it);
   loadItemListings(it);
   loadRecentSales(it);
+}
+/* ---- Item Scorecard: the stock-page header for the expanded item ---- */
+const scoreCache={};
+async function loadScorecard(it){
+  const w=$("#gwscore"); if(!w) return;
+  let d=scoreCache[it];
+  if(!d){ try{ d=await (await fetch("/api/scorecard?item_type="+encodeURIComponent(it))).json(); scoreCache[it]=d; }
+    catch(e){ w.innerHTML=""; return; } }
+  if($("#gwscore")) $("#gwscore").innerHTML=scorecardHTML(d);
+}
+function scorecardHTML(d){
+  if(!d||d.ok===false) return "";
+  const f=d.floor||{};
+  const gold=f.gold!=null?(f.gold>=1?(+f.gold.toFixed(2)):(+f.gold.toPrecision(3)))+"g":"—";
+  const usd=f.usd!=null?"$"+(f.usd>=1?f.usd.toFixed(2):(+f.usd.toPrecision(3))):"—";
+  const kins=f.kins!=null?(f.kins>=1?Math.round(f.kins).toLocaleString():(+f.kins.toFixed(2)))+" $KINS":"—";
+  const chg=v=> v==null?'<span class="sc-mut">—</span>':`<span class="${v>0?'up':v<0?'down':'sc-mut'}">${v>0?'+':''}${v}%</span>`;
+  // cheap/fair/expensive verdict pill
+  const vClr={cheap:'#34d39a',fair:'#e8b54a',expensive:'#f06a6a'}[d.verdict]||'#7f93ad';
+  const verdict=d.verdict?`<span class="sc-verdict" style="background:${vClr}22;color:${vClr};border:1px solid ${vClr}66" data-tip="vs gold-anchored fair value ${d.fair_usd!=null?'$'+(+d.fair_usd).toPrecision(3):''} · confidence ${d.confidence||'low'}">${d.verdict.toUpperCase()}</span>`:'';
+  // liquidity rating word
+  const liq=d.liquidity, liqW=liq>=70?'deep':liq>=40?'ok':'thin', liqC=liq>=70?'#34d39a':liq>=40?'#e8b54a':'#f06a6a';
+  // time to sell
+  let tts='—', ttsTip='';
+  if(d.time_to_sell){ const mn=d.time_to_sell.median_min;
+    tts = mn<60?Math.round(mn)+'m' : mn<1440?(+(mn/60).toFixed(1))+'h' : (+(mn/1440).toFixed(1))+'d';
+    const sr=d.time_to_sell.sold_ratio;
+    ttsTip=`median over ${d.time_to_sell.n} listings we watched start→finish`+(sr!=null?` · ~${Math.round(sr*100)}% of removals were sales (rest cancelled)`:'');
+  }
+  const vol=d.volatility!=null?Math.round(d.volatility*100)+'%':'—';
+  const stat=(label,val,tip,cls)=>`<div class="sc-stat"><div class="sc-k">${label}</div><div class="sc-v ${cls||''}"${tip?` data-tip="${tip}"`:''}>${val}</div></div>`;
+  return `<div class="sc-wrap">
+    <div class="sc-floors">
+      <div class="sc-floor-main"><div class="sc-k">Floor ${verdict}</div>
+        <div class="sc-price"><b class="usd">${usd}</b></div>
+        <div class="sc-sub">${gold} · ${kins}</div></div>
+      <div class="sc-chg">${stat('24h',chg(d.change?.d1))}${stat('7d',chg(d.change?.d7))}${stat('30d',chg(d.change?.d30))}</div>
+    </div>
+    <div class="sc-stats">
+      ${stat('Liquidity',`<b style="color:${liqC}">${liq}</b> <span class="sc-mut">${liqW}</span>`,'can you actually exit — sales velocity + depth + sellers + recency (0–100)')}
+      ${stat('Sells/day',d.velocity!=null?(+d.velocity).toLocaleString():'—','units sold per day, 7d avg')}
+      ${stat('Time to sell',tts,ttsTip)}
+      ${stat('Listed supply',d.listed_supply!=null?fmtK(d.listed_supply):'—','total buyable units on the market now')}
+      ${stat('Sellers',d.sellers!=null?d.sellers:'—','distinct sellers competing now')}
+      ${stat('Volatility',vol,'7d floor variation (stdev/mean)')}
+    </div></div>`;
+}
+/* ---- Floor price history chart (gold / USD / $KINS toggle + ranges) ---- */
+const floorCache={};
+async function loadFloorHistory(it){
+  const w=$("#gwfloor"); if(!w) return;
+  const unit=state.floorUnit||"usd", rng=state.floorRange||"7D";
+  const key=it+"|"+rng;
+  let d=floorCache[key];
+  if(!d){ try{ d=await (await fetch(`/api/floor-history?item_type=${encodeURIComponent(it)}&range=${rng}`)).json(); floorCache[key]=d; }
+    catch(e){ w.innerHTML=""; return; } }
+  if($("#gwfloor")) $("#gwfloor").innerHTML=floorChartHTML(d,unit,it);
+  document.querySelectorAll("#gwfloor [data-fu]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.floorUnit=b.dataset.fu;loadFloorHistory(it);});
+  document.querySelectorAll("#gwfloor [data-fr]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.floorRange=b.dataset.fr;loadFloorHistory(it);});
+}
+function floorChartHTML(d,unit,it){
+  const seg=`<div class="gw-cseg sm">
+    ${['gold','usd','kins'].map(u=>`<button data-fu="${u}" class="${u===unit?'on':''}">${u==='usd'?'USD':u==='gold'?'Gold':'$KINS'}</button>`).join('')}
+    <span style="width:10px"></span>
+    ${['24H','3D','7D','30D','ALL'].map(r=>`<button data-fr="${r}" class="${r===(state.floorRange||'7D')?'on':''}">${r}</button>`).join('')}</div>`;
+  const pts=((d&&d.series)||[]).map(p=>[p.t,p[unit]]).filter(p=>p[1]!=null);
+  const head=`<div class="gw-meta-h">Floor price history <span style="color:#7f93ad;font-weight:400">— the cheapest listing over time (${unit==='usd'?'USD':unit==='gold'?'gold':'$KINS'})</span></div>`;
+  if(pts.length<2) return `${head}${seg}<div class="gw-empty">Not enough floor history yet — this builds as snapshots accumulate.</div>`;
+  const W=1100,H=180,PL=58,PR=14,PT=12,PB=22,plotW=W-PL-PR,plotH=H-PT-PB;
+  const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys);
+  const X=t=>PL+(x1===x0?0:(t-x0)/(x1-x0))*plotW;
+  const pad=(y1-y0)*0.12||y0*0.1||1, lo=Math.max(0,y0-pad), hi=y1+pad;
+  const Y=v=>PT+plotH-(hi===lo?0.5:(v-lo)/(hi-lo))*plotH;
+  const fmtV=v=> unit==='usd'?'$'+(v>=1?v.toFixed(2):(+v.toPrecision(3))) : unit==='gold'?((v>=1?(+v.toFixed(2)):(+v.toPrecision(3)))+'g') : (v>=1?Math.round(v).toLocaleString():(+v.toFixed(2)))+'';
+  let grid='';[0,.5,1].forEach(f=>{const v=lo+(hi-lo)*(1-f),yy=PT+plotH*f;
+    grid+=`<line x1="${PL}" y1="${yy}" x2="${W-PR}" y2="${yy}" stroke="rgba(120,140,165,.12)"/>`+
+      `<text x="${PL-7}" y="${yy+3}" text-anchor="end" fill="#6f86a6" font-size="10" font-family="monospace">${fmtV(v)}</text>`;});
+  const line=pts.map((p,i)=>`${i?'L':'M'}${X(p[0]).toFixed(1)} ${Y(p[1]).toFixed(1)}`).join(' ');
+  const area=`M${X(pts[0][0]).toFixed(1)} ${(PT+plotH).toFixed(1)} `+pts.map(p=>`L${X(p[0]).toFixed(1)} ${Y(p[1]).toFixed(1)}`).join(' ')+` L${X(pts[pts.length-1][0]).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
+  const dt=t=>new Date(t).toLocaleDateString(undefined,{month:'short',day:'numeric',timeZone:'UTC'});
+  const clr=unit==='gold'?'#e8b54a':unit==='kins'?'#7aa2ff':'#34d39a';
+  return `${head}${seg}<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
+    <defs><linearGradient id="flg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${clr}" stop-opacity=".22"/><stop offset="1" stop-color="${clr}" stop-opacity="0"/></linearGradient></defs>
+    ${grid}<path d="${area}" fill="url(#flg)"/><path d="${line}" fill="none" stroke="${clr}" stroke-width="1.8"/>
+    <text x="${PL}" y="${H-7}" fill="#6f86a6" font-size="10" font-family="monospace">${dt(x0)}</text>
+    <text x="${W-PR}" y="${H-7}" text-anchor="end" fill="#6f86a6" font-size="10" font-family="monospace">${dt(x1)}</text></svg>`;
 }
 /* per-item recent ACTUAL sales (from /api/sales-feed), for the Index item expand */
 async function loadRecentSales(it){
@@ -4099,17 +4908,24 @@ function itemListingsHTML(d){
   const rate=d.gold_rate, kp=d.kins_price;
   const sig=v=> v>=1?(+v.toFixed(2)):(+v.toPrecision(3));   // keep small per-unit prices readable
   const sel=s=>s?`<span class="ll-sel">${esc(s)}</span>`:'';
+  // price-memory badges (computed server-side vs snapshot/sale history)
+  const BADGE={'cheapest-ever':['cheapest ever','#34d39a','lowest this item has ever been seen'],
+    'cheapest-7d':['7d low','#34d39a','lowest in the last 7 days'],
+    'below-sale-avg':['below sale avg','#3fb6c9','under what it actually sold for recently'],
+    'above-fair':['above fair','#e8b54a','priced over recent fair value'],
+    'likely-overpriced':['overpriced','#f06a6a','far above fair value — likely bait']};
+  const tags=r=>(r.badges||[]).map(b=>{const m=BADGE[b];return m?`<span class="ll-badge" style="color:${m[1]};border-color:${m[1]}55;background:${m[1]}14" data-tip="${m[2]}">${m[0]}</span>`:'';}).join("");
   // actual listing price (total), with stack + per-unit only when it's a stack
   const goldRows=(d.gold||[]).map(r=>{
     const tot=r.price!=null?r.price:r.per_unit*(r.qty||1);
     const stack=r.qty>1?`<span class="ll-q">×${r.qty.toLocaleString()}</span><span class="ll-x">${sig(r.per_unit)}g/ea</span>`:'';
     const usd=rate?`<span class="ll-x">≈$${(tot*rate).toFixed(2)}</span>`:'';
-    return `<div class="ll-row"><span class="ll-p">${sig(tot)}g</span>${stack}${usd}${sel(r.seller)}</div>`;}).join("");
+    return `<div class="ll-row"><span class="ll-p">${sig(tot)}g</span>${stack}${usd}${tags(r)}${sel(r.seller)}</div>`;}).join("");
   const tokRows=(d.token||[]).map(r=>{
     const tot=r.price!=null?r.price:r.per_unit*(r.qty||1);
     const stack=r.qty>1?`<span class="ll-q">×${r.qty.toLocaleString()}</span><span class="ll-x">$${sig(r.per_unit)}/ea</span>`:'';
     const kins=kp?`<span class="ll-x">${(tot/kp>=1?Math.round(tot/kp).toLocaleString():(+(tot/kp).toFixed(2)))} $KINS</span>`:'';
-    return `<div class="ll-row"><span class="ll-p">$${sig(tot)}</span>${stack}${kins}${sel(r.seller)}</div>`;}).join("");
+    return `<div class="ll-row"><span class="ll-p">$${sig(tot)}</span>${stack}${kins}${tags(r)}${sel(r.seller)}</div>`;}).join("");
   const col=(title,rows,empty)=>`<div class="ll-col"><div class="ll-h">${title}</div>${rows||`<div class="ll-none">${empty}</div>`}</div>`;
   return `<div class="gw-meta-h">Cheapest live listings <span style="color:#7f93ad;font-weight:400">— actual price, sorted by cheapest per-unit, up to 5 each</span></div>
     <div class="ll-cols">
@@ -4541,10 +5357,75 @@ function renderMerchant(){
     </div>`}
     <div class="msub" style="margin-top:12px;font-size:12px">Gold price = our live rate (avg of the 3 cheapest per-gold asks). Trade recipe = current game.js MERCHANT_TRADE_COST. Resource cost = actually buying that many units cheapest-first across all live listings (gold listings converted at the gold rate); listed liquidity supports ~${maxMint.toLocaleString()} gold.</div>
   </section>`;
-  $("#view").innerHTML=`<div class="mwrap">${track}${calc}</div>`;
+  $("#view").innerHTML=`<div class="mwrap">${track}${calc}</div>${forecastHTML(d.forecast)}`;
   const q=$("#mintQty");
   if(q) q.oninput=()=>{ state.mintQty=q.value; renderMerchant();
     const nq=$("#mintQty"); if(nq){ nq.focus(); nq.setSelectionRange(nq.value.length,nq.value.length);} };
+}
+function fmtDur(h){ if(h==null)return '—'; if(h<1)return Math.round(h*60)+'m'; if(h<48)return (+h.toFixed(1))+'h'; return (+(h/24).toFixed(1))+'d'; }
+/* Merchant forecast desk: completion ETA, bottleneck resource, demand pressure,
+   break-even gold price + mint profitability over the campaign. */
+function forecastHTML(f){
+  if(!f) return `<section class="mpanel mfc"><div class="mhead"><div class="mtitle">Merchant Forecast</div></div>
+    <div class="msub">Forecast builds as KinScan logs merchant snapshots over time — it needs a little history of the campaign moving. Check back shortly.</div></section>`;
+  const res=f.resources||[];
+  // headline: when does the donation phase finish (= gold trade unlocks)?
+  let head;
+  if(f.complete){
+    head=`<div class="fc-eta done"><span class="fc-num">Campaign complete</span><span class="fc-lab">gold trade phase</span></div>`;
+  } else if(f.eta_hours!=null){
+    const when=f.eta_iso?new Date(f.eta_iso).toLocaleString(undefined,{weekday:'short',hour:'numeric',minute:'2-digit'}):'';
+    head=`<div class="fc-eta"><span class="fc-num">~${fmtDur(f.eta_hours)}</span>
+      <span class="fc-lab">to completion${when?` · gold trade unlocks ≈ <b>${when}</b>`:''}</span></div>`;
+  } else {
+    head=`<div class="fc-eta"><span class="fc-num">—</span><span class="fc-lab">donation pace too flat to project yet</span></div>`;
+  }
+  const velNote=f.overall_velocity_pct_hr!=null?`donation pace ${(+f.overall_velocity_pct_hr).toFixed(1)}%/hr · over the last ${f.window_hours}h`:'';
+  // bottleneck + demand pressure bars
+  const maxPress=Math.max(1e-9,...res.map(r=>r.pressure||0));
+  const resRows=res.map(r=>{
+    const bn=r.key===f.bottleneck;
+    const pw=r.pressure?Math.max(3,Math.round(r.pressure/maxPress*100)):0;
+    return `<div class="fc-res ${bn?'bn':''}">
+      <span class="nm">${mIcon(r.key)}${r.label}${bn?' <span class="fc-tag" data-tip="at current donation rate this resource finishes last — it gates the campaign, so its market demand is about to spike">bottleneck</span>':''}</span>
+      <span class="bar"><span class="fill" style="width:${pw}%"></span></span>
+      <span class="vv" data-tip="donation rate (this resource added per hour)">${r.velocity_per_hr!=null?'+'+fmtK(Math.round(r.velocity_per_hr))+'/h':'—'}</span>
+      <span class="ee" data-tip="time to fill this resource's goal at the current rate">${r.eta_hours!=null?fmtDur(r.eta_hours):'—'}</span>
+    </div>`; }).join("");
+  // mint economics
+  const be=f.break_even_gold_usd, gp=f.current_gold_usd, pr=f.mint_profit_usd, ok=f.profitable;
+  const econ=`<div class="fc-econ">
+    <div class="fc-e"><span class="k">Break-even gold price</span><span class="v">${be==null?'—':'$'+be.toFixed(3)}</span>
+      <span class="sub">mint cost / gold — mint above this</span></div>
+    <div class="fc-e"><span class="k">Live gold price</span><span class="v gold">${gp==null?'—':'$'+gp.toFixed(3)}</span>
+      <span class="sub">what 1 gold sells for now</span></div>
+    <div class="fc-e"><span class="k">Mint profit / gold</span><span class="v ${ok?'pos':'neg'}">${pr==null?'—':(pr>=0?'+':'')+'$'+pr.toFixed(3)}</span>
+      <span class="sub">${ok?'minting is profitable now':'not profitable right now'}</span></div></div>`;
+  // mint-profit-over-campaign sparkline
+  const ph=(f.profit_history||[]).filter(p=>p.profit!=null);
+  let spark='';
+  if(ph.length>=2){
+    const W=520,H=70,PT=6,PB=6,PL=4,PR=4,pw=W-PL-PR,plotH=H-PT-PB;
+    const xs=ph.map(p=>p.t),ys=ph.map(p=>p.profit);
+    const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(0,...ys),y1=Math.max(0,...ys);
+    const X=t=>PL+(x1===x0?0:(t-x0)/(x1-x0))*pw, Y=v=>PT+plotH-(y1===y0?0.5:(v-y0)/(y1-y0))*plotH;
+    const zeroY=Y(0);
+    const ln=ph.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)} ${Y(p.profit).toFixed(1)}`).join(' ');
+    spark=`<div class="fc-spk"><div class="gw-meta-h" style="margin-bottom:4px">Mint profit over the campaign <span style="color:#7f93ad;font-weight:400">— $ per gold (gold price − mint cost)</span></div>
+      <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
+        <line x1="${PL}" y1="${zeroY.toFixed(1)}" x2="${W-PR}" y2="${zeroY.toFixed(1)}" stroke="rgba(120,140,165,.25)" stroke-dasharray="4 4"/>
+        <path d="${ln}" fill="none" stroke="${ys[ys.length-1]>=0?'#34d39a':'#f06a6a'}" stroke-width="1.8"/></svg></div>`;
+  }
+  return `<section class="mpanel mfc">
+    <div class="mhead"><div class="mtitle">Merchant Forecast</div>
+      <span class="mode-badge ${f.complete?'':'don'}">${(f.mode||'').toUpperCase()||'CAMPAIGN'}</span></div>
+    <div class="msub">${velNote||'Projected from donation pace and live ingredient prices.'}</div>
+    ${head}
+    <div class="fc-reshead"><span>Resource demand pressure</span><span class="r">rate</span><span class="r">to goal</span></div>
+    ${resRows}
+    ${econ}
+    ${spark}
+  </section>`;
 }
 
 /* ---------------- live world + property map ---------------- */
@@ -4901,6 +5782,9 @@ def main():
     threading.Thread(target=poll_loop, args=(args.interval,), daemon=True).start()
     threading.Thread(target=stats_loop, daemon=True).start()
     threading.Thread(target=gold_price_loop, daemon=True).start()
+    threading.Thread(target=snapshot_loop, daemon=True).start()         # order-book history (Substrate A)
+    threading.Thread(target=rollup_loop, daemon=True).start()           # daily metrics + prune (Substrate B)
+    threading.Thread(target=merchant_snapshot_loop, daemon=True).start()  # merchant campaign history
     _spectate_hub.start()   # live-world spectator hub (connects per shard on demand)
     hosted = args.host not in ("127.0.0.1", "localhost")
     url = f"http://{'127.0.0.1' if not hosted else args.host}:{args.port}"
