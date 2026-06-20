@@ -76,6 +76,7 @@ KINTARA_BACKOFF = _envf("KINTARA_BACKOFF", 45)    # pause this long after a 429/
 SNAPSHOT_INTERVAL = _envi("SNAPSHOT_INTERVAL", 300)         # order-book snapshot tick (~5 min)
 SNAPSHOT_RETENTION_DAYS = _envi("SNAPSHOT_RETENTION_DAYS", 14)  # prune raw snapshots after rollup
 MERCHANT_SNAP_INTERVAL = _envi("MERCHANT_SNAP_INTERVAL", 300)   # merchant campaign snapshot tick
+MIN_BULK_QTY = _envi("MIN_BULK_QTY", 1000)   # material floor ignores listings smaller than this
 
 # A single shared pacer so EVERY background loop's requests to kintara.gg are spread
 # out — 24/7 operation then can't burst the marketplace no matter how the loops line
@@ -794,6 +795,24 @@ def icon_asset(item_type):
     return None
 
 
+def icon_candidates(item_type):
+    """Ordered HUD asset paths to try for an item — the first that returns 200 is cached.
+    Pets and furniture have per-item art whose exact path isn't in ICON_OVERRIDES, so we
+    probe the likely schemes; pets fall back to the generic paw so they never lose art."""
+    if not item_type:
+        return []
+    if item_type.startswith("pet_"):
+        short = item_type[len("pet_"):]
+        return [f"pets/{item_type}.png", f"pets/{short}.png", f"pets/{short}.svg",
+                f"cosmetics/{item_type}.png", f"cosmetics/pet_{short}.png", "pets/paw.svg"]
+    if item_type.startswith("furniture_"):
+        short = item_type[len("furniture_"):]
+        return [f"furniture/{item_type}.png", f"furniture/{short}.png",
+                f"furniture/{short}.svg", f"cosmetics/{item_type}.png"]
+    rel = icon_asset(item_type)
+    return [rel] if rel else []
+
+
 # ---------------------------------------------------------------------------
 # fetching (runs on the user's machine; needs network)
 # ---------------------------------------------------------------------------
@@ -1354,11 +1373,14 @@ def compute_orderbook_rows(con, ts):
     need the per-group floor first) are a single pass."""
     rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
     rclause, rparam = _buyable_clause()
+    # Bulk materials: ignore tiny dump listings (<1000) — someone offloading 100 wood for a
+    # pittance isn't a practical floor for a bulk trader, so they shouldn't set the price.
     books = defaultdict(lambda: {"asks": [], "qty": 0, "sellers": set()})
     for r in con.execute(
             f"""SELECT item_type, currency, per_unit, quantity, seller_id
                 FROM listings
-                WHERE active=1 AND per_unit IS NOT NULL AND quantity > 0{rclause}""",
+                WHERE active=1 AND per_unit IS NOT NULL AND quantity > 0{rclause}
+                  AND (category != 'material' OR quantity >= {MIN_BULK_QTY})""",
             (rparam,)):
         b = books[(r["item_type"], r["currency"])]
         b["asks"].append((r["per_unit"], r["quantity"]))
@@ -2267,6 +2289,35 @@ def recent_fair_usd(con, item_type, days=14):
     return (num / den, n_sales) if den else (None, 0)
 
 
+def item_floors(con, rate, item_type=None):
+    """Current floor per item from live buyable listings, with the bulk-material rule
+    (materials ignore listings < MIN_BULK_QTY). Returns {item: {gold, usd}} where
+      gold = cheapest ACTUAL gold-currency per-unit ask (None if not listed in gold),
+      usd  = cheapest USD-equivalent (min of the token per-unit and gold×rate).
+    Pass item_type to compute just one. KINS is derived from `usd` by the caller."""
+    rclause, rparam = _buyable_clause()
+    qfilter = f" AND (category != 'material' OR quantity >= {MIN_BULK_QTY})"
+    one = " AND item_type=?" if item_type else ""
+    args_extra = (item_type,) if item_type else ()
+    out = {}
+    for ccy in ("gold", "token"):
+        for r in con.execute(
+                f"""SELECT item_type, MIN(per_unit) p FROM listings
+                    WHERE active=1 AND currency=? AND per_unit IS NOT NULL{rclause}{qfilter}{one}
+                    GROUP BY item_type""", (ccy, rparam) + args_extra):
+            if r["p"] is None:
+                continue
+            out.setdefault(r["item_type"], {})["gold" if ccy == "gold" else "token_usd"] = r["p"]
+    for f in out.values():
+        cands = []
+        if f.get("token_usd") is not None:
+            cands.append(f["token_usd"])
+        if f.get("gold") is not None and rate:
+            cands.append(f["gold"] * rate)
+        f["usd"] = min(cands) if cands else None
+    return out
+
+
 def liquidity_score(velocity, listed_qty, sellers, last_age_days):
     """0–100 'can I actually exit this' score from sales velocity, available depth,
     seller competition and recency of the last trade. Deliberately simple + monotone
@@ -2481,27 +2532,41 @@ def make_app():
     from flask import Flask, jsonify, request, Response, send_file
     app = Flask(__name__)
 
-    def _serve_cached_icon(item_type, status_on_error=502):
-        """Serve real Kintara HUD art from the same disk cache used by /icon/<item>."""
-        rel = icon_asset(item_type)
-        if not rel:
-            return Response(status=404)
-        ext = rel.rsplit(".", 1)[-1]
-        os.makedirs(ICON_DIR, exist_ok=True)
-        fp = os.path.join(ICON_DIR, f"{item_type}.{ext}")
-        if not os.path.exists(fp):
-            try:
-                import requests
-                r = requests.get(f"https://kintara.gg/assets/hud/{rel}",
-                                 headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
-                r.raise_for_status()
-                with open(fp, "wb") as f:
-                    f.write(r.content)
-            except Exception:
-                return Response(status=status_on_error)
+    def _icon_send(fp, ext):
         return send_file(os.path.abspath(fp),
                          mimetype="image/svg+xml" if ext == "svg" else f"image/{ext}",
                          max_age=604800)
+
+    def _serve_cached_icon(item_type, status_on_error=502):
+        """Serve real Kintara HUD art, resolved by trying each candidate path and caching
+        the first that exists. Pets/furniture get a fresh cache namespace (`__art`) so the
+        old generic-paw files don't shadow the real per-item art."""
+        cands = icon_candidates(item_type)
+        if not cands:
+            return Response(status=404)
+        os.makedirs(ICON_DIR, exist_ok=True)
+        multi = item_type.startswith(("pet_", "furniture_"))
+        prefix = f"{item_type}__art" if multi else item_type
+        for ext in ("png", "svg", "jpg", "jpeg", "webp"):
+            fp = os.path.join(ICON_DIR, f"{prefix}.{ext}")
+            if os.path.exists(fp):
+                return _icon_send(fp, ext)
+        import requests
+        for rel in cands:
+            ext = rel.rsplit(".", 1)[-1]
+            try:
+                pace_kintara()
+                r = requests.get(f"https://kintara.gg/assets/hud/{rel}",
+                                 headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
+                if r.status_code != 200 or not r.content:
+                    continue
+                fp = os.path.join(ICON_DIR, f"{prefix}.{ext}")
+                with open(fp, "wb") as f:
+                    f.write(r.content)
+                return _icon_send(fp, ext)
+            except Exception:
+                continue
+        return Response(status=status_on_error)
 
     @app.route("/")
     def index():
@@ -3035,6 +3100,8 @@ def make_app():
         if not item:
             return jsonify({"ok": False, "error": "item_type required"}), 400
         rclause, now_ms = _buyable_clause()
+        # bulk materials: only show practical (≥1000-unit) listings, not tiny dumps
+        qmin = MIN_BULK_QTY if categorize(item) == "material" else 1
         con = connect(readonly=True)
         try:
             gold_rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
@@ -3044,7 +3111,9 @@ def make_app():
                     f"""SELECT per_unit, quantity, seller_name, price_gold, price_usd
                         FROM listings
                         WHERE item_type=? AND currency=? AND active=1 AND per_unit IS NOT NULL
-                        {rclause} ORDER BY per_unit ASC LIMIT 5""", (item, cur, now_ms)).fetchall()
+                        AND quantity >= ?
+                        {rclause} ORDER BY per_unit ASC LIMIT 5""",
+                    (item, cur, qmin, now_ms)).fetchall()
                 return [{"per_unit": r["per_unit"], "qty": r["quantity"],
                          "seller": r["seller_name"],
                          "price": r["price_gold"] if cur == "gold" else r["price_usd"]}
@@ -3095,11 +3164,12 @@ def make_app():
 
     @app.route("/api/floor-history")
     def floor_history():
-        """Floor-price history for one item, in gold / USD / KINS. Recent points come
-        from the fine-grained orderbook_snapshots (per-tick cheapest USD floor across
-        both currencies); older points fall back to item_daily_metrics (one/day) for
-        the stretch before snapshot coverage. Gold/KINS are derived from USD via the
-        gold-price and KINS daily series (same approach as the sales charts)."""
+        """Floor-price history for one item. Each point: `gold` = the ACTUAL cheapest
+        gold-currency ask (what people really list it for in gold — not a conversion),
+        `usd` = the cheapest USD-equivalent across both currencies (so KINS reflects
+        whichever way is cheaper to buy), `kins` = usd / KINS price. Recent points come
+        from the fine-grained orderbook_snapshots; older points fall back to
+        item_daily_metrics (one/day) for the stretch before snapshot coverage."""
         item = (request.args.get("item_type") or "").strip()
         if not item:
             return jsonify({"ok": False, "error": "item_type required"}), 400
@@ -3112,38 +3182,39 @@ def make_app():
             for r in con.execute(
                     """SELECT ts, currency, floor, floor_usd FROM orderbook_snapshots
                        WHERE item_type=? AND ts>=? ORDER BY ts""", (item, lo)):
-                c = ticks.setdefault(r["ts"], {"usd": None})
+                c = ticks.setdefault(r["ts"], {"usd": None, "gold": None})
                 if r["floor_usd"] is not None and (c["usd"] is None or r["floor_usd"] < c["usd"]):
                     c["usd"] = r["floor_usd"]
+                if r["currency"] == "gold" and r["floor"] is not None:
+                    c["gold"] = r["floor"]                # actual gold-currency floor
             snap_start = min(ticks) if ticks else int(time.time() * 1000)
             # older days from the durable rollup (before snapshot coverage)
             older = []
             for r in con.execute(
-                    """SELECT day, floor_usd_close FROM item_daily_metrics
+                    """SELECT day, floor_usd_close, floor_gold_close FROM item_daily_metrics
                        WHERE item_type=? AND floor_usd_close IS NOT NULL ORDER BY day""", (item,)):
                 dts = int(datetime.strptime(r["day"], "%Y-%m-%d")
                           .replace(tzinfo=timezone.utc).timestamp() * 1000)
                 if lo <= dts < snap_start:
-                    older.append((dts, r["floor_usd_close"]))
-            gusd, kusd = gold_daily_usd(con), kins_daily_usd()
+                    older.append((dts, r["floor_usd_close"], r["floor_gold_close"]))
+            kusd = kins_daily_usd()
         finally:
             con.close()
-        gdates, kdates = sorted(gusd), sorted(kusd)
+        kdates = sorted(kusd)
         def carry(m, dates, d):
             if d in m:
                 return m[d]
             prior = [x for x in dates if x <= d]
             return m[prior[-1]] if prior else None
-        pts = older + [(t, ticks[t]["usd"]) for t in sorted(ticks)]
+        pts = older + [(t, ticks[t]["usd"], ticks[t]["gold"]) for t in sorted(ticks)]
         series = []
-        for t, usd in pts:
-            if usd is None:
+        for t, usd, gold in pts:
+            if usd is None and gold is None:
                 continue
             d = datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d")
-            gu, ku = carry(gusd, gdates, d), carry(kusd, kdates, d)
-            series.append({"t": t, "usd": usd,
-                           "gold": (usd / gu) if gu else None,
-                           "kins": (usd / ku) if ku else None})
+            ku = carry(kusd, kdates, d)
+            series.append({"t": t, "usd": usd, "gold": gold,
+                           "kins": (usd / ku) if (usd and ku) else None})
         return jsonify({"ok": True, "item_type": item, "range": rng, "series": series})
 
     @app.route("/api/scorecard")
@@ -3162,17 +3233,11 @@ def make_app():
             rate, _ = gold_rate_usd(con, gold_item)
             kp = current_kins_usd()
             rclause, rparam = _buyable_clause()
-            # current floor across both currencies (cheapest buyable per-unit → USD)
-            floor_usd = None
-            for r in con.execute(
-                    f"""SELECT currency, MIN(per_unit) p FROM listings
-                        WHERE active=1 AND item_type=? AND per_unit IS NOT NULL{rclause}
-                        GROUP BY currency""", (item, rparam)):
-                if r["p"] is None:
-                    continue
-                u = r["p"] if r["currency"] == "token" else (r["p"] * rate if rate else None)
-                if u is not None and (floor_usd is None or u < floor_usd):
-                    floor_usd = u
+            # current floor (bulk-material rule applied): actual gold-currency floor +
+            # cheapest USD-equivalent across both currencies.
+            ff = item_floors(con, rate, item).get(item, {})
+            gold_floor = ff.get("gold")     # actual cheapest gold-currency per-unit ask
+            floor_usd = ff.get("usd")       # cheapest USD-equivalent (token vs gold×rate)
             # latest snapshot row aggregates (supply / sellers) — cheap, indexed
             supply = sellers = None
             srow = con.execute(
@@ -3221,7 +3286,7 @@ def make_app():
             "ok": True, "item_type": item, "label": item_label(item),
             "category": categorize(item),
             "floor": {"usd": floor_usd,
-                      "gold": (floor_usd / rate) if (floor_usd and rate) else None,
+                      "gold": gold_floor,    # ACTUAL cheapest gold-currency ask (None if not listed in gold)
                       "kins": (floor_usd / kp) if (floor_usd and kp) else None},
             "gold_rate": rate, "kins_price": kp,
             "change": changes,
@@ -3254,6 +3319,8 @@ def make_app():
                           SUM(CASE WHEN sales>0 THEN sales ELSE 0 END) sw
                    FROM sales_daily WHERE date>=? GROUP BY item_type, currency""", (start,)):
                 agg[(r["item_type"], r["currency"])] = r
+        rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
+        floors = item_floors(con, rate)        # current floor per item (bulk-material rule)
         con.close()
         kins_px = current_kins_usd()
         out = []
@@ -3264,12 +3331,16 @@ def make_app():
             ga = (g["wp"] / g["sw"]) if (g and g["sw"]) else None
             ta = (t["wp"] / t["sw"]) if (t and t["sw"]) else None
             kins = (ta / kins_px) if (ta and kins_px) else None
+            ff = floors.get(it, {})
+            f_usd = ff.get("usd")
             out.append({
                 "item_type": it, "label": item_label(it), "category": categorize(it),
                 "sales": gs + ts, "avg_gold": ga, "avg_usd": ta, "kins": kins,
+                "floor_gold": ff.get("gold"), "floor_usd": f_usd,
+                "floor_kins": (f_usd / kins_px) if (f_usd and kins_px) else None,
             })
         return jsonify({"ok": True, "ref_day": ref, "window": window,
-                        "kins_price": kins_px, "items": out})
+                        "kins_price": kins_px, "gold_rate": rate, "items": out})
 
     @app.route("/api/gold-history")
     def gold_history():
@@ -3390,6 +3461,31 @@ def make_app():
             con.close()
         calc = {"gold_rate": round(gold_rate, 6) if gold_rate else None, "recipe": recipe}
         return jsonify({"ok": True, "state": state, "calc": calc, "forecast": forecast})
+
+    @app.route("/api/merchant-history")
+    def merchant_history():
+        """Per-resource donation progress over the campaign, from merchant_snapshots —
+        each resource's % toward its goal over time (and the overall %). Drives the
+        click-to-expand chart on each Merchant resource bar."""
+        con = connect(readonly=True)
+        rows = con.execute(
+            "SELECT ts, overall_pct, resources FROM merchant_snapshots ORDER BY ts").fetchall()
+        con.close()
+        res, overall = defaultdict(list), []
+        for r in rows:
+            if r["overall_pct"] is not None:
+                overall.append({"t": r["ts"], "pct": r["overall_pct"]})
+            try:
+                data = json.loads(r["resources"] or "{}")
+            except Exception:
+                data = {}
+            for k, v in data.items():
+                if v and v.get("pct") is not None:
+                    res[k].append({"t": r["ts"], "pct": v["pct"], "current": v.get("current")})
+        labels = {k: l for k, l in MERCHANT_CAMPAIGN_RESOURCES}
+        return jsonify({"ok": True, "overall": overall,
+                        "resources": [{"key": k, "label": labels.get(k, k), "series": res[k]}
+                                      for k in res]})
 
     @app.route("/api/live")
     def live():
@@ -3686,6 +3782,10 @@ td.isd{cursor:help}
 .mres-row .nums b{color:#dbe5f0}
 .mres-row .rpct{font:700 12px var(--mono);color:var(--gold2);min-width:46px;text-align:right}
 .mres-row .rpct.done{color:var(--buy)}
+.mres-row.clk{cursor:pointer;border-radius:8px;padding:4px 6px;margin:0 -6px;transition:background .12s}
+.mres-row.clk:hover{background:rgba(255,255,255,.04)}
+.mres-row.clk.open{background:rgba(232,181,74,.07)}
+.mres-chart{margin:2px 0 10px;padding:4px 6px}
 .gold-stock{display:flex;justify-content:space-between;align-items:center;margin-top:16px;
   padding-top:14px;border-top:1px solid var(--line);font:600 14px var(--ui);color:#cdd9e6}
 .gold-stock strong{color:var(--gold2);font-family:var(--mono)}
@@ -3774,6 +3874,7 @@ td.isd{cursor:help}
 .lw-search button.go:hover{border-color:var(--gold);color:#241803}
 .lw-search button.go:disabled{opacity:.6;cursor:default}
 .lw-srch-status{color:var(--mut);font:12px var(--ui);margin-left:2px}
+.lw-srch-status.err{color:var(--sell);font-weight:600}
 .lw-roster{border:1px solid var(--line);border-radius:14px;overflow:hidden;
   background:linear-gradient(180deg,rgba(26,38,58,.4),rgba(15,24,40,.25))}
 .lw-roster h3{margin:0;padding:12px 15px;font:700 11px var(--ui);letter-spacing:.16em;
@@ -4121,7 +4222,7 @@ const state={dir:"gold_to_kins", fee:0, goldItem:null, items:[], cats:[], labels
   mpCur:"kins", mpOpen:null, mpRowMap:{}, mpCatOff:new Set(), mpCatInit:false,
   catOff:new Set(), profitableOnly:false, soldOnly:false, search:"", minQty:0, viewSet:[],
   histItem:null, histCur:"token", histCat:"all", histSort:"most", histOpen:null, histWindow:1,
-  goldMode:"gold_usd", goldRange:"1D", srvOpen:false, mintQty:1,
+  goldMode:"gold_usd", goldRange:"1D", srvOpen:false, mintQty:1, merchResOpen:null,
   liveShard:1, liveSel:null, liveSearch:"", liveSearchBusy:false, liveSearchStatus:"", propSel:null, servers:[]};
 
 /* Commodities (materials/potions/food) trade in bulk — a single unit is a fraction of a
@@ -4133,6 +4234,14 @@ function qbasisSuffix(cat){ return PER1K.has(cat)?'/1k':''; }
 /* time a listing sat before it sold, human form */
 function durStr(ms){ if(ms==null) return null; const m=ms/60000;
   return m<60?Math.round(m)+'m':m<1440?(+(m/60).toFixed(1))+'h':(+(m/1440).toFixed(1))+'d'; }
+/* floor formatters. Gold: anything under 1g/item is shown as ITEMS PER GOLD (the
+   practical way to think about cheap commodities) rather than a tiny fraction. USD/KINS:
+   quoted per-1,000 for bulk commodities. */
+const _sig=v=> v>=1?(+v.toFixed(2)):(+v.toPrecision(3));
+function fGold(v){ if(v==null) return '—'; return v<1 ? abbr(Math.round(1/v))+'/g' : _sig(v)+'g'; }
+function fUsd(v,cat){ if(v==null) return '—'; const b=qbasis(cat); return '$'+_sig(v*b)+qbasisSuffix(cat); }
+function fKins(v,cat){ if(v==null) return '—'; const x=v*qbasis(cat);
+  return (x>=1?Math.round(x).toLocaleString():(+x.toFixed(2)))+' $KINS'+qbasisSuffix(cat); }
 
 /* force-refresh cached sales for a set of items (the side currently shown) */
 async function refreshVisible(items){
@@ -4525,7 +4634,11 @@ async function loadArb(){
           items like mounts are never affected. Reserved listings are excluded;
           rows with one side missing (—) can't be arbitraged yet.</div>`);
 
-  $("#view").innerHTML=head+table;
+  $("#view").innerHTML=`<div class="gw"><div class="gw-main">
+    <div class="gw-corner l"></div><div class="gw-corner r"></div>
+    <div class="gw-title">Arbitrage</div>
+    <div class="gw-sub">Buy an item in one currency and sell into the other — green rows are profitable at the current floor.</div>
+    ${head}${table}</div></div>`;
 
   wireModeSeg();
   $("#profonly").onchange=e=>{state.profitableOnly=e.target.checked;loadArb();};
@@ -4675,7 +4788,11 @@ async function loadMispricing(){
         <b>confidence</b> (green = fresh + liquid, red = stale or thin). <b>volume</b> = total units across those recent trading days
         (hover for the per-day split). Use <b>KINS / Gold / Both</b> to change the display unit. This is an upper bound — fair value is historical and you'd undercut to sell.</div>`;
 
-  $("#view").innerHTML=head+table;
+  $("#view").innerHTML=`<div class="gw"><div class="gw-main">
+    <div class="gw-corner l"></div><div class="gw-corner r"></div>
+    <div class="gw-title">Collectables</div>
+    <div class="gw-sub">Cosmetics, mounts &amp; pets priced against a gold-anchored fair value — biggest gaps first.</div>
+    ${head}${table}</div></div>`;
   // morph reuses DOM nodes across renders, so cells can keep stale mouse handlers
   // from the arbitrage tab (e.g. a leftover deal-card hover bound to the old row).
   // Clear them and hide any open card so Collectables shows nothing stale.
@@ -4773,12 +4890,11 @@ async function loadLive(){
   $("#ltable").innerHTML = !rows.length
     ? `<div class="empty">No live listings match.</div>`
     : `<table><thead><tr><th>item</th><th>seller</th><th class="num">qty</th>
-        <th class="num">price</th><th class="num">per item</th><th class="num">listed</th>
+        <th class="num">price</th><th class="num">listed</th>
         </tr></thead><tbody>`+rows.map(r=>`<tr>
         <td title="${r.item_type}">${lbl(r.item_type)}</td>
         <td class="mut">${r.seller_name||""}</td>
         <td class="num">${abbr(r.quantity||0)}</td><td class="num">${fmtPrice(r)}</td>
-        <td class="num mut">${r.per_unit==null?"":(r.currency==="token"?fmtU(r.per_unit):fmtG(r.per_unit))}</td>
         <td class="num mut">${relAbs(r.created_at)}${freshness(r.created_at)}</td></tr>`).join("")+`</tbody></table>`;
 }
 /* total PAID in a sale (what changed hands), in its own currency. Falls back to a
@@ -4794,15 +4910,13 @@ async function loadRemoved(){   // "Sales feed" tab — ACTUAL completed sales (
   if(!$("#ltable")){ await loadItems();
     $("#view").innerHTML=listingControls(); bindListingControls(loadRemoved); }
   const rows=await (await fetch("/api/sales-feed?"+lqs())).json();
-  const per1k=r=> PER1K.has(r.category)&&r.price!=null
-    ? `<span class="mut" style="font:11px var(--mono)">${r.currency==='gold'?(+ (r.price*1000).toPrecision(3))+'g':'$'+(+(r.price*1000).toPrecision(3))}/1k</span>` : '';
   $("#ltable").innerHTML = !rows.length
     ? `<div class="empty">No sales recorded yet. This feed logs <b>actual completed sales</b> — each matched to the listing that vanished, so you see the real stack size, total paid, seller and how long it sat. Cancellations are excluded. Fills in going forward.</div>`
     : `<table><thead><tr><th>item</th><th class="num">qty sold</th><th class="num">total paid</th>
         <th>seller</th><th class="num">time listed</th><th class="num">when</th></tr></thead><tbody>`+
       rows.map(r=>`<tr><td title="${r.item_type}">${lbl(r.item_type)}</td>
         <td class="num">${r.qty!=null?`<b>${r.qty.toLocaleString()}</b>`:'<span class="mut" data-tip="confirmed via the sale counter; listing not captured">—</span>'}</td>
-        <td class="num ${r.currency==='gold'?'gold':'usd'}">${saleAmt(r)} ${per1k(r)}</td>
+        <td class="num ${r.currency==='gold'?'gold':'usd'}">${saleAmt(r)}</td>
         <td class="mut">${r.seller?esc(r.seller):'<span data-tip="listing not captured">~est</span>'}</td>
         <td class="num mut">${r.listing_ms!=null?durStr(r.listing_ms):'—'}</td>
         <td class="num mut">${relAbs(r.ts)}</td></tr>`).join("")+`</tbody></table>`;
@@ -4841,18 +4955,15 @@ function renderHist(){
   const catName=(CAT_ORDER.find(([k])=>k===cat)||[,"All Items"])[1];
   let rows=cat==="all"?items.slice():items.filter(r=>r.category===cat);
   rows.sort((a,b)=> state.histSort==="least" ? a.sales-b.sales : b.sales-a.sales);
-  const usd=v=> v==null?"—":"$"+Number(v).toFixed(v>=1?2:v>=.01?4:5);
-  const goldv=v=> (v==null||v===0)?"—":(+Number(v).toFixed(2))+"g";
-  const kinsv=v=> v==null?"—":(v>=1?Math.round(v).toLocaleString():(+v.toFixed(2)))+" $KINS";
   const body=rows.map(r=>{
     const open=r.item_type===state.histOpen;
     return `<div class="gw-row ${open?'open':''}" data-item="${r.item_type}">
       <div class="gw-item"><span class="gw-chev">▸</span>${iconImg(r)}
         <span class="gw-name" title="${r.item_type}">${r.label}</span></div>
       <div class="gw-num r">${r.sales?fmtK(r.sales):"—"}</div>
-      <div class="gw-num mut r">${goldv(r.avg_gold)}</div>
-      <div class="gw-num r">${usd(r.avg_usd)}</div>
-      <div class="gw-num gw-kins r">${kinsv(r.kins)}</div>
+      <div class="gw-num mut r" data-tip="cheapest live gold listing (items per gold when under 1g each)">${fGold(r.floor_gold)}</div>
+      <div class="gw-num r">${fUsd(r.floor_usd,r.category)}</div>
+      <div class="gw-num gw-kins r">${fKins(r.floor_kins,r.category)}</div>
     </div>`+(open?`<div class="gw-exp" id="gwexp"></div>`:"");
   }).join("");
   const kp=d.kins_price?("$"+(+d.kins_price.toFixed(4))):"—";
@@ -4861,7 +4972,7 @@ function renderHist(){
     <div class="gw-main">
       <div class="gw-corner l"></div><div class="gw-corner r"></div>
       <div class="gw-title">${cat==="all"?"Marketplace":catName}</div>
-      <div class="gw-sub">Completed marketplace sales. Average gold, USD ($KINS listings) and live $KINS prices.</div>
+      <div class="gw-sub">Live floor price per item — in gold, USD and $KINS. Cheap commodities show items-per-gold and per-1,000 prices.</div>
       <div class="gw-pills">
         <button class="gw-pill ${state.histWindow==1?'on':''}" data-win="1">Today</button>
         <button class="gw-pill ${state.histWindow==7?'on':''}" data-win="7">Last 7 days</button>
@@ -4873,7 +4984,7 @@ function renderHist(){
         <button class="gw-pill" id="histRefresh" data-tip="Refresh now">↻</button>
       </div>
       <div class="gw-note">${state.histWindow==1?"Most recent trading day":("Last "+state.histWindow+" days")} · through ${d.ref_day||"—"} · live $KINS price ${kp} per token</div>
-      <div class="gw-head"><span>Item</span><span class="r">Sales</span><span class="r">Avg Gold</span><span class="r">Avg USD</span><span class="r">$KINS</span></div>
+      <div class="gw-head"><span>Item</span><span class="r">Sales</span><span class="r">Floor Gold</span><span class="r">Floor USD</span><span class="r">Floor $KINS</span></div>
       <div id="gwrows">${body||`<div class="gw-empty">No items in this category.</div>`}</div>
     </div></div>`;
   document.querySelectorAll(".gw-cat").forEach(b=>b.onclick=()=>{state.histCat=b.dataset.cat;state.histOpen=null;renderHist();});
@@ -4930,13 +5041,8 @@ async function loadScorecard(it){
 }
 function scorecardHTML(d){
   if(!d||d.ok===false) return "";
-  const f=d.floor||{};
-  const b=qbasis(d.category), sfx=qbasisSuffix(d.category);
-  const G=v=>v==null?null:v*b, sig=v=>v>=1?(+v.toFixed(2)):(+v.toPrecision(3));
-  const gv=G(f.gold), uv=G(f.usd), kv=G(f.kins);
-  const gold=gv!=null?sig(gv)+"g"+sfx:"—";
-  const usd=uv!=null?"$"+sig(uv)+sfx:"—";
-  const kins=kv!=null?((kv>=1?Math.round(kv).toLocaleString():(+kv.toFixed(2)))+" $KINS"+sfx):"—";
+  const f=d.floor||{}, cat=d.category;
+  const gold=fGold(f.gold), usd=fUsd(f.usd,cat), kins=fKins(f.kins,cat);
   const chg=v=> v==null?'<span class="sc-mut">—</span>':`<span class="${v>0?'up':v<0?'down':'sc-mut'}">${v>0?'+':''}${v}%</span>`;
   // cheap/fair/expensive verdict pill
   const vClr={cheap:'#34d39a',fair:'#e8b54a',expensive:'#f06a6a'}[d.verdict]||'#7f93ad';
@@ -4984,33 +5090,38 @@ async function loadFloorHistory(it,cat){
   attachFloorHover();
 }
 function floorChartHTML(d,unit,it,cat){
-  const b=qbasis(cat), sfx=qbasisSuffix(cat);
+  const b=qbasis(cat);
   const seg=`<div class="gw-cseg sm">
     ${['gold','usd','kins'].map(u=>`<button data-fu="${u}" class="${u===unit?'on':''}">${u==='usd'?'USD':u==='gold'?'Gold':'$KINS'}</button>`).join('')}
     <span style="width:10px"></span>
     ${['24H','3D','7D','30D','ALL'].map(r=>`<button data-fr="${r}" class="${r===(state.floorRange||'7D')?'on':''}">${r}</button>`).join('')}</div>`;
   const series=((d&&d.series)||[]).filter(p=>p[unit]!=null);
-  const unitName=unit==='usd'?'USD':unit==='gold'?'gold':'$KINS';
-  const head=`<div class="gw-meta-h">Floor price history <span style="color:#7f93ad;font-weight:400">— the cheapest listing over time (${unitName}${b>1?' per 1,000':''})</span></div>`;
+  // Gold under 1g/item is graphed as ITEMS PER GOLD (line rises as it gets cheaper —
+  // the natural "value" view for commodities). USD/KINS are graphed per-1,000 for bulk.
+  const goldInvert = unit==='gold' && series.length>0 && series.every(p=>p.gold<1);
+  const proj = p => unit==='gold' ? (goldInvert ? 1/p.gold : p.gold) : p[unit]*b;
+  const unitName = unit==='gold' ? (goldInvert?'items per gold':'gold')
+                 : unit==='usd' ? ('USD'+(b>1?' per 1,000':'')) : ('$KINS'+(b>1?' per 1,000':''));
+  const head=`<div class="gw-meta-h">Floor price history <span style="color:#7f93ad;font-weight:400">— cheapest live ${unit==='gold'?'gold':unit==='usd'?'USD-equivalent':'$KINS'} ask over time (${unitName})</span></div>`;
   if(series.length<2){ window.__floor=null; return `${head}${seg}<div class="gw-empty">Not enough floor history yet — this builds as snapshots accumulate.</div>`; }
   const W=1100,H=190,PL=64,PR=14,PT=12,PB=22,plotW=W-PL-PR,plotH=H-PT-PB;
-  const xs=series.map(p=>p.t),ys=series.map(p=>p[unit]);
+  const xs=series.map(p=>p.t),ys=series.map(proj);
   const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys);
   const X=t=>PL+(x1===x0?0:(t-x0)/(x1-x0))*plotW;
   const pad=(y1-y0)*0.12||y0*0.1||1, lo=Math.max(0,y0-pad), hi=y1+pad;
   const Y=v=>PT+plotH-(hi===lo?0.5:(v-lo)/(hi-lo))*plotH;
-  const sig=v=>v>=1?(+v.toFixed(2)):(+v.toPrecision(3));
-  const fmtV=v=>{ const x=v*b; return unit==='usd'?'$'+sig(x):unit==='gold'?sig(x)+'g':(x>=1?Math.round(x).toLocaleString():(+x.toFixed(2))); };
+  const fmtAxis=v=> unit==='gold' ? (goldInvert?abbr(Math.round(v))+'/g':_sig(v)+'g')
+                 : unit==='usd' ? '$'+_sig(v)
+                 : (v>=1?Math.round(v).toLocaleString():(+v.toFixed(2)));
   let grid='';[0,.5,1].forEach(f=>{const v=lo+(hi-lo)*(1-f),yy=PT+plotH*f;
     grid+=`<line x1="${PL}" y1="${yy}" x2="${W-PR}" y2="${yy}" stroke="rgba(120,140,165,.12)"/>`+
-      `<text x="${PL-7}" y="${yy+3}" text-anchor="end" fill="#6f86a6" font-size="10" font-family="monospace">${fmtV(v)}</text>`;});
-  const line=series.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)} ${Y(p[unit]).toFixed(1)}`).join(' ');
-  const area=`M${X(series[0].t).toFixed(1)} ${(PT+plotH).toFixed(1)} `+series.map(p=>`L${X(p.t).toFixed(1)} ${Y(p[unit]).toFixed(1)}`).join(' ')+` L${X(series[series.length-1].t).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
+      `<text x="${PL-7}" y="${yy+3}" text-anchor="end" fill="#6f86a6" font-size="10" font-family="monospace">${fmtAxis(v)}</text>`;});
+  const line=series.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)} ${Y(proj(p)).toFixed(1)}`).join(' ');
+  const area=`M${X(series[0].t).toFixed(1)} ${(PT+plotH).toFixed(1)} `+series.map(p=>`L${X(p.t).toFixed(1)} ${Y(proj(p)).toFixed(1)}`).join(' ')+` L${X(series[series.length-1].t).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
   const dt=t=>new Date(t).toLocaleDateString(undefined,{month:'short',day:'numeric',timeZone:'UTC'});
   const clr=unit==='gold'?'#e8b54a':unit==='kins'?'#7aa2ff':'#34d39a';
-  // stash render context for the hover handler (pixel coords + the all-unit series point)
-  window.__floor={W,H,PL,PR,PT,plotTop:PT,plotBot:PT+plotH,b,unit,clr,
-    pix:series.map(p=>({x:X(p.t),y:Y(p[unit]),t:p.t,usd:p.usd,gold:p.gold,kins:p.kins}))};
+  window.__floor={W,H,plotTop:PT,plotBot:PT+plotH,unit,clr,cat,goldInvert,
+    pix:series.map(p=>({x:X(p.t),y:Y(proj(p)),t:p.t,usd:p.usd,gold:p.gold,kins:p.kins}))};
   return `${head}${seg}<svg id="floorsvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
     <defs><linearGradient id="flg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${clr}" stop-opacity=".22"/><stop offset="1" stop-color="${clr}" stop-opacity="0"/></linearGradient></defs>
     ${grid}<path d="${area}" fill="url(#flg)"/><path d="${line}" fill="none" stroke="${clr}" stroke-width="1.8"/>
@@ -5018,22 +5129,21 @@ function floorChartHTML(d,unit,it,cat){
     <text x="${PL}" y="${H-7}" fill="#6f86a6" font-size="10" font-family="monospace">${dt(x0)}</text>
     <text x="${W-PR}" y="${H-7}" text-anchor="end" fill="#6f86a6" font-size="10" font-family="monospace">${dt(x1)}</text></svg>`;
 }
-/* floor-chart hover: crosshair + a card showing the date and the floor in all 3 units
-   (same feel as the gold-price chart). */
+/* floor-chart hover: crosshair + a card with the date, the floor in the selected unit,
+   and the other units (incl. gold/ea + gold/1k for commodities) as context. */
 function attachFloorHover(){
   const svg=$("#floorsvg"), fx=window.__floor; if(!svg||!fx) return;
-  const cross=$("#floorcross"), card=gcardNode();
-  const fmt=(v,u,b)=>{ if(v==null)return '—'; const x=v*b, sig=z=>z>=1?(+z.toFixed(2)):(+z.toPrecision(3));
-    return u==='usd'?'$'+sig(x):u==='gold'?sig(x)+'g':(x>=1?Math.round(x).toLocaleString():(+x.toFixed(2)))+' $KINS'; };
+  const cross=$("#floorcross"), card=gcardNode(), cat=fx.cat, com=qbasis(cat)>1;
+  const mainFor=p=> fx.unit==='gold'?fGold(p.gold):fx.unit==='usd'?fUsd(p.usd,cat):fKins(p.kins,cat);
   svg.onmousemove=ev=>{
     const r=svg.getBoundingClientRect(), vx=(ev.clientX-r.left)/r.width*fx.W;
     let best=fx.pix[0],bd=1e18; for(const p of fx.pix){ const dd=Math.abs(p.x-vx); if(dd<bd){bd=dd;best=p;} }
-    const sfx=fx.b>1?' /1k':'';
     cross.innerHTML=`<line x1="${best.x.toFixed(1)}" y1="${fx.plotTop}" x2="${best.x.toFixed(1)}" y2="${fx.plotBot}" stroke="rgba(180,200,220,.35)" stroke-dasharray="5 4"/>`+
       `<circle cx="${best.x.toFixed(1)}" cy="${best.y.toFixed(1)}" r="4" fill="${fx.clr}" stroke="#0c0f13" stroke-width="2"/>`;
+    const goldExtra = best.gold!=null ? `${fGold(best.gold)}${com?' · '+_sig(best.gold*1000)+'g/1k':''}` : '—';
     card.innerHTML=`<div class="gd">${new Date(best.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZone:'UTC'})} UTC</div>`+
-      `<div class="gv" style="color:${fx.clr}">Floor : ${fmt(best[fx.unit],fx.unit,fx.b)}${sfx}</div>`+
-      `<div class="gd">${fmt(best.gold,'gold',fx.b)} · ${fmt(best.usd,'usd',fx.b)} · ${fmt(best.kins,'kins',fx.b)}${sfx}</div>`;
+      `<div class="gv" style="color:${fx.clr}">Floor : ${mainFor(best)}</div>`+
+      `<div class="gd">gold ${goldExtra} · ${fUsd(best.usd,cat)} · ${fKins(best.kins,cat)}</div>`;
     card.style.display="block";
     const bb=card.getBoundingClientRect(); let L=ev.clientX+16,T=ev.clientY+16;
     if(L+bb.width>innerWidth-8) L=ev.clientX-bb.width-16;
@@ -5082,22 +5192,20 @@ function itemListingsHTML(d,cat){
     'above-fair':['above fair','#e8b54a','priced over recent fair value'],
     'likely-overpriced':['overpriced','#f06a6a','far above fair value — likely bait']};
   const tags=r=>(r.badges||[]).map(b=>{const m=BADGE[b];return m?`<span class="ll-badge" style="color:${m[1]};border-color:${m[1]}55;background:${m[1]}14" data-tip="${m[2]}">${m[0]}</span>`:'';}).join("");
-  // Headline = what you actually PAY (the listing total) + how many you GET. For bulk
-  // commodities we add a readable per-1,000 figure; per-single-unit is intentionally hidden.
+  const kfmt=v=> v>=1?Math.round(v).toLocaleString():(+v.toFixed(2));
+  // Each row: the price you PAY, how many you GET, and the $KINS equivalent.
   const goldRows=(d.gold||[]).map(r=>{
     const tot=r.price!=null?r.price:r.per_unit*(r.qty||1);
     const stack=r.qty>1?`<span class="ll-q">×${r.qty.toLocaleString()}</span>`:'';
-    const unit=per1k?`<span class="ll-x">${sig(r.per_unit*1000)}g/1k</span>`:'';
-    const usd=rate?`<span class="ll-x">≈$${sig(tot*rate)}</span>`:'';
-    return `<div class="ll-row"><span class="ll-p">${sig(tot)}g</span>${stack}${unit}${usd}${tags(r)}${sel(r.seller)}</div>`;}).join("");
+    const kins=(rate&&kp)?`<span class="ll-x">${kfmt(tot*rate/kp)} $KINS</span>`:'';
+    return `<div class="ll-row"><span class="ll-p">${sig(tot)}g</span>${stack}${kins}${tags(r)}${sel(r.seller)}</div>`;}).join("");
   const tokRows=(d.token||[]).map(r=>{
     const tot=r.price!=null?r.price:r.per_unit*(r.qty||1);
     const stack=r.qty>1?`<span class="ll-q">×${r.qty.toLocaleString()}</span>`:'';
-    const unit=per1k?`<span class="ll-x">$${sig(r.per_unit*1000)}/1k</span>`:'';
-    const kins=kp?`<span class="ll-x">${(tot/kp>=1?Math.round(tot/kp).toLocaleString():(+(tot/kp).toFixed(2)))} $KINS</span>`:'';
-    return `<div class="ll-row"><span class="ll-p">$${sig(tot)}</span>${stack}${unit}${kins}${tags(r)}${sel(r.seller)}</div>`;}).join("");
+    const kins=kp?`<span class="ll-x">${kfmt(tot/kp)} $KINS</span>`:'';
+    return `<div class="ll-row"><span class="ll-p">$${sig(tot)}</span>${stack}${kins}${tags(r)}${sel(r.seller)}</div>`;}).join("");
   const col=(title,rows,empty)=>`<div class="ll-col"><div class="ll-h">${title}</div>${rows||`<div class="ll-none">${empty}</div>`}</div>`;
-  return `<div class="gw-meta-h">Cheapest live listings <span style="color:#7f93ad;font-weight:400">— what you pay &amp; how many you get${per1k?', plus per-1,000':''}, cheapest first, up to 5 each</span></div>
+  return `<div class="gw-meta-h">Cheapest live listings <span style="color:#7f93ad;font-weight:400">— price, quantity &amp; $KINS value, cheapest first${per1k?' (bulk listings ≥1k only)':''}, up to 5 each</span></div>
     <div class="ll-cols">
       ${col("In gold",goldRows,"none listed in gold")}
       ${col("In $KINS",tokRows,"none listed in $KINS")}
@@ -5444,6 +5552,7 @@ async function loadMerchant(){
   if(!document.querySelector('.mwrap')) $("#view").innerHTML=skel(5);
   try{ MERCH=await (await fetch("/api/merchant")).json(); }
   catch(e){ $("#view").innerHTML=`<div class="empty warn">Couldn't load merchant data.</div>`; return; }
+  merchHistCache=null;   // refresh the resource-history chart data alongside the tracker
   renderMerchant();
 }
 function mIcon(it){ return `<img class="ico" src="/icon/${it}" alt="" loading="lazy" `+
@@ -5458,13 +5567,13 @@ function renderMerchant(){
     const gold=s.gold_trade;
     const ov=s.overall_pct||0;
     const rows=(s.resources||[]).map(r=>{
-      const p=r.pct==null?0:r.pct, done=p>=100;
-      return `<div class="mres-row">
+      const p=r.pct==null?0:r.pct, done=p>=100, open=state.merchResOpen===r.key;
+      return `<div class="mres-row clk ${open?'open':''}" data-rk="${r.key}" data-tip="click for donation progress over time">
         <div class="rh"><span class="nm">${mIcon(r.key)}${r.label}</span>
           <span class="nums"><span><b>${r.current==null?'—':r.current.toLocaleString()}</b> / ${r.goal==null?'—':r.goal.toLocaleString()}</span>
             <span class="rpct ${done?'done':''}">${r.pct==null?'—':p.toFixed(1)+'%'}</span></span></div>
         <div class="mtrack sm"><div class="mfill ${done?'done':''}" style="width:${Math.min(100,p)}%"></div></div>
-      </div>`; }).join("");
+      </div>`+(open?`<div class="mres-chart" id="mresChart">${skel(2)}</div>`:''); }).join("");
     const goldStock=(gold && s.gold_stock!=null)
       ? `<div class="gold-stock"><span>Gold stock</span><strong>${(s.gold_stock||0).toLocaleString()} / ${(s.gold_stock_full||0).toLocaleString()}</strong></div>` : "";
     track=`<section class="mpanel">
@@ -5531,6 +5640,34 @@ function renderMerchant(){
   const q=$("#mintQty");
   if(q) q.oninput=()=>{ state.mintQty=q.value; renderMerchant();
     const nq=$("#mintQty"); if(nq){ nq.focus(); nq.setSelectionRange(nq.value.length,nq.value.length);} };
+  document.querySelectorAll('.mres-row.clk').forEach(row=>row.onclick=()=>{
+    const k=row.dataset.rk; state.merchResOpen=(state.merchResOpen===k)?null:k; renderMerchant(); });
+  if(state.merchResOpen) drawMerchResChart(state.merchResOpen);
+}
+let merchHistCache=null;
+async function drawMerchResChart(key){
+  const w=$("#mresChart"); if(!w) return;
+  if(!merchHistCache){ try{ merchHistCache=await (await fetch("/api/merchant-history")).json(); }
+    catch(e){ w.innerHTML=`<div class="empty" style="padding:14px">Couldn't load history.</div>`; return; } }
+  if(!$("#mresChart")) return;
+  const rec=((merchHistCache&&merchHistCache.resources)||[]).find(r=>r.key===key);
+  const pts=(rec&&rec.series||[]).filter(p=>p.pct!=null);
+  if(pts.length<2){ $("#mresChart").innerHTML=`<div class="empty" style="padding:14px">Not enough history yet — donation progress is logged ~every 5 min; the curve fills in as the campaign runs.</div>`; return; }
+  const W=560,H=150,PL=34,PR=12,PT=12,PB=20,plotW=W-PL-PR,plotH=H-PT-PB;
+  const xs=pts.map(p=>p.t),x0=Math.min(...xs),x1=Math.max(...xs);
+  const X=t=>PL+(x1===x0?0:(t-x0)/(x1-x0))*plotW, Y=v=>PT+plotH-(v/100)*plotH;
+  let grid='';[0,25,50,75,100].forEach(v=>{const yy=Y(v);
+    grid+=`<line x1="${PL}" y1="${yy}" x2="${W-PR}" y2="${yy}" stroke="rgba(120,140,165,.12)"/>`+
+      `<text x="${PL-6}" y="${yy+3}" text-anchor="end" fill="#6f86a6" font-size="9" font-family="monospace">${v}%</text>`;});
+  const line=pts.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)} ${Y(p.pct).toFixed(1)}`).join(' ');
+  const area=`M${X(pts[0].t).toFixed(1)} ${(PT+plotH).toFixed(1)} `+pts.map(p=>`L${X(p.t).toFixed(1)} ${Y(p.pct).toFixed(1)}`).join(' ')+` L${X(pts[pts.length-1].t).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
+  const dt=t=>new Date(t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',timeZone:'UTC'});
+  $("#mresChart").innerHTML=`<div class="gw-meta-h" style="margin:2px 0 4px">${esc(rec.label)} — donation progress over time</div>
+    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
+      <defs><linearGradient id="mrg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e8b54a" stop-opacity=".25"/><stop offset="1" stop-color="#e8b54a" stop-opacity="0"/></linearGradient></defs>
+      ${grid}<path d="${area}" fill="url(#mrg)"/><path d="${line}" fill="none" stroke="#e8b54a" stroke-width="1.8"/>
+      <text x="${PL}" y="${H-6}" fill="#6f86a6" font-size="9" font-family="monospace">${dt(x0)}</text>
+      <text x="${W-PR}" y="${H-6}" text-anchor="end" fill="#6f86a6" font-size="9" font-family="monospace">${dt(x1)}</text></svg>`;
 }
 function fmtDur(h){ if(h==null)return '—'; if(h<1)return Math.round(h*60)+'m'; if(h<48)return (+h.toFixed(1))+'h'; return (+(h/24).toFixed(1))+'d'; }
 /* Merchant forecast desk: completion ETA, bottleneck resource, demand pressure,
@@ -5684,7 +5821,7 @@ function renderWorld(){
       <input id="lwsearch" placeholder="🔍 find a player by name…" value="${esc(state.liveSearch)}" autocomplete="off" spellcheck="false">
       <button id="lwgo" class="go" ${state.liveSearchBusy?'disabled':''}>${state.liveSearchBusy?'Searching…':'Search all servers'}</button>
       ${(qq||state.liveSearchStatus)?`<button id="lwclear" title="clear">✕</button>`:''}
-      <span id="lwstatus" class="lw-srch-status">${esc(state.liveSearchStatus||'')}</span>
+      <span id="lwstatus" class="lw-srch-status${state.liveSearchErr?' err':''}">${esc(state.liveSearchStatus||'')}</span>
     </div>
     <p class="lw-note">Each server is a separate world (all 12). We sweep every area — hub, pond, shores, dungeons — to roster who's where (fills over the first ~20s). Typing filters this server's roster live; hit <b>Search all servers</b> (or Enter) to sweep every server and jump to whoever matches. Click anyone to expand; players out on the overworld also pin to the map.</p>
     <div class="lw-roster">${body}</div>`;
@@ -5705,7 +5842,8 @@ async function searchAllServers(){
   if(state.liveSearchBusy) return;
   state.liveSearchBusy=true; state.liveSearchStatus="searching all 12 servers…";
   renderWorld();
-  const setStatus=t=>{ state.liveSearchStatus=t; const el=$("#lwstatus"); if(el) el.textContent=t; };
+  const setStatus=t=>{ state.liveSearchStatus=t; state.liveSearchErr=false;
+    const el=$("#lwstatus"); if(el){ el.textContent=t; el.classList.remove('err'); } };
   let found=null;
   const deadline=Date.now()+18000;          // rosters fill over ~20s; give it that long
   try{
@@ -5730,6 +5868,7 @@ async function searchAllServers(){
       if(el) el.scrollIntoView({block:'center',behavior:'smooth'}); }, 380);
   } else {
     state.liveSearchStatus=`"${q}" isn't on any of the 12 servers right now.`;
+    state.liveSearchErr=true;
     renderWorld();
   }
 }

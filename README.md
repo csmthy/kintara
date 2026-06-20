@@ -117,7 +117,7 @@ publicly exposed** (no kintara.gg supply/index API; game.js has no edition/suppl
 | Active listings | `GET kintara.gg/api/marketplace/listings?sort=latest&currency=all&category=all&limit=40&offset=0&q=` | Returns `{ok, listings[], total, limit, offset, hasMore}`. Each listing: `id, sellerId, sellerName, itemType, quantity, priceGold, currency, priceUsd, createdAt, reservedBy, reservedUntilMs, itemDurability`. **No public sales-history here; no category field** (the `category` param is ignored — server returns everything). We build history ourselves. |
 | Daily completed sales | `GET kintara.gg/api/marketplace/stats?[currency=token&]itemType=<x>` | `{ok, currency, avg30d, samples:[{date, avgUnitPrice, sales}]}`. **Daily only** (ignores interval params), ~30 days, **sparse** (only days with sales). `avgUnitPrice` is per single item; gold prices are rounded to 2 decimals (sub-cent gold collapses to 0). Omit `currency` = gold; `currency=token` = USD. |
 | Live KINS price (USD) | `GET kintara.gg/api/token/blimp-stats` | `{priceUsd, ...}` — kintara's own KINS/USD, matches their index page. |
-| Item art | `kintara.gg/assets/hud/<category>/<name>.(png|svg)` | Real in-game icons. Mapping is per-item (see `ICON_OVERRIDES` + `icon_asset()`); cosmetics = `cosmetics/<itemType>.png`, pets = `pets/paw.svg`, keys = bronze/silver/gold. Furniture has no art. |
+| Item art | `kintara.gg/assets/hud/<category>/<name>.(png|svg)` | Real in-game icons. Mapping is per-item (`ICON_OVERRIDES` + `icon_asset()`); cosmetics = `cosmetics/<itemType>.png`, keys = bronze/silver/gold. **Pets/furniture**: the exact per-item paths aren't in the override map, so `icon_candidates()` probes likely schemes (`pets/<name>.png`, `furniture/<name>.png`, …) and the `/icon` route caches the first that returns 200, falling back to the generic paw for pets. Cached under a `__art` namespace so the old generic-paw files don't shadow real art. **The probed paths are unverified guesses** — confirm a real one in-browser and add it to `ICON_OVERRIDES` if a pet/furniture stays blank. |
 | Item display names | (ripped from `kintara.gg/game.js` label catalog) | Baked into `ITEM_LABELS` dict (133 entries). `item_label()` resolves itemType→name with a prettify fallback. e.g. `cosmetic_dog_mask`→"Jotchua", `wild_sword`→"Training Sword". |
 | **Gold USD price (ours)** | our own `listings` DB | Authoritative while the tracker runs. `gold_price_loop` snapshots one row into `gold_price` every ~3 min = `our_gold_price()` (avg per-gold USD of the 3 cheapest live token gold listings). Drives both the gold chart and the arbitrage gold rate. |
 | **Gold USD price history (fallback)** | (ripped from `kintaragold.xyz` HTML) | The page embeds `"history":[{t,price}]` + `"spotPriceUsd"` in its RSC payload (escaped, can straddle chunk boundaries — we regex the `t`/`price` pairs). Independent gold-USD series (~10-min, ~25 days), NOT derived from KINS. `fetch_kintara_gold_history()`, cached ~3 min. Used **only to backfill the stretch before our own `gold_price` data begins** (see `gold_series_for_chart()`) and as the gold-rate fallback when no live gold listings exist. |
@@ -299,17 +299,25 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   plus a `sold_ratio` = sale-event units ÷ removed units calibration), `fair_usd`+`verdict`
   (cheap/fair/expensive vs gold-anchored `recent_fair_usd()`) + `confidence`, `last_sale`. Reads the
   durable metrics + a couple of cheap indexed live queries — never aggregates raw snapshots.
-- `GET /api/floor-history?item_type=&range=24H|3D|7D|30D|ALL` — floor-price history for the floor chart:
-  recent points from `orderbook_snapshots` (per-tick cheapest USD floor across both currencies), older
-  points from `item_daily_metrics` (one/day, for the stretch before snapshot coverage). Returns per-point
-  `{t, usd, gold, kins}` (gold/KINS derived from USD via `gold_daily_usd()`/`kins_daily_usd()`).
+- `GET /api/floor-history?item_type=&range=24H|3D|7D|30D|ALL` — floor-price history for the floor chart.
+  Per point `{t, usd, gold, kins}`: **`gold` = the ACTUAL cheapest gold-currency ask** (what people really
+  list it for in gold, not a conversion), `usd` = the cheapest USD-equivalent across both currencies (so
+  KINS reflects whichever way is cheaper to buy), `kins` = usd ÷ KINS price. Recent points from
+  `orderbook_snapshots`, older from `item_daily_metrics`. The frontend graphs cheap gold floors as
+  **items-per-gold**.
 - `GET /api/item-meta?item_type=` — Index info-panel metadata for one cosmetic/mount/pet: sourcing
   channel + **availability cadence** (weekly 7d vs daily 24h, from the game's shop-payload shapes),
   **ride speed** (mounts), special-feature flavor (`ITEM_DESC`), a **cheapest-ever-traded** source/floor
   proxy (exact rotating shop gold prices are server-side/auth-gated, not public), plus the derived
   availability window + supply status from `sales_daily` (`item_index_meta()`).
 - `GET /api/sales-summary?window=1|7|30` — per-item totals over the window: sales,
-  sales-weighted avg gold/USD, `$KINS` (= avg USD ÷ live KINS price), `ref_day`.
+  sales-weighted avg gold/USD, `$KINS`, `ref_day`. Also returns the **current floor** per item
+  (`floor_gold` = actual cheapest gold ask, `floor_usd` = cheapest USD-equivalent, `floor_kins`) via
+  `item_floors()` — drives the Index tab's floor columns. `item_floors()` applies the **bulk-material
+  rule**: for `material` items it ignores listings smaller than `MIN_BULK_QTY` (1000), so a "100 wood for
+  a pittance" dump doesn't set the floor.
+- `GET /api/merchant-history` — each campaign resource's donation **% over time** (and the overall %),
+  from `merchant_snapshots`. Drives the click-to-expand chart on each Merchant resource bar.
 - `GET /api/gold-history?range=4H|1D|3D|7D|14D|ALL` — gold/USD + KINS/gold series (our
   `gold_price` series spliced over the kintaragold fallback).
 - `GET /api/liquidity?item_type=&gold_item=` — buy-side liquidity depth for one item, in **USD
@@ -390,14 +398,17 @@ numbered by topic, not bar order.
      (`mpRenderExpand()`); auto-refresh freezes while a dropdown is open. Because the flicker-free morph
      reuses DOM nodes, the render **clears stale per-cell mouse handlers** (`td.onmouse*`) so an arbitrage
      deal/sold hover card can't bleed into the Collectables table.
-2. **Live listings** — current active listings, with item art. **Sales feed** — **actual completed
-   sales** (`/api/sales-feed`): item · **qty sold** (real stack size) · **total paid** (+ per-1,000 for
-   bulk commodities) · **seller** · **time listed** (how long it sat before selling) · when. Each sale is
-   matched to the listing that vanished, so "13,251 stone for 1g" reads correctly instead of the old
-   misleading "5 units". Cancellations excluded.
+2. **Live listings** — current active listings (item · seller · qty · price · listed; the per-item column
+   was removed). **Sales feed** — **actual completed sales** (`/api/sales-feed`): item · **qty sold**
+   (real stack size) · **total paid** · **seller** · **time listed** (how long it sat before selling) ·
+   when. Each sale is matched to the listing that vanished, so "13,251 stone for 1g" reads correctly
+   instead of the old misleading "5 units". Cancellations excluded.
 3. **Index** (was "Sales history") — game "index" layout: category **sidebar**, **Today / 7d / 30d**
-   window selector, **Most/Least sales** sort, columns ITEM · SALES · AVG GOLD · AVG USD ·
-   $KINS. Click a row → expands to a full **Item Scorecard** (stock-page) view:
+   window selector, **Most/Least sales** sort, columns ITEM · SALES · **FLOOR GOLD · FLOOR USD ·
+   FLOOR $KINS** (the live cheapest price per item, from `item_floors()` — replaced the old avg-sales
+   columns). Cheap commodities show **items-per-gold** (e.g. `24k/g`) instead of a tiny gold fraction, and
+   **material/food/potion** show **USD/$KINS per 1,000**. Click a row → expands to a full **Item
+   Scorecard** (stock-page) view:
    - **Scorecard header** (`/api/scorecard`, `loadScorecard`/`scorecardHTML`): the floor in
      **gold/USD/KINS** with a **cheap/fair/expensive verdict** pill, **24h/7d/30d %** change, and a
      stat strip — **liquidity** (0–100 exit score, deep/ok/thin), **sells/day**, **time to sell**
@@ -405,9 +416,11 @@ numbered by topic, not bar order.
    - **Floor price chart** (`/api/floor-history`, `loadFloorHistory`/`floorChartHTML`): the cheapest
      listing over time — like the Gold-price chart but per item — with a **gold / USD / $KINS** unit
      toggle, **24H/3D/7D/30D/ALL** ranges, and a **crosshair hover card** (`attachFloorHover`) showing
-     the point's date and floor in all three units. Fills in as snapshots accumulate. For
-     **material/potion/food** it (and the scorecard floor) quotes **per 1,000 units** — a single unit is
-     a fraction of a cent and nobody trades one (the Solana fee dwarfs it).
+     the point's date and floor in all units (incl. gold/ea + gold/1k). **Gold** is the ACTUAL cheapest
+     gold-currency ask; when it's under 1g/item the chart graphs **items-per-gold** (line rises as it gets
+     cheaper). **$KINS** is whichever is cheaper at the time (token-USD vs gold→USD). For
+     **material/potion/food** the scorecard floor and USD/$KINS axes quote **per 1,000 units** — a single
+     unit is a fraction of a cent and nobody trades one (the Solana fee dwarfs it).
    - Then the existing **line chart** with a 4-way currency toggle
    **USD ($KINS) ⇆ vs $KINS ⇆ Gold ⇆ Gold Standard**, hover card, + a cumulative stats panel.
    **Gold Standard** (`currency=goldstd`) values *every* sale in gold — gold sales as-is, USD/KINS sales
@@ -436,7 +449,9 @@ numbered by topic, not bar order.
      tiny per-unit number — with stack size, seller, cross-converted value (gold→USD, USD→$KINS), and a
      **per-1,000** figure for bulk commodities. Each listing is stamped with **price-memory badges**
      (`cheapest ever`/`7d low` vs the floor history, `below sale avg`/`above fair`/`overpriced` vs recent
-     fair value) so Live Listings beats the in-game market. Many items have <5; that's fine.
+     fair value) so Live Listings beats the in-game market. For **material** items only listings ≥1000 units
+  are shown (tiny dumps filtered). Each row shows **price · quantity · $KINS value** (no per-unit/per-1k
+  clutter). Many items have <5; that's fine.
    - **Every** item expand also shows a **Recent sales** panel (`loadRecentSales()`, `/api/sales-feed`):
      the item's latest **actual completed sales** — **qty × total paid**, who sold it, **how long it sat**
      before selling, relative time — newest first, cancellations excluded. Empty until real sales are
@@ -448,7 +463,9 @@ numbered by topic, not bar order.
    card, auto log-scale for extreme ranges.
 5. **Merchant** — traveling-merchant desk. Left: progress tracker (overall % + five donation-resource
    current/goal bars **with a % next to each item**: wood, stone, coal, cooked fish, **metal**; mode
-   badge donation/gold-trade; gold stock). Right: **cost calculator** — the current gold-trade recipe
+   badge donation/gold-trade; gold stock). **Each resource bar is clickable** → expands an inline chart of
+   that resource's donation **% over time** (`/api/merchant-history`, `drawMerchResChart`). Right: **cost
+   calculator** — the current gold-trade recipe
    from `MERCHANT_TRADE_COST` priced **liquidity-aware** (walks the live order book, so each additional
    gold costs more as cheap listings are consumed), with a "mint N gold" input, avg & marginal $/gold,
    craft cost vs gold value, profit/margin, and a cap when the mint exceeds listed liquidity.
@@ -570,6 +587,28 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Floor-centric Index + actual-gold floors + merchant resource history + UI polish:**
+  - **Index now shows the live FLOOR** (gold/USD/$KINS) per item instead of avg-sales columns
+    (`item_floors()` in `/api/sales-summary`). Cheap commodities render as **items-per-gold** (`24k/g`),
+    and **material/food/potion** quote **USD/$KINS per 1,000**. Same floor display on the scorecard.
+  - **Bulk-material floor rule:** materials ignore listings smaller than `MIN_BULK_QTY` (1000) when
+    pricing the floor — a tiny "100 wood" dump no longer sets the price. Applied in `compute_orderbook_rows`
+    (snapshots), `item_floors`, the scorecard, and `/api/item-listings`.
+  - **Floor chart uses ACTUAL gold listings** (not a USD→gold conversion): `gold` = cheapest gold-currency
+    ask, graphed as **items-per-gold** when <1g/item; `$KINS` = whichever is cheaper at the time (token-USD
+    vs gold→USD); hover shows gold/ea + gold/1k. (`/api/floor-history` now returns the real gold floor.)
+  - **Merchant resource bars are clickable** → inline chart of that resource's donation **% over time**
+    (`/api/merchant-history` + `drawMerchResChart`, from `merchant_snapshots`).
+  - **Cheapest live listings** (materials): only ≥1k-unit listings; rows show **price · quantity · $KINS**
+    (dropped the per-1k/per-unit clutter).
+  - **Pets/furniture icons:** `icon_candidates()` probes likely per-item art paths (cached under a `__art`
+    namespace so old generic-paw files don't shadow them), falling back to the paw for pets. *The probed
+    paths are unverified guesses* — confirm real ones in-browser and add to `ICON_OVERRIDES` if needed.
+  - **Aesthetic + small fixes:** Arbitrage and Collectables are now wrapped in the same framed gold-titled
+    game panel (`.gw`) as the Index, so the tabs match. Removed the **per-item** column from Live listings
+    and the **per-1k** figure from the Sales feed. Live-World "player isn't on any server" message is now
+    **red**.
 
 - **Sales-feed accuracy overhaul + per-1,000 quoting + floor-chart hover + Index-first:**
   - **Sales feed rebuilt for real quantities.** The old `sales_events.units` was a `/stats` *count* of
