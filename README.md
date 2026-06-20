@@ -214,6 +214,10 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
   `undercut_count` (downward floor moves). This is the cache the scorecard / floor-history
   read from — **never aggregate raw snapshots per request**. Storage stays bounded because raw
   snapshots are pruned once their day is rolled up here.
+- **`merchant_events`** — **merchant RESTOCK events** (`ts` PK, `kind`, `gold_stock`, `note`). Detected in
+  `merchant_snapshot_loop` by comparing each snapshot to the previous: the campaign filling (complete/
+  overall % crossing 100) or the gold stock jumping back up (refill ≥40% of full), deduped to one per
+  ~30 min. A market-wide shock, overlaid as gold markers on the time charts via `/api/merchant-events`.
 - **`merchant_snapshots`** — traveling-merchant campaign history (`merchant_snapshot_loop`,
   ~5 min, reuses `fetch_merchant()`'s 60s cache → no extra kintara load): `ts` (PK), `mode`,
   `overall_pct`, `gold_stock`, `gold_trade`, `complete`, `resources` (JSON
@@ -302,9 +306,11 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
 - `GET /api/floor-history?item_type=&range=24H|3D|7D|30D|ALL` — floor-price history for the floor chart.
   Per point `{t, usd, gold, kins}`: **`gold` = the ACTUAL cheapest gold-currency ask** (what people really
   list it for in gold, not a conversion), `usd` = the cheapest USD-equivalent across both currencies (so
-  KINS reflects whichever way is cheaper to buy), `kins` = usd ÷ KINS price. Recent points from
-  `orderbook_snapshots`, older from `item_daily_metrics`. The frontend graphs cheap gold floors as
-  **items-per-gold**.
+  KINS reflects whichever way is cheaper to buy), `kins` = usd ÷ KINS price **at that tick's time**
+  (intraday, via `kins_intraday_ms()` + `interp_gold()` — NOT a single daily close, otherwise the $KINS
+  line would just be a scaled copy of the USD line within a day; falls back to the daily close for old
+  pre-snapshot points or if GeckoTerminal is unreachable). Recent points from `orderbook_snapshots`, older
+  from `item_daily_metrics`. The frontend graphs cheap gold floors as **items-per-gold**.
 - `GET /api/item-meta?item_type=` — Index info-panel metadata for one cosmetic/mount/pet: sourcing
   channel + **availability cadence** (weekly 7d vs daily 24h, from the game's shop-payload shapes),
   **ride speed** (mounts), special-feature flavor (`ITEM_DESC`), a **cheapest-ever-traded** source/floor
@@ -318,6 +324,9 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   a pittance" dump doesn't set the floor.
 - `GET /api/merchant-history` — each campaign resource's donation **% over time** (and the overall %),
   from `merchant_snapshots`. Drives the click-to-expand chart on each Merchant resource bar.
+- `GET /api/merchant-events` — **merchant RESTOCK timestamps** (campaign-fill / gold-stock-refill), last
+  ~90 days, from `merchant_events`. The frontend overlays these as **gold markers** on the floor, sales and
+  gold-price charts (a restock is a market-wide shock worth anchoring for research).
 - `GET /api/gold-history?range=4H|1D|3D|7D|14D|ALL` — gold/USD + KINS/gold series (our
   `gold_price` series spliced over the kintaragold fallback).
 - `GET /api/liquidity?item_type=&gold_item=` — buy-side liquidity depth for one item, in **USD
@@ -398,8 +407,9 @@ numbered by topic, not bar order.
      (`mpRenderExpand()`); auto-refresh freezes while a dropdown is open. Because the flicker-free morph
      reuses DOM nodes, the render **clears stale per-cell mouse handlers** (`td.onmouse*`) so an arbitrage
      deal/sold hover card can't bleed into the Collectables table.
-2. **Live listings** — current active listings (item · seller · qty · price · listed; the per-item column
-   was removed). **Sales feed** — **actual completed sales** (`/api/sales-feed`): item · **qty sold**
+2. **Live listings** — current active listings (item **icon** + name · seller · qty · price · listed; the
+   per-item column was removed). **Sales feed** — **actual completed sales** (`/api/sales-feed`): item
+   **icon** + name · **qty sold**
    (real stack size) · **total paid** · **seller** · **time listed** (how long it sat before selling) ·
    when. Each sale is matched to the listing that vanished, so "13,251 stone for 1g" reads correctly
    instead of the old misleading "5 units". Cancellations excluded.
@@ -464,7 +474,8 @@ numbered by topic, not bar order.
 5. **Merchant** — traveling-merchant desk. Left: progress tracker (overall % + five donation-resource
    current/goal bars **with a % next to each item**: wood, stone, coal, cooked fish, **metal**; mode
    badge donation/gold-trade; gold stock). **Each resource bar is clickable** → expands an inline chart of
-   that resource's donation **% over time** (`/api/merchant-history`, `drawMerchResChart`). Right: **cost
+   that resource's donation **% over time** (`/api/merchant-history`, `drawMerchResChart`, with a gold-chart
+   style crosshair hover via the reusable `svgHover()`). Right: **cost
    calculator** — the current gold-trade recipe
    from `MERCHANT_TRADE_COST` priced **liquidity-aware** (walks the live order book, so each additional
    gold costs more as cheap listings are consumed), with a "mint N gold" input, avg & marginal $/gold,
@@ -587,6 +598,28 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Merchant restock markers on every time chart:** a merchant restock (donation campaign filling / gold
+  stock refilling) is a market-wide price shock, so it's now detected (`merchant_events` table, transition
+  logic in `merchant_snapshot_loop`), served (`/api/merchant-events`), and **overlaid as a gold dot +
+  faint vertical line on the floor charts, the per-item sales charts, and the gold-price chart** — hover
+  shows "🪙 Merchant restock · <time>". The overlay is a reusable plain-HTML layer (`restockOverlay` /
+  `applyRestock` + `ensureMerchEvents`) positioned over each chart, so it works uniformly over both the
+  `<svg>` floor chart and the `<canvas>` sales/gold charts; each chart supplies a `time → x-fraction`
+  mapping. Markers refresh when the Merchant tab is opened.
+
+- **Floor chart $KINS bugfix:** the floor chart's $KINS series was dividing every (high-resolution,
+  per-tick) point by a single **daily** KINS close, so within a day $KINS was just a scaled copy of USD
+  (identical shape). Now it converts each tick by the KINS price **at that tick's time** (intraday, new
+  `kins_intraday_ms()` cached ~3 min + `interp_gold()`), falling back to the daily close only for old
+  pre-snapshot points / when GeckoTerminal is unreachable. KINS now moves independently of USD, surfacing
+  item-alpha-vs-token-beta on the floor chart.
+
+- **Merchant graph hover + table item icons:** added a reusable `svgHover()` (crosshair + floating card,
+  same feel as the gold-price chart) and wired it into the Merchant **resource-progress chart**
+  (date · % · amount donated) and the **mint-profit sparkline** (date · profit/gold · gold & mint cost) —
+  the inline SVG charts that previously had no hover. Added a small item **icon** next to the name in both
+  the **Live listings** and **Sales feed** tables (`rowIcon()`, emoji fallback).
 
 - **Floor-centric Index + actual-gold floors + merchant resource history + UI polish:**
   - **Index now shows the live FLOOR** (gold/USD/$KINS) per item instead of avg-sales columns

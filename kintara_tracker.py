@@ -478,6 +478,17 @@ def init_db() -> None:
             mint_usd     REAL,                -- cheapest $/gold to mint at tick time
             gold_rate    REAL
         );
+
+        -- MERCHANT RESTOCK EVENTS — the moment the donation campaign fills (goals met /
+        -- the merchant restocks gold). A major market-wide shock, so we mark it on the
+        -- price/sales/gold charts for research. Detected from merchant_snapshots
+        -- transitions; deduped so a flap at the 100% boundary logs once.
+        CREATE TABLE IF NOT EXISTS merchant_events (
+            ts         INTEGER PRIMARY KEY,    -- epoch ms of the restock
+            kind       TEXT,                   -- 'restock'
+            gold_stock INTEGER,
+            note       TEXT
+        );
         """
     )
 
@@ -1021,6 +1032,28 @@ def kins_series_for_range(window_sec, bucket_sec):
             b[int(t // bucket_sec) * bucket_sec] = c  # last close in each bucket
         raw = sorted(b.items())
     return raw
+
+
+_kins_intraday_cache = {}   # bucket_sec -> (fetched_at, [(t_ms, price)])
+
+
+def kins_intraday_ms(window_sec, bucket_sec):
+    """KINS USD price as [(t_ms, price)] over the window at bucket resolution, for
+    converting a high-resolution series to $KINS at the price PREVAILING AT EACH TICK
+    (not a single daily close — otherwise KINS is just a scaled copy of USD intraday).
+    Cached ~3 min per bucket so opening several item charts doesn't hammer GeckoTerminal."""
+    now = time.time()
+    hit = _kins_intraday_cache.get(bucket_sec)
+    if hit and now - hit[0] < 180:
+        return hit[1]
+    try:
+        candles = kins_series_for_range(window_sec, bucket_sec)
+        ms = [(int(t * 1000), c) for t, c in candles if c and c > 0]
+    except Exception:
+        ms = []
+    if ms:
+        _kins_intraday_cache[bucket_sec] = (now, ms)
+    return ms
 
 
 _kins_px_cache = {"at": 0, "px": None}
@@ -1651,14 +1684,42 @@ def merchant_snapshot_loop(interval=None):
                 overall = round(sum(pcts) / len(pcts), 2) if pcts else None
                 rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
                 cost, _capped = merchant_mint_cost(con, 1, rate)
+                now_ms = int(time.time() * 1000)
+                gstock = raw.get("goldStock")
+                gfull = raw.get("goldStockFull")
+                new_complete = 1 if raw.get("complete") else 0
+                # detect a RESTOCK: the campaign just filled (complete/overall crossed to
+                # 100), or the merchant's gold stock jumped back up (refilled). Compare to
+                # the previous snapshot; dedupe within 30 min so a 100% flap logs once.
+                prev = con.execute(
+                    "SELECT overall_pct, complete, gold_stock FROM merchant_snapshots "
+                    "ORDER BY ts DESC LIMIT 1").fetchone()
+                if prev is not None:
+                    was_full = (prev["complete"] == 1) or (prev["overall_pct"] is not None
+                                                           and prev["overall_pct"] >= 99.5)
+                    is_full = (new_complete == 1) or (overall is not None and overall >= 99.5)
+                    pstock = prev["gold_stock"]
+                    refill = (gstock is not None and pstock is not None and gfull
+                              and gstock - pstock >= 0.4 * gfull)
+                    if (is_full and not was_full) or refill:
+                        recent = con.execute(
+                            "SELECT MAX(ts) m FROM merchant_events WHERE ts >= ?",
+                            (now_ms - 1800_000,)).fetchone()
+                        if not (recent and recent["m"]):
+                            con.execute(
+                                "INSERT OR REPLACE INTO merchant_events(ts,kind,gold_stock,note) "
+                                "VALUES(?,?,?,?)",
+                                (now_ms, "restock", gstock,
+                                 "campaign filled" if (is_full and not was_full) else "gold stock refilled"))
+                            print(f"[{now_iso()}] merchant RESTOCK detected")
                 con.execute(
                     """INSERT OR REPLACE INTO merchant_snapshots
                        (ts,mode,overall_pct,gold_stock,gold_trade,complete,resources,
                         mint_usd,gold_rate)
                        VALUES(?,?,?,?,?,?,?,?,?)""",
-                    (int(time.time() * 1000), raw.get("mode"), overall,
-                     raw.get("goldStock"), 1 if raw.get("goldTradeEnabled") else 0,
-                     1 if raw.get("complete") else 0, json.dumps(resources),
+                    (now_ms, raw.get("mode"), overall, gstock,
+                     1 if raw.get("goldTradeEnabled") else 0, new_complete,
+                     json.dumps(resources),
                      round(cost, 6) if cost is not None else None,
                      round(rate, 6) if rate else None))
                 con.commit()
@@ -3200,19 +3261,30 @@ def make_app():
             kusd = kins_daily_usd()
         finally:
             con.close()
+        # KINS price at EACH tick (intraday), so the $KINS line isn't a scaled copy of the
+        # USD line within a day. Fall back to the daily close for points outside the
+        # intraday window (old pre-snapshot days) or if the intraday fetch fails.
+        bucket = 180 if days <= 1 else 900 if days <= 3 else 3600 if days <= 7 else 14400
+        kms = kins_intraday_ms(max(days, 1) * 86400, bucket)
         kdates = sorted(kusd)
         def carry(m, dates, d):
             if d in m:
                 return m[d]
             prior = [x for x in dates if x <= d]
             return m[prior[-1]] if prior else None
+        def kins_at(t, d):
+            if kms and kms[0][0] <= t <= kms[-1][0]:
+                v = interp_gold(kms, t)
+                if v:
+                    return v
+            return carry(kusd, kdates, d)         # daily fallback (old points / no intraday)
         pts = older + [(t, ticks[t]["usd"], ticks[t]["gold"]) for t in sorted(ticks)]
         series = []
         for t, usd, gold in pts:
             if usd is None and gold is None:
                 continue
             d = datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d")
-            ku = carry(kusd, kdates, d)
+            ku = kins_at(t, d)
             series.append({"t": t, "usd": usd, "gold": gold,
                            "kins": (usd / ku) if (usd and ku) else None})
         return jsonify({"ok": True, "item_type": item, "range": rng, "series": series})
@@ -3486,6 +3558,21 @@ def make_app():
         return jsonify({"ok": True, "overall": overall,
                         "resources": [{"key": k, "label": labels.get(k, k), "series": res[k]}
                                       for k in res]})
+
+    @app.route("/api/merchant-events")
+    def merchant_events():
+        """Merchant RESTOCK timestamps (campaign-fill / gold-stock-refill events) — a
+        market-wide shock the frontend overlays as gold markers on the floor, sales and
+        gold-price charts for research. Newest-first, last ~90 days."""
+        con = connect(readonly=True)
+        cutoff = int((time.time() - 90 * 86400) * 1000)
+        rows = con.execute(
+            "SELECT ts, kind, note FROM merchant_events WHERE ts >= ? ORDER BY ts",
+            (cutoff,)).fetchall()
+        con.close()
+        return jsonify({"ok": True,
+                        "events": [{"ts": r["ts"], "kind": r["kind"], "note": r["note"]}
+                                   for r in rows]})
 
     @app.route("/api/live")
     def live():
@@ -3875,6 +3962,13 @@ td.isd{cursor:help}
 .lw-search button.go:disabled{opacity:.6;cursor:default}
 .lw-srch-status{color:var(--mut);font:12px var(--ui);margin-left:2px}
 .lw-srch-status.err{color:var(--sell);font-weight:600}
+.restock-mk{position:absolute;top:6%;bottom:9%;width:0;border-left:1.5px dashed rgba(232,181,74,.45);
+  pointer-events:auto;cursor:help}
+.restock-mk::after{content:"";position:absolute;left:0;bottom:-4px;width:9px;height:9px;border-radius:50%;
+  background:#f6d68a;transform:translateX(-50%);box-shadow:0 0 8px rgba(232,181,74,.85);pointer-events:auto}
+.cellitem{display:inline-flex;align-items:center;gap:7px;min-width:0}
+.rico{display:inline-flex;width:18px;height:18px;flex:0 0 18px;align-items:center;justify-content:center;font-size:13px;line-height:1}
+.rico img{width:18px;height:18px;object-fit:contain}
 .lw-roster{border:1px solid var(--line);border-radius:14px;overflow:hidden;
   background:linear-gradient(180deg,rgba(26,38,58,.4),rgba(15,24,40,.25))}
 .lw-roster h3{margin:0;padding:12px 15px;font:700 11px var(--ui);letter-spacing:.16em;
@@ -4403,6 +4497,37 @@ document.addEventListener('mouseover',e=>{ const t=e.target.closest&&e.target.cl
   el.style.left=Math.max(6,Math.min(L,innerWidth-b.width-6))+'px'; el.style.top=T+'px'; });
 document.addEventListener('mouseout',e=>{ if(tipEl && e.target.closest&&e.target.closest('[data-tip]')) tipEl.style.display='none'; });
 
+/* ---- merchant restock markers: a major market-wide shock, overlaid as gold dots on
+   every time-series chart (floor, sales, gold price) for research. The overlay is plain
+   HTML positioned over the chart, so it works uniformly over both <canvas> and <svg>. ---- */
+let MERCH_EVENTS=null, _meFetch=null;
+function ensureMerchEvents(){
+  if(MERCH_EVENTS) return Promise.resolve(MERCH_EVENTS);
+  if(!_meFetch) _meFetch=fetch("/api/merchant-events").then(r=>r.json())
+    .then(d=>{MERCH_EVENTS=((d&&d.events)||[]).map(e=>e.ts); return MERCH_EVENTS;})
+    .catch(()=>{MERCH_EVENTS=[]; return MERCH_EVENTS;});
+  return _meFetch;
+}
+function restockOverlay(el, xfrac){
+  if(!el||!el.parentElement) return;
+  const host=el.parentElement;
+  if(getComputedStyle(host).position==='static') host.style.position='relative';
+  host.querySelectorAll(':scope > .restock-layer').forEach(n=>n.remove());
+  const evs=MERCH_EVENTS||[]; if(!evs.length) return;
+  const layer=document.createElement('div'); layer.className='restock-layer';
+  layer.style.cssText=`position:absolute;left:${el.offsetLeft}px;top:${el.offsetTop}px;`+
+    `width:${el.offsetWidth}px;height:${el.offsetHeight}px;pointer-events:none;z-index:4`;
+  let any=false;
+  evs.forEach(ts=>{ const f=xfrac(ts); if(f==null||f<-0.002||f>1.002) return; any=true;
+    const mk=document.createElement('div'); mk.className='restock-mk';
+    mk.style.left=(Math.max(0,Math.min(1,f))*100)+'%';
+    mk.setAttribute('data-tip','🪙 Merchant restock · '+new Date(ts).toLocaleString());
+    layer.appendChild(mk); });
+  if(any) host.appendChild(layer);
+}
+function applyRestock(el, xfrac){ if(el) ensureMerchEvents().then(()=>{
+  if(document.body.contains(el)) restockOverlay(el,xfrac); }); }
+
 /* (#1) flicker-free DOM morph + (#8) value flash, installed as an
    innerHTML interceptor on #view / #ltable so every render updates in
    place instead of nuking the DOM. Falls back to native on any error. */
@@ -4882,6 +5007,10 @@ function lqs(){ return `q=${encodeURIComponent(fstate.q)}&currency=${fstate.curr
   `&category=${fstate.category}&sort=${fstate.sort}`; }
 function fmtPrice(r){ return r.currency==="token"
   ? `<span class="usd">$${r.price_usd}</span>` : `<span class="gold">${r.price_gold}g</span>`; }
+/* small inline item icon for table rows (Live listings / Sales feed), emoji fallback */
+function rowIcon(r){ const fb=(CAT_EMO[r.category]||"📦").replace(/'/g,"");
+  return `<span class="rico"><img src="/icon/${r.item_type}" alt="" loading="lazy" `+
+    `onerror="this.parentElement.textContent='${fb}'"></span>`; }
 
 async function loadLive(){
   if(!$("#ltable")){ await loadItems();
@@ -4892,7 +5021,7 @@ async function loadLive(){
     : `<table><thead><tr><th>item</th><th>seller</th><th class="num">qty</th>
         <th class="num">price</th><th class="num">listed</th>
         </tr></thead><tbody>`+rows.map(r=>`<tr>
-        <td title="${r.item_type}">${lbl(r.item_type)}</td>
+        <td title="${r.item_type}"><span class="cellitem">${rowIcon(r)}${lbl(r.item_type)}</span></td>
         <td class="mut">${r.seller_name||""}</td>
         <td class="num">${abbr(r.quantity||0)}</td><td class="num">${fmtPrice(r)}</td>
         <td class="num mut">${relAbs(r.created_at)}${freshness(r.created_at)}</td></tr>`).join("")+`</tbody></table>`;
@@ -4914,7 +5043,7 @@ async function loadRemoved(){   // "Sales feed" tab — ACTUAL completed sales (
     ? `<div class="empty">No sales recorded yet. This feed logs <b>actual completed sales</b> — each matched to the listing that vanished, so you see the real stack size, total paid, seller and how long it sat. Cancellations are excluded. Fills in going forward.</div>`
     : `<table><thead><tr><th>item</th><th class="num">qty sold</th><th class="num">total paid</th>
         <th>seller</th><th class="num">time listed</th><th class="num">when</th></tr></thead><tbody>`+
-      rows.map(r=>`<tr><td title="${r.item_type}">${lbl(r.item_type)}</td>
+      rows.map(r=>`<tr><td title="${r.item_type}"><span class="cellitem">${rowIcon(r)}${lbl(r.item_type)}</span></td>
         <td class="num">${r.qty!=null?`<b>${r.qty.toLocaleString()}</b>`:'<span class="mut" data-tip="confirmed via the sale counter; listing not captured">—</span>'}</td>
         <td class="num ${r.currency==='gold'?'gold':'usd'}">${saleAmt(r)}</td>
         <td class="mut">${r.seller?esc(r.seller):'<span data-tip="listing not captured">~est</span>'}</td>
@@ -5088,6 +5217,8 @@ async function loadFloorHistory(it,cat){
   document.querySelectorAll("#gwfloor [data-fu]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.floorUnit=b.dataset.fu;loadFloorHistory(it,cat);});
   document.querySelectorAll("#gwfloor [data-fr]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.floorRange=b.dataset.fr;loadFloorHistory(it,cat);});
   attachFloorHover();
+  const fx=window.__floor;
+  if(fx) applyRestock($("#floorsvg"), ts=> (ts<fx.t0||ts>fx.t1)?null:(fx.PL+(ts-fx.t0)/((fx.t1-fx.t0)||1)*fx.plotW)/fx.W);
 }
 function floorChartHTML(d,unit,it,cat){
   const b=qbasis(cat);
@@ -5121,6 +5252,7 @@ function floorChartHTML(d,unit,it,cat){
   const dt=t=>new Date(t).toLocaleDateString(undefined,{month:'short',day:'numeric',timeZone:'UTC'});
   const clr=unit==='gold'?'#e8b54a':unit==='kins'?'#7aa2ff':'#34d39a';
   window.__floor={W,H,plotTop:PT,plotBot:PT+plotH,unit,clr,cat,goldInvert,
+    t0:x0,t1:x1,PL,plotW,
     pix:series.map(p=>({x:X(p.t),y:Y(proj(p)),t:p.t,usd:p.usd,gold:p.gold,kins:p.kins}))};
   return `${head}${seg}<svg id="floorsvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
     <defs><linearGradient id="flg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${clr}" stop-opacity=".22"/><stop offset="1" stop-color="${clr}" stop-opacity="0"/></linearGradient></defs>
@@ -5343,6 +5475,7 @@ async function drawSalesChart(it,cur){
       x.fillStyle="#e8b54a";x.beginPath();x.arc(xx,yy,4,0,7);x.fill();x.strokeStyle="#0c0f13";x.lineWidth=2;x.beginPath();x.arc(xx,yy,4,0,7);x.stroke();}
   };
   paint(null);
+  applyRestock(c, ts=> (ts<t0||ts>t1)?null:(PL+(ts-t0)/tspan*(W-PL-PR))/W);
   c.onmousemove=ev=>{
     const r=c.getBoundingClientRect(),mx=(ev.clientX-r.left)*(W/r.width);
     let bi=0,bd=1e18; pts.forEach((p,i)=>{const dd=Math.abs(X(p.t)-mx);if(dd<bd){bd=dd;bi=i;}});
@@ -5477,6 +5610,11 @@ async function drawGold(){
     }
   }
   paint(null);
+  // gold restock markers — points are index-spaced, so map a timestamp to its fractional index
+  applyRestock(c, ts=>{ if(ts<pts[0].t||ts>pts[n-1].t) return null;
+    let i=0; while(i<n-1 && pts[i+1].t<=ts) i++;
+    let fi=i; if(i<n-1 && pts[i+1].t>pts[i].t) fi=i+(ts-pts[i].t)/(pts[i+1].t-pts[i].t);
+    return X(fi)/W; });
 
   const idxAt=ev=>{ const r=c.getBoundingClientRect(), px=(ev.clientX-r.left)*(W/r.width);
     let i=Math.round((px-left)/((right-left)/(n-1))); return Math.max(0,Math.min(n-1,i)); };
@@ -5553,6 +5691,7 @@ async function loadMerchant(){
   try{ MERCH=await (await fetch("/api/merchant")).json(); }
   catch(e){ $("#view").innerHTML=`<div class="empty warn">Couldn't load merchant data.</div>`; return; }
   merchHistCache=null;   // refresh the resource-history chart data alongside the tracker
+  MERCH_EVENTS=null; _meFetch=null;   // re-pull restock markers (a new one may have fired)
   renderMerchant();
 }
 function mIcon(it){ return `<img class="ico" src="/icon/${it}" alt="" loading="lazy" `+
@@ -5643,6 +5782,11 @@ function renderMerchant(){
   document.querySelectorAll('.mres-row.clk').forEach(row=>row.onclick=()=>{
     const k=row.dataset.rk; state.merchResOpen=(state.merchResOpen===k)?null:k; renderMerchant(); });
   if(state.merchResOpen) drawMerchResChart(state.merchResOpen);
+  const fs=window.__fcspark;
+  if(fs) svgHover("fcsvg","fccross",fs.W,fs.plotTop,fs.plotBot,fs.pix,fs.clr,
+    p=>`<div class="gd">${new Date(p.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZone:'UTC'})} UTC</div>`+
+       `<div class="gv" style="color:${p.profit>=0?'#34d39a':'#f06a6a'}">Profit : ${(p.profit>=0?'+':'')+'$'+(+p.profit).toFixed(3)}/gold</div>`+
+       `<div class="gd">gold $${(+(p.gold_rate||0)).toFixed(3)} · mint $${(+(p.mint_usd||0)).toFixed(3)}</div>`);
 }
 let merchHistCache=null;
 async function drawMerchResChart(key){
@@ -5663,11 +5807,36 @@ async function drawMerchResChart(key){
   const area=`M${X(pts[0].t).toFixed(1)} ${(PT+plotH).toFixed(1)} `+pts.map(p=>`L${X(p.t).toFixed(1)} ${Y(p.pct).toFixed(1)}`).join(' ')+` L${X(pts[pts.length-1].t).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
   const dt=t=>new Date(t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',timeZone:'UTC'});
   $("#mresChart").innerHTML=`<div class="gw-meta-h" style="margin:2px 0 4px">${esc(rec.label)} — donation progress over time</div>
-    <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
+    <svg id="mrsvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
       <defs><linearGradient id="mrg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e8b54a" stop-opacity=".25"/><stop offset="1" stop-color="#e8b54a" stop-opacity="0"/></linearGradient></defs>
       ${grid}<path d="${area}" fill="url(#mrg)"/><path d="${line}" fill="none" stroke="#e8b54a" stroke-width="1.8"/>
+      <g id="mrcross"></g>
       <text x="${PL}" y="${H-6}" fill="#6f86a6" font-size="9" font-family="monospace">${dt(x0)}</text>
       <text x="${W-PR}" y="${H-6}" text-anchor="end" fill="#6f86a6" font-size="9" font-family="monospace">${dt(x1)}</text></svg>`;
+  // crosshair + hover card (same feel as the gold-price chart)
+  svgHover("mrsvg","mrcross",W,PT,PT+plotH,
+    pts.map(p=>({x:X(p.t),y:Y(p.pct),t:p.t,pct:p.pct,current:p.current})),"#e8b54a",
+    p=>`<div class="gd">${new Date(p.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZone:'UTC'})} UTC</div>`+
+        `<div class="gv" style="color:#e8b54a">${esc(rec.label)} : ${p.pct.toFixed(1)}%</div>`+
+        (p.current!=null?`<div class="gd">${p.current.toLocaleString()} donated</div>`:''));
+}
+/* Reusable crosshair-hover for the inline SVG line charts (merchant, etc.) — finds the
+   nearest point by x, draws a dashed vertical line + dot, and shows a floating card. */
+function svgHover(svgId,crossId,W,plotTop,plotBot,pix,clr,fmtCard){
+  const svg=$("#"+svgId), cross=$("#"+crossId), card=gcardNode();
+  if(!svg||!cross||!pix.length) return;
+  svg.onmousemove=ev=>{
+    const r=svg.getBoundingClientRect(), vx=(ev.clientX-r.left)/r.width*W;
+    let best=pix[0],bd=1e18; for(const p of pix){ const dd=Math.abs(p.x-vx); if(dd<bd){bd=dd;best=p;} }
+    cross.innerHTML=`<line x1="${best.x.toFixed(1)}" y1="${plotTop}" x2="${best.x.toFixed(1)}" y2="${plotBot}" stroke="rgba(180,200,220,.35)" stroke-dasharray="5 4"/>`+
+      `<circle cx="${best.x.toFixed(1)}" cy="${best.y.toFixed(1)}" r="4" fill="${clr}" stroke="#0c0f13" stroke-width="2"/>`;
+    card.innerHTML=fmtCard(best); card.style.display="block";
+    const bb=card.getBoundingClientRect(); let L=ev.clientX+16,T=ev.clientY+16;
+    if(L+bb.width>innerWidth-8) L=ev.clientX-bb.width-16;
+    if(T+bb.height>innerHeight-8) T=innerHeight-bb.height-8;
+    card.style.left=L+"px"; card.style.top=T+"px";
+  };
+  svg.onmouseleave=()=>{ if(cross)cross.innerHTML=""; if(gcardEl)gcardEl.style.display="none"; };
 }
 function fmtDur(h){ if(h==null)return '—'; if(h<1)return Math.round(h*60)+'m'; if(h<48)return (+h.toFixed(1))+'h'; return (+(h/24).toFixed(1))+'d'; }
 /* Merchant forecast desk: completion ETA, bottleneck resource, demand pressure,
@@ -5711,17 +5880,20 @@ function forecastHTML(f){
   // mint-profit-over-campaign sparkline
   const ph=(f.profit_history||[]).filter(p=>p.profit!=null);
   let spark='';
+  window.__fcspark=null;
   if(ph.length>=2){
     const W=520,H=70,PT=6,PB=6,PL=4,PR=4,pw=W-PL-PR,plotH=H-PT-PB;
     const xs=ph.map(p=>p.t),ys=ph.map(p=>p.profit);
     const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(0,...ys),y1=Math.max(0,...ys);
     const X=t=>PL+(x1===x0?0:(t-x0)/(x1-x0))*pw, Y=v=>PT+plotH-(y1===y0?0.5:(v-y0)/(y1-y0))*plotH;
-    const zeroY=Y(0);
+    const zeroY=Y(0), clr=ys[ys.length-1]>=0?'#34d39a':'#f06a6a';
     const ln=ph.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)} ${Y(p.profit).toFixed(1)}`).join(' ');
+    window.__fcspark={W,plotTop:PT,plotBot:PT+plotH,clr,
+      pix:ph.map(p=>({x:X(p.t),y:Y(p.profit),t:p.t,profit:p.profit,mint_usd:p.mint_usd,gold_rate:p.gold_rate}))};
     spark=`<div class="fc-spk"><div class="gw-meta-h" style="margin-bottom:4px">Mint profit over the campaign <span style="color:#7f93ad;font-weight:400">— $ per gold (gold price − mint cost)</span></div>
-      <svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
+      <svg id="fcsvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
         <line x1="${PL}" y1="${zeroY.toFixed(1)}" x2="${W-PR}" y2="${zeroY.toFixed(1)}" stroke="rgba(120,140,165,.25)" stroke-dasharray="4 4"/>
-        <path d="${ln}" fill="none" stroke="${ys[ys.length-1]>=0?'#34d39a':'#f06a6a'}" stroke-width="1.8"/></svg></div>`;
+        <path d="${ln}" fill="none" stroke="${clr}" stroke-width="1.8"/><g id="fccross"></g></svg></div>`;
   }
   return `<section class="mpanel mfc">
     <div class="mhead"><div class="mtitle">Merchant Forecast</div>
