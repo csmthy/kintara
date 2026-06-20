@@ -5042,6 +5042,10 @@ async function loadLive(){
 function saleAmt(r){
   const g=r.currency==='gold';
   if(r.total!=null) return g?(+Number(r.total).toPrecision(4))+'g':'$'+Number(r.total).toFixed(r.total>=1?2:4);
+  if(r.qty!=null && r.price!=null){
+    const total=Number(r.qty)*Number(r.price);
+    if(Number.isFinite(total)) return g?(+Number(total).toPrecision(4))+'g':'$'+Number(total).toFixed(total>=1?2:4);
+  }
   if(r.price!=null) return (g?(+Number(r.price).toPrecision(3))+'g':'$'+Number(r.price).toFixed(r.price>=1?2:4))+'/ea';
   return "—";
 }
