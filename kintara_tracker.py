@@ -1166,7 +1166,7 @@ def _marginal_price(old_sales, old_avg, new_sales, new_avg, delta):
 
 
 def _log_sales(con, it, cur, d, delta, marginal, strict):
-    """Attribute `delta` CONFIRMED sales (the /stats sale-count rise — cancellations don't
+    """Attribute `delta` CONFIRMED sold units (the /stats sale-count rise — cancellations don't
     move it) to recently-captured, unclaimed REMOVED listings of (it,cur), recovering the
     real stack quantity, seller, price and time-on-market. Candidates are ranked by how
     close their per-unit is to the marginal sold price, so the genuinely-sold listing wins
@@ -1189,11 +1189,15 @@ def _log_sales(con, it, cur, d, delta, marginal, strict):
             return 1e9
         return abs(pu - marginal) / marginal
 
+    remaining = int(delta or 0)
     logged = 0
     for r in sorted(cands, key=closeness):
-        if logged >= delta:
+        if remaining <= 0:
             break
         if strict and closeness(r) > SALE_PRICE_TOL:
+            continue
+        q = int(r["quantity"] or 1)
+        if q > remaining:
             continue
         pu = r["per_unit"]
         total = r["price_gold"] if cur == "gold" else r["price_usd"]
@@ -1205,20 +1209,22 @@ def _log_sales(con, it, cur, d, delta, marginal, strict):
             """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
                seller_id,seller_name,listing_ms,listing_id,day,ts)
                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (it, cur, 1, r["quantity"], pu if pu is not None else marginal, total,
+            (it, cur, q, q, pu if pu is not None else marginal, total,
              r["seller_id"], r["seller_name"], lms, r["id"], d, now))
         con.execute("UPDATE listings SET sold_claimed=1 WHERE id=?", (r["id"],))
-        logged += 1
+        logged += q
+        remaining -= q
     # confirmed-but-unmatched: we know a sale happened (count + price) but missed the
-    # listing capture — log a synthetic row (qty unknown) so we don't re-detect it. Never
+    # listing capture — log one estimated stack row so we don't re-detect it. Never
     # on the first baseline (that delta may be pre-tracking history we never witnessed).
-    if not strict:
-        for _ in range(delta - logged):
-            con.execute(
-                """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
-                   seller_id,seller_name,listing_ms,listing_id,day,ts)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (it, cur, 1, None, marginal, None, None, None, None, None, d, now))
+    if not strict and remaining > 0:
+        con.execute(
+            """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
+               seller_id,seller_name,listing_ms,listing_id,day,ts)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (it, cur, remaining, remaining, marginal,
+             (marginal * remaining) if marginal is not None else None,
+             None, None, None, None, d, now))
     return logged
 
 
@@ -2898,8 +2904,21 @@ def make_app():
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         con = connect(readonly=True)
         rows = con.execute(
-            f"""SELECT item_type,currency,units,qty,price,total,seller_name,listing_ms,day,ts
-                FROM sales_events {where} ORDER BY ts DESC LIMIT ?""",
+            f"""SELECT item_type,currency,
+                       CASE WHEN qty IS NULL AND seller_name IS NULL
+                            THEN SUM(COALESCE(units,1)) ELSE units END AS units,
+                       CASE WHEN qty IS NULL AND seller_name IS NULL
+                            THEN SUM(COALESCE(units,1)) ELSE qty END AS qty,
+                       price,
+                       CASE WHEN qty IS NULL AND seller_name IS NULL AND price IS NOT NULL
+                            THEN SUM(COALESCE(units,1)) * price ELSE total END AS total,
+                       seller_name,listing_ms,day,MAX(ts) AS ts
+                FROM sales_events {where}
+                GROUP BY CASE WHEN qty IS NULL AND seller_name IS NULL
+                         THEN 's:' || item_type || ':' || currency || ':' ||
+                              COALESCE(price,'') || ':' || day || ':' || ts
+                         ELSE 'm:' || id END
+                ORDER BY ts DESC LIMIT ?""",
             params + [limit * 3]).fetchall()
         con.close()
         out = []
