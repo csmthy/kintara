@@ -389,11 +389,18 @@ def init_db() -> None:
         -- marginal avg unit price of just those units (backed out of the day total),
         -- in `currency` (gold or USD/token). This is the truthful sales feed.
         CREATE TABLE IF NOT EXISTS sales_events (
-            id        INTEGER PRIMARY KEY AUTOINCREMENT,
-            item_type TEXT, currency TEXT,
-            units     INTEGER, price REAL,
-            day       TEXT,                  -- game day (UTC) the sale belongs to
-            ts        INTEGER                -- epoch ms we observed it
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_type   TEXT, currency TEXT,
+            units       INTEGER,             -- legacy: count of listings sold (pre-redesign)
+            qty         INTEGER,             -- ACTUAL items sold (stack size of the sold listing)
+            price       REAL,                -- per-unit price
+            total       REAL,                -- headline paid = qty*price (own currency)
+            seller_id   INTEGER,
+            seller_name TEXT,
+            listing_ms  INTEGER,             -- time on market (removed_at - created_at)
+            listing_id  INTEGER,             -- the matched sold listing (NULL = synthetic)
+            day         TEXT,                -- game day (UTC) the sale belongs to
+            ts          INTEGER              -- epoch ms we observed it
         );
         CREATE INDEX IF NOT EXISTS idx_se_ts ON sales_events(ts);
         CREATE INDEX IF NOT EXISTS idx_se_item ON sales_events(item_type, ts);
@@ -481,9 +488,22 @@ def init_db() -> None:
     have = {r["name"] for r in con.execute("PRAGMA table_info(listings)")}
     for col, decl in (("category", "TEXT"), ("per_unit", "REAL"),
                       ("reserved_by", "INTEGER"), ("reserved_until", "INTEGER"),
-                      ("item_durability", "INTEGER")):
+                      ("item_durability", "INTEGER"),
+                      ("sold_claimed", "INTEGER")):   # 1 once attributed to a sales_event
         if col not in have:
             con.execute(f"ALTER TABLE listings ADD COLUMN {col} {decl}")
+    # sales_events redesign: richer per-sale columns. The old `units` was a /stats
+    # COUNT of listings sold (misleading — "5 stone" = 5 listings, each a big stack),
+    # so the legacy rows are dropped and the new accurate detector fills forward.
+    se_cols = {r["name"] for r in con.execute("PRAGMA table_info(sales_events)")}
+    se_new = [("qty", "INTEGER"), ("total", "REAL"), ("seller_id", "INTEGER"),
+              ("seller_name", "TEXT"), ("listing_ms", "INTEGER"), ("listing_id", "INTEGER")]
+    if any(c not in se_cols for c, _ in se_new):
+        for c, decl in se_new:
+            if c not in se_cols:
+                con.execute(f"ALTER TABLE sales_events ADD COLUMN {c} {decl}")
+        con.execute("DELETE FROM sales_events")   # legacy rows had count-not-quantity semantics
+    con.execute("CREATE INDEX IF NOT EXISTS idx_l_sold ON listings(item_type,currency,sold_claimed,removed_at)")
     con.execute(
         "UPDATE listings SET per_unit = unit_price*1.0/quantity "
         "WHERE per_unit IS NULL AND quantity > 0 AND unit_price IS NOT NULL")
@@ -1078,6 +1098,78 @@ def _upsert_stats(con, it, cur, day, day_sales, avg30d, day_avg=None):
     con.commit()
 
 
+SALE_MATCH_WINDOW_MS = 45 * 60 * 1000   # only attribute removals we captured this recently
+SALE_PRICE_TOL = 0.18                    # first-baseline: per_unit must be within this of marginal
+
+
+def _marginal_price(old_sales, old_avg, new_sales, new_avg, delta):
+    """The avg per-unit price of just the newly-sold units, backed out of the running
+    day total (so a busy day's late sales aren't smeared with the morning's average)."""
+    price = new_avg
+    if old_avg is not None and new_avg is not None and delta > 0 and old_sales is not None:
+        m = (new_sales * new_avg - old_sales * old_avg) / delta
+        if m and m > 0:
+            price = m
+    return price
+
+
+def _log_sales(con, it, cur, d, delta, marginal, strict):
+    """Attribute `delta` CONFIRMED sales (the /stats sale-count rise — cancellations don't
+    move it) to recently-captured, unclaimed REMOVED listings of (it,cur), recovering the
+    real stack quantity, seller, price and time-on-market. Candidates are ranked by how
+    close their per-unit is to the marginal sold price, so the genuinely-sold listing wins
+    over a coincidental cancellation. `strict` (the first time we ever see this item-day)
+    requires a price match AND emits no synthetic rows — so pre-tracking history is never
+    replayed as 'now'; we only log sales whose listing we actually watched vanish."""
+    now = int(time.time() * 1000)
+    cutoff_iso = datetime.fromtimestamp(
+        (now - SALE_MATCH_WINDOW_MS) / 1000, timezone.utc).isoformat()
+    cands = con.execute(
+        """SELECT id, quantity, per_unit, price_gold, price_usd, seller_id, seller_name,
+                  created_at, removed_at FROM listings
+           WHERE item_type=? AND currency=? AND active=0 AND sold_claimed IS NULL
+             AND removed_at IS NOT NULL AND removed_at>=?""",
+        (it, cur, cutoff_iso)).fetchall()
+
+    def closeness(r):
+        pu = r["per_unit"]
+        if pu is None or not marginal:
+            return 1e9
+        return abs(pu - marginal) / marginal
+
+    logged = 0
+    for r in sorted(cands, key=closeness):
+        if logged >= delta:
+            break
+        if strict and closeness(r) > SALE_PRICE_TOL:
+            continue
+        pu = r["per_unit"]
+        total = r["price_gold"] if cur == "gold" else r["price_usd"]
+        if total is None and pu is not None and r["quantity"]:
+            total = pu * r["quantity"]
+        c0, c1 = _parse_iso_ms(r["created_at"]), _parse_iso_ms(r["removed_at"])
+        lms = (c1 - c0) if (c0 and c1 and c1 >= c0) else None
+        con.execute(
+            """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
+               seller_id,seller_name,listing_ms,listing_id,day,ts)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (it, cur, 1, r["quantity"], pu if pu is not None else marginal, total,
+             r["seller_id"], r["seller_name"], lms, r["id"], d, now))
+        con.execute("UPDATE listings SET sold_claimed=1 WHERE id=?", (r["id"],))
+        logged += 1
+    # confirmed-but-unmatched: we know a sale happened (count + price) but missed the
+    # listing capture — log a synthetic row (qty unknown) so we don't re-detect it. Never
+    # on the first baseline (that delta may be pre-tracking history we never witnessed).
+    if not strict:
+        for _ in range(delta - logged):
+            con.execute(
+                """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
+                   seller_id,seller_name,listing_ms,listing_id,day,ts)
+                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (it, cur, 1, None, marginal, None, None, None, None, None, d, now))
+    return logged
+
+
 def _archive_samples(con, it, cur, samples):
     """Persist every daily sample. Past days are immutable; the current day's
     partial figure updates in place. Caller commits.
@@ -1097,19 +1189,17 @@ def _archive_samples(con, it, cur, samples):
         prev = con.execute(
             "SELECT sales, avg_price FROM sales_daily WHERE item_type=? AND currency=? AND date=?",
             (it, cur, d)).fetchone()
-        if prev is not None and new_sales is not None and prev["sales"] is not None \
-                and new_sales > prev["sales"]:
-            old_sales, old_avg = prev["sales"], prev["avg_price"]
-            units = new_sales - old_sales
-            # marginal avg price of just the newly-sold units (back out the running total)
-            price = new_avg
-            if old_avg is not None and new_avg is not None and units > 0:
-                m = (new_sales * new_avg - old_sales * old_avg) / units
-                if m and m > 0:
-                    price = m
-            con.execute(
-                "INSERT INTO sales_events(item_type,currency,units,price,day,ts) VALUES(?,?,?,?,?,?)",
-                (it, cur, units, price, d, int(time.time() * 1000)))
+        if new_sales is not None:
+            if prev is None:
+                # first time we've ever seen this item-day: catch sales we can corroborate
+                # with a recently-captured, price-matching removal; don't replay history.
+                if new_sales > 0:
+                    marg = _marginal_price(0, None, new_sales, new_avg, new_sales)
+                    _log_sales(con, it, cur, d, new_sales, marg, strict=True)
+            elif prev["sales"] is not None and new_sales > prev["sales"]:
+                delta = new_sales - prev["sales"]
+                marg = _marginal_price(prev["sales"], prev["avg_price"], new_sales, new_avg, delta)
+                _log_sales(con, it, cur, d, delta, marg, strict=False)
         con.execute(
             """INSERT INTO sales_daily(item_type,currency,date,sales,avg_price)
                VALUES(?,?,?,?,?)
@@ -1140,9 +1230,19 @@ def _next_stats_pair(con, stale_sec, retry_err_sec=300):
     items = [r["item_type"] for r in con.execute("SELECT DISTINCT item_type FROM listings")]
     cached = {(r["item_type"], r["currency"]): r for r in con.execute(
         "SELECT item_type,currency,day_sales,updated_at FROM item_stats")}
+    # items with a freshly-vanished, not-yet-attributed listing are URGENT: a removal is
+    # the leading edge of a possible sale, and we want to confirm it against /stats while
+    # it's still inside the match window — so a 500g cosmetic that just sold surfaces fast
+    # instead of waiting out the slow cold-item cadence.
+    recent_iso = datetime.fromtimestamp(
+        time.time() - SALE_MATCH_WINDOW_MS / 1000, timezone.utc).isoformat()
+    urgent = {r["item_type"] for r in con.execute(
+        "SELECT DISTINCT item_type FROM listings "
+        "WHERE active=0 AND sold_claimed IS NULL AND removed_at>=?", (recent_iso,))}
     now = time.time()
     best, best_key = None, None
     for it in items:
+        is_urgent = it in urgent
         for cur in ("gold", "token"):
             row = cached.get((it, cur))
             never = row is None
@@ -1156,11 +1256,12 @@ def _next_stats_pair(con, stale_sec, retry_err_sec=300):
                     age = 1e18
                 # actively-traded items (lots of live listings) refresh much more often,
                 # so the actual-sales feed stays granular for the things that sell a lot;
-                # quiet items use the slower cadence. Both env-tunable.
+                # quiet items use the slower cadence. Both env-tunable. Urgent items
+                # (recent unclaimed removal) bypass the freshness skip entirely.
                 eff_stale = STATS_STALE_HOT if liq.get(it, 0) >= 15 else stale_sec
-                if age < (eff_stale if got else retry_err_sec):
+                if not is_urgent and age < (eff_stale if got else retry_err_sec):
                     continue  # fresh enough, skip
-            key = (liq.get(it, 0), never, age)   # liquidity first, then unfetched, then age
+            key = (is_urgent, liq.get(it, 0), never, age)  # urgent first, then liquidity, unfetched, age
             if best_key is None or key > best_key:
                 best_key, best = key, (it, cur)
     return best
@@ -1342,13 +1443,13 @@ def rollup_day(con, day):
     # sales for the day
     sales = defaultdict(lambda: {"units": 0, "usd": 0.0, "n": 0})
     for r in con.execute(
-            "SELECT item_type, units, price, currency FROM sales_events WHERE day=?", (day,)):
+            "SELECT item_type, qty, price, total, currency FROM sales_events WHERE day=?", (day,)):
         s = sales[r["item_type"]]
-        s["units"] += r["units"] or 0
-        s["n"] += 1
+        s["units"] += r["qty"] or 0           # real items sold (stack sizes)
+        s["n"] += 1                           # number of completed sales
         # rough USD volume (token sales are USD; gold sales left approximate)
         if r["currency"] == "token":
-            s["usd"] += (r["price"] or 0) * (r["units"] or 0)
+            s["usd"] += r["total"] if r["total"] is not None else (r["price"] or 0) * (r["qty"] or 0)
 
     items = set(series) | set(sales)
     out = []
@@ -2128,7 +2229,7 @@ def time_to_sell(con, item_type, days=21):
     def q(f):
         return spans[min(len(spans) - 1, int(f * len(spans)))]
     sold = con.execute(
-        "SELECT COALESCE(SUM(units),0) u FROM sales_events WHERE item_type=? AND ts>=?",
+        "SELECT COALESCE(SUM(qty),0) u FROM sales_events WHERE item_type=? AND ts>=? AND qty IS NOT NULL",
         (item_type, ts0)).fetchone()["u"] or 0
     sold_ratio = min(1.0, sold / removed_units) if removed_units else None
     return {"median_min": q(0.5), "p25_min": q(0.25), "p75_min": q(0.75),
@@ -2136,9 +2237,10 @@ def time_to_sell(con, item_type, days=21):
 
 
 def recent_fair_usd(con, item_type, days=14):
-    """Volume-weighted average USD sale price over the last `days`, from sales_events.
-    Gold sales are converted at the gold price on their own day. The 'fair value'
-    anchor for the scorecard's cheap/fair/expensive verdict. Returns (usd, units)."""
+    """Quantity-weighted average per-unit USD sale price over the last `days`, from
+    sales_events. Gold sales are converted at the gold price on their own day. The 'fair
+    value' anchor for the scorecard's cheap/fair/expensive verdict. Returns (usd_per_unit,
+    n_sales) — n_sales is the count of completed sales (drives confidence, not the price)."""
     cutoff = (datetime.now(timezone.utc) - _td(days=days)).isoformat()[:10]
     gusd = gold_daily_usd(con)
     gdates = sorted(gusd)
@@ -2146,21 +2248,23 @@ def recent_fair_usd(con, item_type, days=14):
         prior = [x for x in gdates if x <= d]
         return gusd[prior[-1]] if prior else (gusd[gdates[0]] if gdates else None)
     num = den = 0.0
+    n_sales = 0
     for r in con.execute(
-            "SELECT currency, units, price, day FROM sales_events WHERE item_type=? AND day>=?",
+            "SELECT currency, qty, price, day FROM sales_events WHERE item_type=? AND day>=?",
             (item_type, cutoff)):
-        u = r["units"] or 0
-        if not u or r["price"] is None:
+        if r["price"] is None:
             continue
+        w = r["qty"] or 1                      # weight per-unit price by stack size when known
         if r["currency"] == "token":
             usd = r["price"]
         else:
             g = gold_on(r["day"])
             usd = r["price"] * g if g else None
         if usd is not None:
-            num += usd * u
-            den += u
-    return (num / den, den) if den else (None, 0)
+            num += usd * w
+            den += w
+            n_sales += 1
+    return (num / den, n_sales) if den else (None, 0)
 
 
 def liquidity_score(velocity, listed_qty, sellers, last_age_days):
@@ -2646,10 +2750,12 @@ def make_app():
 
     @app.route("/api/sales-feed")
     def sales_feed():
-        """ACTUAL completed sales (from `sales_events`), newest first — the truthful
-        replacement for the removed-listings feed (which also counted cancellations).
-        Filters: currency (gold|token), item_type, q (item or in-game label). Each row:
-        item_type, label, category, units, price, currency, day, ts."""
+        """ACTUAL completed sales (from `sales_events`), newest first. Each row now carries
+        the real stack `qty`, `total` paid, per-unit `price`, the `seller`, and `listing_ms`
+        (time the listing sat before it sold) — recovered by matching each confirmed sale to
+        the listing we watched vanish. `qty`/`total`/`seller` are null for the few sales we
+        confirmed via /stats but didn't capture the listing for. Filters: currency, item_type,
+        category, q."""
         item = request.args.get("item_type", "all")
         currency = request.args.get("currency", "all")
         cat = request.args.get("category", "all")
@@ -2663,8 +2769,9 @@ def make_app():
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
         con = connect(readonly=True)
         rows = con.execute(
-            f"SELECT item_type,currency,units,price,day,ts FROM sales_events {where} "
-            f"ORDER BY ts DESC LIMIT ?", params + [limit * 3]).fetchall()
+            f"""SELECT item_type,currency,units,qty,price,total,seller_name,listing_ms,day,ts
+                FROM sales_events {where} ORDER BY ts DESC LIMIT ?""",
+            params + [limit * 3]).fetchall()
         con.close()
         out = []
         for r in rows:
@@ -2676,7 +2783,9 @@ def make_app():
             if q and q not in it.lower() and q not in lbl.lower():
                 continue
             out.append({"item_type": it, "label": lbl, "category": c,
-                        "units": r["units"], "price": r["price"],
+                        "units": r["units"], "qty": r["qty"], "price": r["price"],
+                        "total": r["total"], "seller": r["seller_name"],
+                        "listing_ms": r["listing_ms"],
                         "currency": r["currency"], "day": r["day"], "ts": r["ts"]})
             if len(out) >= limit:
                 break
@@ -3092,8 +3201,8 @@ def make_app():
             velocity = (vrow["u"] / 7.0) if vrow else 0
             volatility = vrow["v"] if vrow else None
             last = con.execute(
-                """SELECT units, price, currency, day, ts FROM sales_events
-                   WHERE item_type=? ORDER BY ts DESC LIMIT 1""", (item,)).fetchone()
+                """SELECT qty, price, total, currency, seller_name, listing_ms, day, ts
+                   FROM sales_events WHERE item_type=? ORDER BY ts DESC LIMIT 1""", (item,)).fetchone()
             last_age = None
             if last:
                 last_age = (time.time() * 1000 - last["ts"]) / 86400000.0
@@ -3992,10 +4101,10 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
 </div></div>
 <main>
   <div class="tabs">
-    <div class="tab on" data-t="arb">Arbitrage</div>
+    <div class="tab on" data-t="hist">Index</div>
+    <div class="tab" data-t="arb">Arbitrage</div>
     <div class="tab" data-t="live">Live listings</div>
     <div class="tab" data-t="removed">Sales feed</div>
-    <div class="tab" data-t="hist">Index</div>
     <div class="tab" data-t="gold">Gold price</div>
     <div class="tab" data-t="merchant">Merchant</div>
     <div class="tab" data-t="world">Live World</div>
@@ -4007,13 +4116,23 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
 <script>
 const $=s=>document.querySelector(s);
 const lbl=it=>(state.labels&&state.labels[it])||it;   // itemType -> in-game name
-let TAB="arb", timer=null;
+let TAB="hist", timer=null;
 const state={dir:"gold_to_kins", fee:0, goldItem:null, items:[], cats:[], labels:{},
   mpCur:"kins", mpOpen:null, mpRowMap:{}, mpCatOff:new Set(), mpCatInit:false,
   catOff:new Set(), profitableOnly:false, soldOnly:false, search:"", minQty:0, viewSet:[],
   histItem:null, histCur:"token", histCat:"all", histSort:"most", histOpen:null, histWindow:1,
   goldMode:"gold_usd", goldRange:"1D", srvOpen:false, mintQty:1,
   liveShard:1, liveSel:null, liveSearch:"", liveSearchBusy:false, liveSearchStatus:"", propSel:null, servers:[]};
+
+/* Commodities (materials/potions/food) trade in bulk — a single unit is a fraction of a
+   cent and nobody sells one (the Solana fee dwarfs it), so we quote these per 1,000 units.
+   Everything else (cosmetics/mounts/pets/tools/…) is quoted per item. */
+const PER1K=new Set(['material','potion','food']);
+function qbasis(cat){ return PER1K.has(cat)?1000:1; }
+function qbasisSuffix(cat){ return PER1K.has(cat)?'/1k':''; }
+/* time a listing sat before it sold, human form */
+function durStr(ms){ if(ms==null) return null; const m=ms/60000;
+  return m<60?Math.round(m)+'m':m<1440?(+(m/60).toFixed(1))+'h':(+(m/1440).toFixed(1))+'d'; }
 
 /* force-refresh cached sales for a set of items (the side currently shown) */
 async function refreshVisible(items){
@@ -4662,22 +4781,30 @@ async function loadLive(){
         <td class="num mut">${r.per_unit==null?"":(r.currency==="token"?fmtU(r.per_unit):fmtG(r.per_unit))}</td>
         <td class="num mut">${relAbs(r.created_at)}${freshness(r.created_at)}</td></tr>`).join("")+`</tbody></table>`;
 }
-/* price of an actual sale, in its own currency */
-function salePrice(r){ if(r.price==null) return "—";
-  return r.currency==='gold' ? (+Number(r.price).toPrecision(3))+'g'
-    : '$'+Number(r.price).toFixed(r.price>=1?2:4); }
-async function loadRemoved(){   // "Sales feed" tab — now ACTUAL completed sales
+/* total PAID in a sale (what changed hands), in its own currency. Falls back to a
+   per-unit estimate for the few sales we confirmed but couldn't match to a listing. */
+function saleAmt(r){
+  const g=r.currency==='gold';
+  if(r.total!=null) return g?(+Number(r.total).toPrecision(4))+'g':'$'+Number(r.total).toFixed(r.total>=1?2:4);
+  if(r.price!=null) return (g?(+Number(r.price).toPrecision(3))+'g':'$'+Number(r.price).toFixed(r.price>=1?2:4))+'/ea';
+  return "—";
+}
+function salePrice(r){ return saleAmt(r); }   // back-compat alias
+async function loadRemoved(){   // "Sales feed" tab — ACTUAL completed sales (rich rows)
   if(!$("#ltable")){ await loadItems();
     $("#view").innerHTML=listingControls(); bindListingControls(loadRemoved); }
   const rows=await (await fetch("/api/sales-feed?"+lqs())).json();
+  const per1k=r=> PER1K.has(r.category)&&r.price!=null
+    ? `<span class="mut" style="font:11px var(--mono)">${r.currency==='gold'?(+ (r.price*1000).toPrecision(3))+'g':'$'+(+(r.price*1000).toPrecision(3))}/1k</span>` : '';
   $("#ltable").innerHTML = !rows.length
-    ? `<div class="empty">No sales recorded yet. This feed logs <b>actual completed sales</b> — detected from kintara's own sale counter, so cancel-and-relist undercutting is ignored — and fills in going forward (the old removed-listings data was dropped).</div>`
-    : `<table><thead><tr><th>item</th><th class="num">units sold</th><th class="num">price</th>
-        <th>paid in</th><th class="num">when</th></tr></thead><tbody>`+
+    ? `<div class="empty">No sales recorded yet. This feed logs <b>actual completed sales</b> — each matched to the listing that vanished, so you see the real stack size, total paid, seller and how long it sat. Cancellations are excluded. Fills in going forward.</div>`
+    : `<table><thead><tr><th>item</th><th class="num">qty sold</th><th class="num">total paid</th>
+        <th>seller</th><th class="num">time listed</th><th class="num">when</th></tr></thead><tbody>`+
       rows.map(r=>`<tr><td title="${r.item_type}">${lbl(r.item_type)}</td>
-        <td class="num"><b>${(r.units||0).toLocaleString()}</b></td>
-        <td class="num ${r.currency==='gold'?'gold':'usd'}">${salePrice(r)}</td>
-        <td class="mut">${r.currency==='gold'?'gold':'$KINS / USD'}</td>
+        <td class="num">${r.qty!=null?`<b>${r.qty.toLocaleString()}</b>`:'<span class="mut" data-tip="confirmed via the sale counter; listing not captured">—</span>'}</td>
+        <td class="num ${r.currency==='gold'?'gold':'usd'}">${saleAmt(r)} ${per1k(r)}</td>
+        <td class="mut">${r.seller?esc(r.seller):'<span data-tip="listing not captured">~est</span>'}</td>
+        <td class="num mut">${r.listing_ms!=null?durStr(r.listing_ms):'—'}</td>
         <td class="num mut">${relAbs(r.ts)}</td></tr>`).join("")+`</tbody></table>`;
 }
 
@@ -4786,10 +4913,10 @@ async function openHist(it){
   exp.onclick=ev=>ev.stopPropagation();   // clicks inside don't collapse the row
   drawSalesChart(it, cur);
   loadScorecard(it);
-  loadFloorHistory(it);
+  loadFloorHistory(it, row?row.category:null);
   if(isMat) loadLiquidity(it);
   if(showMeta) loadItemMeta(it);
-  loadItemListings(it);
+  loadItemListings(it, row?row.category:null);
   loadRecentSales(it);
 }
 /* ---- Item Scorecard: the stock-page header for the expanded item ---- */
@@ -4804,9 +4931,12 @@ async function loadScorecard(it){
 function scorecardHTML(d){
   if(!d||d.ok===false) return "";
   const f=d.floor||{};
-  const gold=f.gold!=null?(f.gold>=1?(+f.gold.toFixed(2)):(+f.gold.toPrecision(3)))+"g":"—";
-  const usd=f.usd!=null?"$"+(f.usd>=1?f.usd.toFixed(2):(+f.usd.toPrecision(3))):"—";
-  const kins=f.kins!=null?(f.kins>=1?Math.round(f.kins).toLocaleString():(+f.kins.toFixed(2)))+" $KINS":"—";
+  const b=qbasis(d.category), sfx=qbasisSuffix(d.category);
+  const G=v=>v==null?null:v*b, sig=v=>v>=1?(+v.toFixed(2)):(+v.toPrecision(3));
+  const gv=G(f.gold), uv=G(f.usd), kv=G(f.kins);
+  const gold=gv!=null?sig(gv)+"g"+sfx:"—";
+  const usd=uv!=null?"$"+sig(uv)+sfx:"—";
+  const kins=kv!=null?((kv>=1?Math.round(kv).toLocaleString():(+kv.toFixed(2)))+" $KINS"+sfx):"—";
   const chg=v=> v==null?'<span class="sc-mut">—</span>':`<span class="${v>0?'up':v<0?'down':'sc-mut'}">${v>0?'+':''}${v}%</span>`;
   // cheap/fair/expensive verdict pill
   const vClr={cheap:'#34d39a',fair:'#e8b54a',expensive:'#f06a6a'}[d.verdict]||'#7f93ad';
@@ -4840,44 +4970,77 @@ function scorecardHTML(d){
 }
 /* ---- Floor price history chart (gold / USD / $KINS toggle + ranges) ---- */
 const floorCache={};
-async function loadFloorHistory(it){
+async function loadFloorHistory(it,cat){
   const w=$("#gwfloor"); if(!w) return;
+  if(cat!=null) w.__cat=cat; cat=w.__cat;
   const unit=state.floorUnit||"usd", rng=state.floorRange||"7D";
   const key=it+"|"+rng;
   let d=floorCache[key];
   if(!d){ try{ d=await (await fetch(`/api/floor-history?item_type=${encodeURIComponent(it)}&range=${rng}`)).json(); floorCache[key]=d; }
     catch(e){ w.innerHTML=""; return; } }
-  if($("#gwfloor")) $("#gwfloor").innerHTML=floorChartHTML(d,unit,it);
-  document.querySelectorAll("#gwfloor [data-fu]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.floorUnit=b.dataset.fu;loadFloorHistory(it);});
-  document.querySelectorAll("#gwfloor [data-fr]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.floorRange=b.dataset.fr;loadFloorHistory(it);});
+  if($("#gwfloor")) $("#gwfloor").innerHTML=floorChartHTML(d,unit,it,cat);
+  document.querySelectorAll("#gwfloor [data-fu]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.floorUnit=b.dataset.fu;loadFloorHistory(it,cat);});
+  document.querySelectorAll("#gwfloor [data-fr]").forEach(b=>b.onclick=ev=>{ev.stopPropagation();state.floorRange=b.dataset.fr;loadFloorHistory(it,cat);});
+  attachFloorHover();
 }
-function floorChartHTML(d,unit,it){
+function floorChartHTML(d,unit,it,cat){
+  const b=qbasis(cat), sfx=qbasisSuffix(cat);
   const seg=`<div class="gw-cseg sm">
     ${['gold','usd','kins'].map(u=>`<button data-fu="${u}" class="${u===unit?'on':''}">${u==='usd'?'USD':u==='gold'?'Gold':'$KINS'}</button>`).join('')}
     <span style="width:10px"></span>
     ${['24H','3D','7D','30D','ALL'].map(r=>`<button data-fr="${r}" class="${r===(state.floorRange||'7D')?'on':''}">${r}</button>`).join('')}</div>`;
-  const pts=((d&&d.series)||[]).map(p=>[p.t,p[unit]]).filter(p=>p[1]!=null);
-  const head=`<div class="gw-meta-h">Floor price history <span style="color:#7f93ad;font-weight:400">— the cheapest listing over time (${unit==='usd'?'USD':unit==='gold'?'gold':'$KINS'})</span></div>`;
-  if(pts.length<2) return `${head}${seg}<div class="gw-empty">Not enough floor history yet — this builds as snapshots accumulate.</div>`;
-  const W=1100,H=180,PL=58,PR=14,PT=12,PB=22,plotW=W-PL-PR,plotH=H-PT-PB;
-  const xs=pts.map(p=>p[0]),ys=pts.map(p=>p[1]);
+  const series=((d&&d.series)||[]).filter(p=>p[unit]!=null);
+  const unitName=unit==='usd'?'USD':unit==='gold'?'gold':'$KINS';
+  const head=`<div class="gw-meta-h">Floor price history <span style="color:#7f93ad;font-weight:400">— the cheapest listing over time (${unitName}${b>1?' per 1,000':''})</span></div>`;
+  if(series.length<2){ window.__floor=null; return `${head}${seg}<div class="gw-empty">Not enough floor history yet — this builds as snapshots accumulate.</div>`; }
+  const W=1100,H=190,PL=64,PR=14,PT=12,PB=22,plotW=W-PL-PR,plotH=H-PT-PB;
+  const xs=series.map(p=>p.t),ys=series.map(p=>p[unit]);
   const x0=Math.min(...xs),x1=Math.max(...xs),y0=Math.min(...ys),y1=Math.max(...ys);
   const X=t=>PL+(x1===x0?0:(t-x0)/(x1-x0))*plotW;
   const pad=(y1-y0)*0.12||y0*0.1||1, lo=Math.max(0,y0-pad), hi=y1+pad;
   const Y=v=>PT+plotH-(hi===lo?0.5:(v-lo)/(hi-lo))*plotH;
-  const fmtV=v=> unit==='usd'?'$'+(v>=1?v.toFixed(2):(+v.toPrecision(3))) : unit==='gold'?((v>=1?(+v.toFixed(2)):(+v.toPrecision(3)))+'g') : (v>=1?Math.round(v).toLocaleString():(+v.toFixed(2)))+'';
+  const sig=v=>v>=1?(+v.toFixed(2)):(+v.toPrecision(3));
+  const fmtV=v=>{ const x=v*b; return unit==='usd'?'$'+sig(x):unit==='gold'?sig(x)+'g':(x>=1?Math.round(x).toLocaleString():(+x.toFixed(2))); };
   let grid='';[0,.5,1].forEach(f=>{const v=lo+(hi-lo)*(1-f),yy=PT+plotH*f;
     grid+=`<line x1="${PL}" y1="${yy}" x2="${W-PR}" y2="${yy}" stroke="rgba(120,140,165,.12)"/>`+
       `<text x="${PL-7}" y="${yy+3}" text-anchor="end" fill="#6f86a6" font-size="10" font-family="monospace">${fmtV(v)}</text>`;});
-  const line=pts.map((p,i)=>`${i?'L':'M'}${X(p[0]).toFixed(1)} ${Y(p[1]).toFixed(1)}`).join(' ');
-  const area=`M${X(pts[0][0]).toFixed(1)} ${(PT+plotH).toFixed(1)} `+pts.map(p=>`L${X(p[0]).toFixed(1)} ${Y(p[1]).toFixed(1)}`).join(' ')+` L${X(pts[pts.length-1][0]).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
+  const line=series.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)} ${Y(p[unit]).toFixed(1)}`).join(' ');
+  const area=`M${X(series[0].t).toFixed(1)} ${(PT+plotH).toFixed(1)} `+series.map(p=>`L${X(p.t).toFixed(1)} ${Y(p[unit]).toFixed(1)}`).join(' ')+` L${X(series[series.length-1].t).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
   const dt=t=>new Date(t).toLocaleDateString(undefined,{month:'short',day:'numeric',timeZone:'UTC'});
   const clr=unit==='gold'?'#e8b54a':unit==='kins'?'#7aa2ff':'#34d39a';
-  return `${head}${seg}<svg viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
+  // stash render context for the hover handler (pixel coords + the all-unit series point)
+  window.__floor={W,H,PL,PR,PT,plotTop:PT,plotBot:PT+plotH,b,unit,clr,
+    pix:series.map(p=>({x:X(p.t),y:Y(p[unit]),t:p.t,usd:p.usd,gold:p.gold,kins:p.kins}))};
+  return `${head}${seg}<svg id="floorsvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
     <defs><linearGradient id="flg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="${clr}" stop-opacity=".22"/><stop offset="1" stop-color="${clr}" stop-opacity="0"/></linearGradient></defs>
     ${grid}<path d="${area}" fill="url(#flg)"/><path d="${line}" fill="none" stroke="${clr}" stroke-width="1.8"/>
+    <g id="floorcross"></g>
     <text x="${PL}" y="${H-7}" fill="#6f86a6" font-size="10" font-family="monospace">${dt(x0)}</text>
     <text x="${W-PR}" y="${H-7}" text-anchor="end" fill="#6f86a6" font-size="10" font-family="monospace">${dt(x1)}</text></svg>`;
+}
+/* floor-chart hover: crosshair + a card showing the date and the floor in all 3 units
+   (same feel as the gold-price chart). */
+function attachFloorHover(){
+  const svg=$("#floorsvg"), fx=window.__floor; if(!svg||!fx) return;
+  const cross=$("#floorcross"), card=gcardNode();
+  const fmt=(v,u,b)=>{ if(v==null)return '—'; const x=v*b, sig=z=>z>=1?(+z.toFixed(2)):(+z.toPrecision(3));
+    return u==='usd'?'$'+sig(x):u==='gold'?sig(x)+'g':(x>=1?Math.round(x).toLocaleString():(+x.toFixed(2)))+' $KINS'; };
+  svg.onmousemove=ev=>{
+    const r=svg.getBoundingClientRect(), vx=(ev.clientX-r.left)/r.width*fx.W;
+    let best=fx.pix[0],bd=1e18; for(const p of fx.pix){ const dd=Math.abs(p.x-vx); if(dd<bd){bd=dd;best=p;} }
+    const sfx=fx.b>1?' /1k':'';
+    cross.innerHTML=`<line x1="${best.x.toFixed(1)}" y1="${fx.plotTop}" x2="${best.x.toFixed(1)}" y2="${fx.plotBot}" stroke="rgba(180,200,220,.35)" stroke-dasharray="5 4"/>`+
+      `<circle cx="${best.x.toFixed(1)}" cy="${best.y.toFixed(1)}" r="4" fill="${fx.clr}" stroke="#0c0f13" stroke-width="2"/>`;
+    card.innerHTML=`<div class="gd">${new Date(best.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZone:'UTC'})} UTC</div>`+
+      `<div class="gv" style="color:${fx.clr}">Floor : ${fmt(best[fx.unit],fx.unit,fx.b)}${sfx}</div>`+
+      `<div class="gd">${fmt(best.gold,'gold',fx.b)} · ${fmt(best.usd,'usd',fx.b)} · ${fmt(best.kins,'kins',fx.b)}${sfx}</div>`;
+    card.style.display="block";
+    const bb=card.getBoundingClientRect(); let L=ev.clientX+16,T=ev.clientY+16;
+    if(L+bb.width>innerWidth-8) L=ev.clientX-bb.width-16;
+    if(T+bb.height>innerHeight-8) T=innerHeight-bb.height-8;
+    card.style.left=L+"px"; card.style.top=T+"px";
+  };
+  svg.onmouseleave=()=>{ if(cross)cross.innerHTML=""; if(gcardEl)gcardEl.style.display="none"; };
 }
 /* per-item recent ACTUAL sales (from /api/sales-feed), for the Index item expand */
 async function loadRecentSales(it){
@@ -4889,24 +5052,28 @@ async function loadRecentSales(it){
   const when=ms=>{ const s=(Date.now()-ms)/1000;
     if(s<60)return Math.floor(s)+'s ago'; if(s<3600)return Math.floor(s/60)+'m ago';
     if(s<86400)return Math.floor(s/3600)+'h ago'; return Math.floor(s/86400)+'d ago'; };
-  const body=rows.map(r=>`<div class="ll-row">
-      <span class="ll-p">${r.units.toLocaleString()}×</span>
-      <span class="${r.currency==='gold'?'gold':'usd'}" style="font-weight:700">${salePrice(r)}</span>
-      <span class="ll-x">${r.currency==='gold'?'gold':'$KINS/USD'}</span>
-      <span class="ll-sel" data-tip="${new Date(r.ts).toLocaleString()}">${when(r.ts)}</span></div>`).join("");
-  w.innerHTML=`<div class="gw-meta-h">Recent sales <span style="color:#7f93ad;font-weight:400">— actual completed sales (newest first), cancellations excluded</span></div>${body}`;
+  const body=rows.map(r=>{
+    const qty=r.qty!=null?`<span class="ll-q">${r.qty.toLocaleString()}×</span>`:'';
+    const dur=r.listing_ms!=null?`<span class="ll-x" data-tip="time the listing sat before it sold">sat ${durStr(r.listing_ms)}</span>`:'';
+    const who=r.seller?`<span class="ll-x">by ${esc(r.seller)}</span>`:`<span class="ll-x" data-tip="we confirmed the sale via the sale counter but didn't capture the listing">~est</span>`;
+    return `<div class="ll-row">${qty}
+      <span class="${r.currency==='gold'?'gold':'usd'}" style="font-weight:700">${saleAmt(r)}</span>
+      ${dur}${who}
+      <span class="ll-sel" data-tip="${new Date(r.ts).toLocaleString()}">${when(r.ts)}</span></div>`;}).join("");
+  w.innerHTML=`<div class="gw-meta-h">Recent sales <span style="color:#7f93ad;font-weight:400">— actual completed sales (newest first): how many sold, total paid, who sold it, how long it sat</span></div>${body}`;
 }
 const listCache={};
-async function loadItemListings(it){
+async function loadItemListings(it,cat){
+  const w0=$("#gwlist"); if(w0&&cat!=null) w0.__cat=cat; cat=w0?w0.__cat:cat;
   let d=listCache[it];
   if(!d){ try{ d=await (await fetch("/api/item-listings?item_type="+encodeURIComponent(it))).json(); listCache[it]=d; }
     catch(e){ const w=$("#gwlist"); if(w)w.innerHTML=`<div class="gw-empty">Couldn't load listings.</div>`; return; } }
-  const w=$("#gwlist"); if(w) w.innerHTML=itemListingsHTML(d);
+  const w=$("#gwlist"); if(w) w.innerHTML=itemListingsHTML(d,cat);
 }
-function itemListingsHTML(d){
+function itemListingsHTML(d,cat){
   if(!d||d.ok===false) return `<div class="gw-empty">No live listings.</div>`;
-  const rate=d.gold_rate, kp=d.kins_price;
-  const sig=v=> v>=1?(+v.toFixed(2)):(+v.toPrecision(3));   // keep small per-unit prices readable
+  const rate=d.gold_rate, kp=d.kins_price, b=qbasis(cat), per1k=b>1;
+  const sig=v=> v>=1?(+v.toFixed(2)):(+v.toPrecision(3));
   const sel=s=>s?`<span class="ll-sel">${esc(s)}</span>`:'';
   // price-memory badges (computed server-side vs snapshot/sale history)
   const BADGE={'cheapest-ever':['cheapest ever','#34d39a','lowest this item has ever been seen'],
@@ -4915,19 +5082,22 @@ function itemListingsHTML(d){
     'above-fair':['above fair','#e8b54a','priced over recent fair value'],
     'likely-overpriced':['overpriced','#f06a6a','far above fair value — likely bait']};
   const tags=r=>(r.badges||[]).map(b=>{const m=BADGE[b];return m?`<span class="ll-badge" style="color:${m[1]};border-color:${m[1]}55;background:${m[1]}14" data-tip="${m[2]}">${m[0]}</span>`:'';}).join("");
-  // actual listing price (total), with stack + per-unit only when it's a stack
+  // Headline = what you actually PAY (the listing total) + how many you GET. For bulk
+  // commodities we add a readable per-1,000 figure; per-single-unit is intentionally hidden.
   const goldRows=(d.gold||[]).map(r=>{
     const tot=r.price!=null?r.price:r.per_unit*(r.qty||1);
-    const stack=r.qty>1?`<span class="ll-q">×${r.qty.toLocaleString()}</span><span class="ll-x">${sig(r.per_unit)}g/ea</span>`:'';
-    const usd=rate?`<span class="ll-x">≈$${(tot*rate).toFixed(2)}</span>`:'';
-    return `<div class="ll-row"><span class="ll-p">${sig(tot)}g</span>${stack}${usd}${tags(r)}${sel(r.seller)}</div>`;}).join("");
+    const stack=r.qty>1?`<span class="ll-q">×${r.qty.toLocaleString()}</span>`:'';
+    const unit=per1k?`<span class="ll-x">${sig(r.per_unit*1000)}g/1k</span>`:'';
+    const usd=rate?`<span class="ll-x">≈$${sig(tot*rate)}</span>`:'';
+    return `<div class="ll-row"><span class="ll-p">${sig(tot)}g</span>${stack}${unit}${usd}${tags(r)}${sel(r.seller)}</div>`;}).join("");
   const tokRows=(d.token||[]).map(r=>{
     const tot=r.price!=null?r.price:r.per_unit*(r.qty||1);
-    const stack=r.qty>1?`<span class="ll-q">×${r.qty.toLocaleString()}</span><span class="ll-x">$${sig(r.per_unit)}/ea</span>`:'';
+    const stack=r.qty>1?`<span class="ll-q">×${r.qty.toLocaleString()}</span>`:'';
+    const unit=per1k?`<span class="ll-x">$${sig(r.per_unit*1000)}/1k</span>`:'';
     const kins=kp?`<span class="ll-x">${(tot/kp>=1?Math.round(tot/kp).toLocaleString():(+(tot/kp).toFixed(2)))} $KINS</span>`:'';
-    return `<div class="ll-row"><span class="ll-p">$${sig(tot)}</span>${stack}${kins}${tags(r)}${sel(r.seller)}</div>`;}).join("");
+    return `<div class="ll-row"><span class="ll-p">$${sig(tot)}</span>${stack}${unit}${kins}${tags(r)}${sel(r.seller)}</div>`;}).join("");
   const col=(title,rows,empty)=>`<div class="ll-col"><div class="ll-h">${title}</div>${rows||`<div class="ll-none">${empty}</div>`}</div>`;
-  return `<div class="gw-meta-h">Cheapest live listings <span style="color:#7f93ad;font-weight:400">— actual price, sorted by cheapest per-unit, up to 5 each</span></div>
+  return `<div class="gw-meta-h">Cheapest live listings <span style="color:#7f93ad;font-weight:400">— what you pay &amp; how many you get${per1k?', plus per-1,000':''}, cheapest first, up to 5 each</span></div>
     <div class="ll-cols">
       ${col("In gold",goldRows,"none listed in gold")}
       ${col("In $KINS",tokRows,"none listed in $KINS")}

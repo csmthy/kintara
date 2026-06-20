@@ -179,13 +179,22 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
 - **`item_stats`** — last-day summary per `(item_type, currency)`: `day`, `day_sales`,
   `day_avg`, `avg30d`, `updated_at`. Drives the arbitrage "sold today" column.
 - **`sales_daily`** — the daily archive (see above).
-- **`sales_events`** — **ACTUAL completed sales** (the truthful sales feed). Detected by the stats
-  loop in `_archive_samples()`: when a day we've already baselined shows MORE completed sales than
-  before, that increment is real (cancel-and-relist doesn't move kintara's sale counter), so we log
-  `(item_type, currency, units, price, day, ts)` — `units` = how many sold since we last looked,
-  `price` = the **marginal** avg unit price of just those units, backed out of the running day total
-  `(new_sales·new_avg − old_sales·old_avg)/units`. Only logged on an UPDATE (a day already seen), so
-  pre-existing sales aren't replayed as "now". Indexed on `ts` and `(item_type, ts)`.
+- **`sales_events`** — **ACTUAL completed sales**, one row per sale, now with the real stack size,
+  seller, total paid and time-on-market. Detection (`_archive_samples` → `_log_sales`): kintara's
+  `/stats` completed-sale **count** is the authoritative trigger (cancel-and-relist doesn't move it),
+  but it only gives a count + marginal price — *not* the quantity. So each confirmed sale is **matched
+  to the listing we watched vanish** (recently `removed_at`, `sold_claimed IS NULL`, ranked by how
+  close its `per_unit` is to the marginal sold price, so the genuinely-sold listing wins over a
+  coincident cancellation) to recover `qty` (stack size), `total`, `seller_id/name`, `listing_ms`
+  (time on market = `removed_at − created_at`) and `listing_id`. The matched listing is flagged
+  `listings.sold_claimed=1` so it's never double-counted. The first time we ever see an item-day we
+  only attribute **price-matching** recent removals and emit **no** synthetic rows (so pre-tracking
+  history is never replayed as "now"); confirmed-but-unmatched sales (we missed the listing) get one
+  synthetic row (`qty`/`seller` null) so we stop re-detecting. `units` is a legacy column (now always
+  1/row). Items with a fresh unclaimed removal are **prioritised** in the stats queue
+  (`_next_stats_pair`) so high-value sales (e.g. a 500g aura) surface within a poll instead of waiting
+  out the cold-item cadence. Indexed on `ts` and `(item_type, ts)`; legacy count-semantics rows were
+  dropped on migration and the feed fills forward.
 - **`gold_price`** — our own measured gold-USD series: `ts` (epoch ms, PK), `usd` (USD per
   1 gold), `listings` (how many listings the avg used, ≤3). One row per ~3 min from
   `gold_price_loop`.
@@ -257,9 +266,11 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   in-game label. (`/api/removed` is retained for internal/debug use; the **Sales feed** tab no longer
   uses it — see below.)
 - `GET /api/sales-feed?limit=&item_type=&currency=&category=&q=` — **actual completed sales** from
-  `sales_events`, newest first (the truthful sales feed; cancellations excluded). Each row:
-  `{item_type, label, category, units, price, currency, day, ts}`. Drives the **Sales feed** tab and
-  the per-item **Recent sales** panel in the Index expand.
+  `sales_events`, newest first (cancellations excluded). Each row now carries the **real stack `qty`,
+  `total` paid, per-unit `price`, `seller`, and `listing_ms`** (time the listing sat before it sold) —
+  recovered by matching each sale to the listing that vanished. `qty`/`total`/`seller` are null for the
+  few sales confirmed via `/stats` but whose listing we didn't capture. Drives the **Sales feed** tab
+  and the per-item **Recent sales** panel in the Index expand.
 - `GET /icon/<item_type>` — real item art, lazily downloaded + disk-cached; 404 → UI
   falls back to a category emoji.
 - `GET /api/sales-history?item_type=&currency=gold|token|kins|goldstd` — daily price series from the
@@ -348,6 +359,10 @@ body, gold pill tabs, rounded panels). Public branding is **KinScan** with a Kin
 gold-icon brand mark, browser title/description metadata, favicon/apple icon, and web
 manifest for a more polished hosted-site shell.
 
+**The Index is the first tab and the default landing tab** (`TAB="hist"`) — it's the
+flagship intelligence product (per-item scorecards), so it opens first. The tabs below are
+numbered by topic, not bar order.
+
 1. **Arbitrage** (landing) — per-item table: `items/$` (green; shows `$X.XX` per item for
    items >$1 each), `per gold` (gold), **kins/gold** ($KINS to assemble 1 gold's worth, green when
    below the live market KINS/gold), margin, profit, `sold KINS/gold · <day>`. The rate line shows
@@ -375,11 +390,11 @@ manifest for a more polished hosted-site shell.
      (`mpRenderExpand()`); auto-refresh freezes while a dropdown is open. Because the flicker-free morph
      reuses DOM nodes, the render **clears stale per-cell mouse handlers** (`td.onmouse*`) so an arbitrage
      deal/sold hover card can't bleed into the Collectables table.
-2. **Live listings** — current active listings, with item art. **Sales feed** — now shows **actual
-   completed sales** (`/api/sales-feed`, from `sales_events`): item · units sold · marginal price · paid-in
-   currency · when. This replaced the old removed-listings feed, which counted cancel-and-relist
-   undercutting as if it were sales; the misleading old data was dropped (`sales_events` starts empty and
-   fills going forward).
+2. **Live listings** — current active listings, with item art. **Sales feed** — **actual completed
+   sales** (`/api/sales-feed`): item · **qty sold** (real stack size) · **total paid** (+ per-1,000 for
+   bulk commodities) · **seller** · **time listed** (how long it sat before selling) · when. Each sale is
+   matched to the listing that vanished, so "13,251 stone for 1g" reads correctly instead of the old
+   misleading "5 units". Cancellations excluded.
 3. **Index** (was "Sales history") — game "index" layout: category **sidebar**, **Today / 7d / 30d**
    window selector, **Most/Least sales** sort, columns ITEM · SALES · AVG GOLD · AVG USD ·
    $KINS. Click a row → expands to a full **Item Scorecard** (stock-page) view:
@@ -388,8 +403,11 @@ manifest for a more polished hosted-site shell.
      stat strip — **liquidity** (0–100 exit score, deep/ok/thin), **sells/day**, **time to sell**
      (median, hover for sample size + sold-vs-cancelled ratio), **listed supply**, **sellers**, **volatility**.
    - **Floor price chart** (`/api/floor-history`, `loadFloorHistory`/`floorChartHTML`): the cheapest
-     listing over time, with a **gold / USD / $KINS** unit toggle and **24H/3D/7D/30D/ALL** ranges
-     (inline SVG area chart; fills in as snapshots accumulate).
+     listing over time — like the Gold-price chart but per item — with a **gold / USD / $KINS** unit
+     toggle, **24H/3D/7D/30D/ALL** ranges, and a **crosshair hover card** (`attachFloorHover`) showing
+     the point's date and floor in all three units. Fills in as snapshots accumulate. For
+     **material/potion/food** it (and the scorecard floor) quotes **per 1,000 units** — a single unit is
+     a fraction of a cent and nobody trades one (the Solana fee dwarfs it).
    - Then the existing **line chart** with a 4-way currency toggle
    **USD ($KINS) ⇆ vs $KINS ⇆ Gold ⇆ Gold Standard**, hover card, + a cumulative stats panel.
    **Gold Standard** (`currency=goldstd`) values *every* sale in gold — gold sales as-is, USD/KINS sales
@@ -414,13 +432,15 @@ manifest for a more polished hosted-site shell.
    - **Every** item expand also shows a **Cheapest live listings** panel (`/api/item-listings`): up to the
      **5 cheapest buyable (non-reserved) listings per currency** — **gold** and **$KINS** side by side. Shows
      the **actual listing price** (the stack total, e.g. stone *1g ×13,251*, not the 0g per-unit), **sorted by
-     cheapest per-unit**, with stack size, per-unit (for stacks), seller, and the cross-converted value
-     (gold→USD at the rate, USD→$KINS at spot). Each listing is stamped with **price-memory badges**
+     cheapest per-unit**, showing **what you pay (the listing total) and how many you get** — not the
+     tiny per-unit number — with stack size, seller, cross-converted value (gold→USD, USD→$KINS), and a
+     **per-1,000** figure for bulk commodities. Each listing is stamped with **price-memory badges**
      (`cheapest ever`/`7d low` vs the floor history, `below sale avg`/`above fair`/`overpriced` vs recent
      fair value) so Live Listings beats the in-game market. Many items have <5; that's fine.
    - **Every** item expand also shows a **Recent sales** panel (`loadRecentSales()`, `/api/sales-feed`):
-     the item's latest **actual completed sales** (units × marginal price, currency, relative time),
-     newest first — cancellations excluded. Empty until real sales are observed (it logs going forward).
+     the item's latest **actual completed sales** — **qty × total paid**, who sold it, **how long it sat**
+     before selling, relative time — newest first, cancellations excluded. Empty until real sales are
+     observed (it logs going forward).
    - **For `material` items**, the expand still shows the buy-side **liquidity depth chart**
      (`/api/liquidity`): cumulative units available by USD price per 1000, in $0.10 tranches.
 4. **Gold price** — kintaragold-style chart, now driven by our own `gold_price` series.
@@ -511,10 +531,13 @@ A site-wide quality-of-life pass that sits under every tab:
   `timeZone:'UTC'` or they shift a day in western timezones.
 - `removed`/`active=0` ≠ guaranteed sale (that's why the **Sales feed** is now driven by `sales_events`,
   detected from kintara's own completed-sale counter, not by listing removals).
-- The actual-sales feed is **granular but not per-transaction**: it logs the delta each time the stats
-  loop re-checks an item (every ~5 min for actively-traded items, ~30 min for quiet ones), so a busy item
-  shows up as "N units sold @ avg $P" per interval, with up to that much latency. Gold-priced sale prices
-  inherit the `/stats` 2-dp rounding (coarse for cheap goods); the USD/$KINS prices are exact.
+- The actual-sales feed is **per-sale** (one row per completed sale, matched to the vanished listing for
+  the real stack qty/seller/duration), but its **timing** is still gated by the `/stats` poll cadence —
+  a sale is detected when the stats loop next re-checks that item (items with a fresh unclaimed removal
+  jump the queue, so high-value sales surface within a poll; quiet items can lag minutes). When we can't
+  match a confirmed sale to a captured listing, it shows as a `qty —`/`~est` row (price known, stack
+  unknown). Gold sale prices inherit the `/stats` 2-dp rounding (coarse for cheap goods); USD/$KINS are
+  exact.
 - Profit is an upper bound (no buy orders to price against; you'd undercut to sell).
 - KINS pumped ~60× since launch, so KINS/gold over ALL legitimately spans ~45,000→~340
   (auto log-scale handles it — not a bug).
@@ -547,6 +570,27 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Sales-feed accuracy overhaul + per-1,000 quoting + floor-chart hover + Index-first:**
+  - **Sales feed rebuilt for real quantities.** The old `sales_events.units` was a `/stats` *count* of
+    listings sold (so "5 stone" meant 5 listings, each a huge stack — misleading). Now each sale is
+    **matched to the listing we watched vanish** (`_log_sales`: recently removed, unclaimed, ranked by
+    per-unit closeness to the marginal sold price) to recover the real **`qty`, `total` paid, `seller`,
+    and `listing_ms`** (time on market). `sales_events` gained those columns + `listing_id`; `listings`
+    gained `sold_claimed`. **Don't-miss:** detection now also fires on the *first* baseline of an item-day
+    (price-matched removals only, no synthetic rows → no replaying history), and items with a fresh
+    unclaimed removal are **prioritised in the stats queue** so high-value sales (e.g. a 500g aura)
+    surface within a poll instead of waiting out the cold cadence. Legacy `sales_events` rows were
+    dropped on migration; the feed fills forward. `rollup_day`/`recent_fair_usd`/`time_to_sell` now use
+    `qty`. The **Sales feed** tab and **Recent sales** panel show qty · total paid · seller · time-listed.
+  - **Per-1,000 quoting** for **material/potion/food** (a single unit is sub-cent and untradeable under
+    the Solana fee): scorecard floor, floor chart axis/hover, and cheapest-live-listings all quote
+    `/1k` for these categories. `qbasis()`/`qbasisSuffix()` (frontend `PER1K` set).
+  - **Cheapest-live-listings + recent-sales show total paid + quantity**, not the tiny per-unit number
+    (per-unit was unreadable for big stacks); per-1,000 is the secondary figure for commodities.
+  - **Floor chart hover:** the per-item floor chart now has a Gold-chart-style **crosshair + hover card**
+    (`attachFloorHover`, reuses the `.goldcard` style) showing the point's date and floor in gold/USD/$KINS.
+  - **Index moved to the first/default tab** (`TAB="hist"`), since the scorecard is now the main product.
 
 - **Historical order-book pipeline + Item Scorecard + Merchant Forecast (the "market memory" build):**
   The DB now preserves the market's *shape over time*, not just current state. Three new tables +
