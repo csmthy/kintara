@@ -304,9 +304,10 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   (cheap/fair/expensive vs gold-anchored `recent_fair_usd()`) + `confidence`, `last_sale`. Reads the
   durable metrics + a couple of cheap indexed live queries — never aggregates raw snapshots.
 - `GET /api/floor-history?item_type=&range=24H|3D|7D|30D|ALL` — floor-price history for the floor chart.
-  Per point `{t, usd, gold, kins}`: **`gold` = the ACTUAL cheapest gold-currency ask** (what people really
-  list it for in gold, not a conversion), `usd` = the cheapest USD-equivalent across both currencies (so
-  KINS reflects whichever way is cheaper to buy), `kins` = usd ÷ KINS price **at that tick's time**
+  Per point `{t, usd, gold, kins}`: **`gold` = the ACTUAL cheapest gold-currency ask** (not a conversion);
+  **`usd` = the cheapest RAW USD listing only** (a real typed price — NOT gold converted to USD, so no weird
+  decimals; `null` when the item isn't listed in USD); `kins` = the cheapest acquisition cost (whichever of
+  USD or gold→USD is cheaper) ÷ KINS price **at that tick's time**
   (intraday, via `kins_intraday_ms()` + `interp_gold()` — NOT a single daily close, otherwise the $KINS
   line would just be a scaled copy of the USD line within a day; falls back to the daily close for old
   pre-snapshot points or if GeckoTerminal is unreachable). Recent points from `orderbook_snapshots`, older
@@ -598,6 +599,15 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **USD floor = raw USD listings only (no gold conversion):** the USD floor was `min(token_usd,
+  gold_floor×rate)`, so an item listed only in gold showed its gold price *converted* to USD (weird
+  decimals nobody types). Now `item_floors()` returns `usd` = the cheapest **raw token/USD** listing only
+  (null if not listed in USD) and a separate `usd_equiv` = the cheaper of USD vs gold→USD, used **only**
+  for the KINS floor (which should reflect whichever currency is cheaper) and the cheap/fair/expensive
+  verdict. Applied across the scorecard, Index floor columns, and the floor-history chart (the USD line is
+  now real listings only; KINS still uses the cheaper path). Floor-chart `usd` for old pre-snapshot points
+  is null since the rollup only kept the cheapest-acquisition close.
 
 - **Merchant restock markers on every time chart:** a merchant restock (donation campaign filling / gold
   stock refilling) is a market-wide price shock, so it's now detected (`merchant_events` table, transition

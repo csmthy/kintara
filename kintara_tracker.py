@@ -2352,10 +2352,13 @@ def recent_fair_usd(con, item_type, days=14):
 
 def item_floors(con, rate, item_type=None):
     """Current floor per item from live buyable listings, with the bulk-material rule
-    (materials ignore listings < MIN_BULK_QTY). Returns {item: {gold, usd}} where
-      gold = cheapest ACTUAL gold-currency per-unit ask (None if not listed in gold),
-      usd  = cheapest USD-equivalent (min of the token per-unit and gold×rate).
-    Pass item_type to compute just one. KINS is derived from `usd` by the caller."""
+    (materials ignore listings < MIN_BULK_QTY). Returns {item: {gold, usd, usd_equiv}}:
+      gold      = cheapest ACTUAL gold-currency per-unit ask (None if not listed in gold),
+      usd       = cheapest RAW USD listing (token per-unit) — NOT a gold conversion, so the
+                  USD floor is a real price someone typed (None if not listed in USD),
+      usd_equiv = cheapest way to ACQUIRE it in USD terms (min of usd and gold×rate) —
+                  used only to derive the KINS floor (whichever currency is cheaper).
+    Pass item_type to compute just one."""
     rclause, rparam = _buyable_clause()
     qfilter = f" AND (category != 'material' OR quantity >= {MIN_BULK_QTY})"
     one = " AND item_type=?" if item_type else ""
@@ -2368,14 +2371,14 @@ def item_floors(con, rate, item_type=None):
                     GROUP BY item_type""", (ccy, rparam) + args_extra):
             if r["p"] is None:
                 continue
-            out.setdefault(r["item_type"], {})["gold" if ccy == "gold" else "token_usd"] = r["p"]
+            out.setdefault(r["item_type"], {})["gold" if ccy == "gold" else "usd"] = r["p"]
     for f in out.values():
         cands = []
-        if f.get("token_usd") is not None:
-            cands.append(f["token_usd"])
+        if f.get("usd") is not None:
+            cands.append(f["usd"])
         if f.get("gold") is not None and rate:
             cands.append(f["gold"] * rate)
-        f["usd"] = min(cands) if cands else None
+        f["usd_equiv"] = min(cands) if cands else None
     return out
 
 
@@ -3226,11 +3229,12 @@ def make_app():
     @app.route("/api/floor-history")
     def floor_history():
         """Floor-price history for one item. Each point: `gold` = the ACTUAL cheapest
-        gold-currency ask (what people really list it for in gold — not a conversion),
-        `usd` = the cheapest USD-equivalent across both currencies (so KINS reflects
-        whichever way is cheaper to buy), `kins` = usd / KINS price. Recent points come
-        from the fine-grained orderbook_snapshots; older points fall back to
-        item_daily_metrics (one/day) for the stretch before snapshot coverage."""
+        gold-currency ask (not a conversion); `usd` = the cheapest RAW USD listing only
+        (a real typed price — NOT gold converted to USD; null if it isn't listed in USD);
+        `kins` = the cheapest acquisition cost (whichever of USD or gold→USD is cheaper)
+        ÷ the KINS price at that tick. Recent points from orderbook_snapshots; older from
+        item_daily_metrics (which only kept the cheapest-acquisition close, so the raw-USD
+        line begins where snapshot coverage does)."""
         item = (request.args.get("item_type") or "").strip()
         if not item:
             return jsonify({"ok": False, "error": "item_type required"}), 400
@@ -3243,13 +3247,16 @@ def make_app():
             for r in con.execute(
                     """SELECT ts, currency, floor, floor_usd FROM orderbook_snapshots
                        WHERE item_type=? AND ts>=? ORDER BY ts""", (item, lo)):
-                c = ticks.setdefault(r["ts"], {"usd": None, "gold": None})
-                if r["floor_usd"] is not None and (c["usd"] is None or r["floor_usd"] < c["usd"]):
-                    c["usd"] = r["floor_usd"]
+                c = ticks.setdefault(r["ts"], {"equiv": None, "gold": None, "usd": None})
+                if r["floor_usd"] is not None and (c["equiv"] is None or r["floor_usd"] < c["equiv"]):
+                    c["equiv"] = r["floor_usd"]          # cheapest acquisition (for KINS)
                 if r["currency"] == "gold" and r["floor"] is not None:
-                    c["gold"] = r["floor"]                # actual gold-currency floor
+                    c["gold"] = r["floor"]               # actual gold-currency floor
+                if r["currency"] == "token" and r["floor"] is not None:
+                    c["usd"] = r["floor"]                # RAW USD listing floor only
             snap_start = min(ticks) if ticks else int(time.time() * 1000)
-            # older days from the durable rollup (before snapshot coverage)
+            # older days from the durable rollup (before snapshot coverage). It only stored
+            # the cheapest-acquisition USD close, so older raw-USD is unknown (left null).
             older = []
             for r in con.execute(
                     """SELECT day, floor_usd_close, floor_gold_close FROM item_daily_metrics
@@ -3257,7 +3264,7 @@ def make_app():
                 dts = int(datetime.strptime(r["day"], "%Y-%m-%d")
                           .replace(tzinfo=timezone.utc).timestamp() * 1000)
                 if lo <= dts < snap_start:
-                    older.append((dts, r["floor_usd_close"], r["floor_gold_close"]))
+                    older.append((dts, None, r["floor_gold_close"], r["floor_usd_close"]))
             kusd = kins_daily_usd()
         finally:
             con.close()
@@ -3278,15 +3285,16 @@ def make_app():
                 if v:
                     return v
             return carry(kusd, kdates, d)         # daily fallback (old points / no intraday)
-        pts = older + [(t, ticks[t]["usd"], ticks[t]["gold"]) for t in sorted(ticks)]
+        pts = older + [(t, ticks[t]["usd"], ticks[t]["gold"], ticks[t]["equiv"])
+                       for t in sorted(ticks)]
         series = []
-        for t, usd, gold in pts:
-            if usd is None and gold is None:
+        for t, usd, gold, equiv in pts:
+            if usd is None and gold is None and equiv is None:
                 continue
             d = datetime.fromtimestamp(t / 1000, timezone.utc).strftime("%Y-%m-%d")
             ku = kins_at(t, d)
             series.append({"t": t, "usd": usd, "gold": gold,
-                           "kins": (usd / ku) if (usd and ku) else None})
+                           "kins": (equiv / ku) if (equiv and ku) else None})
         return jsonify({"ok": True, "item_type": item, "range": rng, "series": series})
 
     @app.route("/api/scorecard")
@@ -3308,8 +3316,9 @@ def make_app():
             # current floor (bulk-material rule applied): actual gold-currency floor +
             # cheapest USD-equivalent across both currencies.
             ff = item_floors(con, rate, item).get(item, {})
-            gold_floor = ff.get("gold")     # actual cheapest gold-currency per-unit ask
-            floor_usd = ff.get("usd")       # cheapest USD-equivalent (token vs gold×rate)
+            gold_floor = ff.get("gold")        # actual cheapest gold-currency per-unit ask
+            floor_usd = ff.get("usd")          # RAW cheapest USD listing (display)
+            floor_equiv = ff.get("usd_equiv")  # cheapest acquisition cost (verdict/change/KINS)
             # latest snapshot row aggregates (supply / sellers) — cheap, indexed
             supply = sellers = None
             srow = con.execute(
@@ -3326,8 +3335,8 @@ def make_app():
                     """SELECT floor_usd_close c FROM item_daily_metrics
                        WHERE item_type=? AND day<=? AND floor_usd_close IS NOT NULL
                        ORDER BY day DESC LIMIT 1""", (item, d)).fetchone()
-                if row and row["c"] and floor_usd:
-                    return round((floor_usd - row["c"]) / row["c"] * 100, 1)
+                if row and row["c"] and floor_equiv:   # floor_usd_close is the cheapest-acquisition series
+                    return round((floor_equiv - row["c"]) / row["c"] * 100, 1)
                 return None
             changes = {"d1": change(1), "d7": change(7), "d30": change(30)}
             # velocity = avg units/day sold over 7d; volatility = recent daily avg
@@ -3348,18 +3357,19 @@ def make_app():
         finally:
             con.close()
         liq = liquidity_score(velocity, supply or 0, sellers or 0, last_age)
-        # verdict: cheap/fair/expensive vs the gold-anchored fair value
+        # verdict: cheap/fair/expensive vs the gold-anchored fair value (uses the cheapest
+        # acquisition cost across currencies, not just the raw USD listing)
         verdict = conf = None
-        if fair_usd and floor_usd:
-            r = floor_usd / fair_usd
+        if fair_usd and floor_equiv:
+            r = floor_equiv / fair_usd
             verdict = "cheap" if r <= 0.9 else ("expensive" if r >= 1.12 else "fair")
             conf = "high" if fair_units >= 8 else ("med" if fair_units >= 3 else "low")
         return jsonify({
             "ok": True, "item_type": item, "label": item_label(item),
             "category": categorize(item),
-            "floor": {"usd": floor_usd,
-                      "gold": gold_floor,    # ACTUAL cheapest gold-currency ask (None if not listed in gold)
-                      "kins": (floor_usd / kp) if (floor_usd and kp) else None},
+            "floor": {"usd": floor_usd,       # RAW cheapest USD listing (not a gold conversion)
+                      "gold": gold_floor,     # ACTUAL cheapest gold-currency ask
+                      "kins": (floor_equiv / kp) if (floor_equiv and kp) else None},  # cheaper of USD/gold→KINS
             "gold_rate": rate, "kins_price": kp,
             "change": changes,
             "velocity": round(velocity, 2), "listed_supply": supply,
@@ -3404,12 +3414,13 @@ def make_app():
             ta = (t["wp"] / t["sw"]) if (t and t["sw"]) else None
             kins = (ta / kins_px) if (ta and kins_px) else None
             ff = floors.get(it, {})
-            f_usd = ff.get("usd")
+            f_usd = ff.get("usd")            # raw cheapest USD listing
+            f_equiv = ff.get("usd_equiv")    # cheaper of USD / gold→USD, for the KINS floor
             out.append({
                 "item_type": it, "label": item_label(it), "category": categorize(it),
                 "sales": gs + ts, "avg_gold": ga, "avg_usd": ta, "kins": kins,
                 "floor_gold": ff.get("gold"), "floor_usd": f_usd,
-                "floor_kins": (f_usd / kins_px) if (f_usd and kins_px) else None,
+                "floor_kins": (f_equiv / kins_px) if (f_equiv and kins_px) else None,
             })
         return jsonify({"ok": True, "ref_day": ref, "window": window,
                         "kins_price": kins_px, "gold_rate": rate, "items": out})
