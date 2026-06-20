@@ -179,12 +179,17 @@ SPECTATE_REGIONS = {
 # players present). Override with KINTARA_BOSS_REGION once the real key is known to skip
 # probing. Spider-themed keys are tried first, then generic boss/raid/dungeon names.
 BOSS_REGION_OVERRIDE = os.environ.get("KINTARA_BOSS_REGION") or None
+# The boss is "Venomweaver" — its region key is most likely derived from that name, so those
+# variants are probed first, then spider-themed and generic boss names as fallbacks.
 BOSS_CANDIDATES = [
-    "spider_boss", "spider_queen", "spider_king", "spiderboss", "boss_spider",
-    "spider_nest", "spider_den", "spider_cave", "spider_lair_boss", "spider_ext",
-    "spider_exp", "spider2", "web", "webs", "nest", "boss", "boss_arena", "raid", "dungeon",
+    "venomweaver", "venomweaver_boss", "venom_weaver", "boss_venomweaver",
+    "venomweaver_lair", "venomweaver_nest", "venomweaver_den", "venomweaver_arena",
+    "venom", "weaver",
+    "spider_boss", "spider_queen", "spiderboss", "boss_spider", "spider_nest",
+    "spider_den", "spider_lair_boss", "web", "webs", "nest", "boss", "boss_arena",
+    "raid", "dungeon",
 ]
-BOSS_LABEL = ("Spider Boss", "\U0001F577")   # 🕷 — display name + emoji for Live World
+BOSS_LABEL = ("Venomweaver", "\U0001F577")   # 🕷 — display name + emoji for Live World
 BOSS_CENSUS_INTERVAL = _envf("BOSS_CENSUS_INTERVAL", 8)   # gap between per-shard census visits (s)
 PROPERTY_STATUS_URL = "https://kintara.gg/api/property-signs/status"
 # Skin-tone palette (game.js `SKIN_TONE_HEX`) for rendering player avatars.
@@ -4412,6 +4417,111 @@ textarea{width:100%;min-height:90px;font:12.5px/1.5 var(--mono);resize:vertical}
 .empty{color:var(--mut);padding:30px;text-align:center;font:13px var(--ui)}
 a{color:var(--gold2)}
 
+/* ============================================================================
+   MOBILE — phone layout pass (≤680px). Desktop is untouched; everything here is
+   an override for small screens: tighter spacing, scrollable tab strip, stacked
+   panels, condensed tables, and horizontally-scrollable wide tables.
+   ============================================================================ */
+@media (max-width:680px){
+  /* header: compact, no overflow */
+  .hdr{gap:8px 10px;padding:10px 12px}
+  .brand{margin-right:0}
+  .brand-mark{width:30px;height:30px;border-radius:9px;padding:4px}
+  h1{font-size:17px;letter-spacing:.05em}
+  .brand-sub{display:none}
+  #status{display:none}                 /* error-only line — reclaim the space */
+  .kbtn{padding:7px 10px}
+  .kbtn kbd{display:none}
+  .kpx{margin-left:auto;padding:6px 10px}
+  .kpx .kpx-v{font-size:12px}
+  .srv{margin-left:0}
+
+  /* content rhythm */
+  main{padding:14px 12px 36px}
+
+  /* tabs → single scrollable strip (full-bleed) */
+  .tabs{flex-wrap:nowrap;overflow-x:auto;gap:6px;margin:0 -12px 14px;padding:0 12px 4px;
+    -webkit-overflow-scrolling:touch;scrollbar-width:none}
+  .tabs::-webkit-scrollbar{display:none}
+  .tab{flex:0 0 auto;padding:8px 14px;font-size:13px}
+
+  /* controls wrap tighter; full-width search box */
+  .controls{gap:6px;margin-bottom:12px}
+  .controls #q,.controls #asearch{min-width:0;flex:1 1 100%}
+
+  /* index / collectables / arbitrage game panel: stack the sidebar */
+  .gw{flex-direction:column;min-height:0;border-radius:14px}
+  .gw-side{flex:none;border-right:0;border-bottom:1px solid #1c2b40;
+    display:flex;gap:6px;overflow-x:auto;padding:10px;scrollbar-width:none}
+  .gw-side::-webkit-scrollbar{display:none}
+  .gw-eyebrow{display:none}
+  .gw-cat{flex:0 0 auto;width:auto;margin:0;padding:8px 12px;border-radius:999px;
+    font-size:13px;border:1px solid #2c3c56}
+  .gw-cat.on{box-shadow:none}
+  .gw-cat .c{float:none;margin-left:6px}
+  .gw-main{padding:16px 12px 20px;overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .gw-corner{display:none}
+  .gw-title{font-size:21px}
+  .gw-sub{font-size:12.5px}
+  .gw-pills{flex-wrap:wrap}
+
+  /* index rows: drop the Sales column on phones, keep the three floors */
+  .gw-head,.gw-row{grid-template-columns:1.5fr .9fr .9fr .9fr;gap:6px}
+  .gw-head>*:nth-child(2),.gw-row>*:nth-child(2){display:none}
+  .gw-head{font-size:9.5px;letter-spacing:.06em}
+  .gw-name{font-size:13.5px}
+  .gw-num{font-size:12px}
+  .gw-row{padding:11px 10px}
+  .gw-item{gap:8px}
+  .gw-ico,.gw-ico img{width:20px!important;height:20px!important}
+
+  /* item expand: single column */
+  .gw-expinner{grid-template-columns:1fr;gap:12px;padding:6px 0 14px}
+  .gw-statpanel{order:4}
+  .gw-cseg button{padding:6px 11px;font-size:12px}
+
+  /* scorecard header: let everything stack/wrap left */
+  .sc-wrap{gap:12px 18px;padding:12px}
+  .sc-stats{margin-left:0;gap:10px 16px}
+  .sc-floors{gap:14px;flex-wrap:wrap}
+  .sc-floor-main .sc-price{font-size:22px}
+
+  /* raw tables (arbitrage / live listings / sales feed): scroll horizontally */
+  #ltable{overflow-x:auto;-webkit-overflow-scrolling:touch}
+  .gw-main table,#ltable table{min-width:560px}
+  th{padding:8px 8px;font-size:10px}
+  td{padding:7px 8px;font-size:11.5px}
+
+  /* charts: shorter on phones (override inline heights) */
+  #schart{height:190px!important}
+  #gchart{height:250px!important}
+
+  /* merchant */
+  .mpanel{padding:15px 14px}
+  .mwrap{gap:14px}
+  .fc-eta .fc-num{font-size:24px}
+  .fc-reshead,.fc-res{grid-template-columns:1fr auto auto;gap:8px}
+  .fc-res .bar{display:none}
+  .fc-econ{gap:10px}
+
+  /* listings panel two-up → one column */
+  .ll-cols{grid-template-columns:1fr}
+
+  /* floating cards / tooltips fit the viewport */
+  .dealcard,.soldcard{max-width:92vw}
+  .tipbox{max-width:80vw}
+
+  /* live world + property already stack via their own breakpoints */
+  .lw-head{gap:8px}
+  .srv-pop{width:min(360px,92vw)}
+}
+/* extra-narrow phones */
+@media (max-width:400px){
+  h1{font-size:15px}
+  .gw-title{font-size:18px}
+  .tab{padding:7px 12px;font-size:12.5px}
+}
+
 /* ===== premium QoL layer ===== */
 /* honour reduced-motion (#11) */
 @media (prefers-reduced-motion: reduce){
@@ -5860,7 +5970,7 @@ async function loadServers(){
   if(!d.ok){ el.innerHTML=`<button class="srv-btn">${SRV_ICON}<span>servers n/a</span></button>`; return; }
   const popDot=p=>`<span class="pdot pop-${["High","Medium","Low"].includes(p)?p:'na'}"></span>`;
   const bossBadge=s=> s.boss!=null
-    ? `<span class="qbadge boss ${s.boss?'':'zero'}" data-tip="players fighting the Spider Boss right now">🕷 ${s.boss}</span>` : '';
+    ? `<span class="qbadge boss ${s.boss?'':'zero'}" data-tip="players fighting Venomweaver right now">🕷 ${s.boss}</span>` : '';
   const cards=d.servers.map(s=>`<div class="srv-card">
       <div class="nm">${popDot(s.population)}${s.name||('Server '+s.id)}
         ${s.min_level?`<small style="color:var(--mut);font:11px var(--mono);margin-left:auto">Lv ${s.min_level}+</small>`:''}</div>
@@ -5878,7 +5988,7 @@ async function loadServers(){
         <span class="sb ${d.open?'sb-open':'sb-mut'}">${d.open} open</span>
         <span class="sb ${d.full?'sb-full':'sb-mut'}">${d.full} full</span>
         <span class="sb ${d.queue_total?'sb-queue':'sb-mut'}">${d.queue_total} queued</span>
-        ${d.boss_total?`<span class="sb sb-boss" data-tip="total players fighting the Spider Boss across all servers">🕷 ${d.boss_total} fighting</span>`:''}
+        ${d.boss_total?`<span class="sb sb-boss" data-tip="total players fighting Venomweaver across all servers">🕷 ${d.boss_total} fighting</span>`:''}
       </div>
       <div class="srv-grid">${cards}</div>
     </div>`;
