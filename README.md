@@ -340,7 +340,9 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   ≤50 markers) so overpriced tail stacks don't squash the actionable range. Drives the materials
   liquidity chart in the Sales-History item expand.
 - `GET /api/servers` — normalized server list + rollup (`open/full/queued/queue_total`) for
-  the top status bar.
+  the top status bar. Also includes per-server **`boss`** (players in the new Spider Boss area right now,
+  `null` until measured) plus top-level **`boss_region`** (the resolved spectate key) and **`boss_total`**,
+  from `BossCensus`.
 - `GET /api/live?shard=1|2|3|4` — live world roster for a shard (from the spectate
   WebSocket): `online_total`, `players[]` (id, name, x, z, level, held item, badge, hp,
   outfit), `connected`, `err`. Opens the socket on first hit, keeps it warm while polled.
@@ -518,6 +520,9 @@ numbered by topic, not bar order.
    locked/open, how many properties they hold, their live marketplace listing count + value,
    and a "view their listings" jump). Polled ~30s.
 
+The bubble also shows a **🕷 boss count per server** (players in the new level-20 Spider Boss area
+right now) and a **🕷 N fighting** total in the header — from `BossCensus` (see below).
+
 Site-wide, in the header: a compact **server status icon** (shows server count + total queue)
 that expands into a floating bubble listing every server's population + queue. Polled ~30s,
 closes on outside click. Next to it, a **live `$KINS` price pill** (`#kpx`, `/api/kins-price`,
@@ -600,6 +605,19 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **New Spider Boss area — Live World + per-server boss counts:** Kintara added a level-20 Spider Boss
+  area (east of the wilderness). Its internal spectate region key wasn't in our datamine, so a new
+  **`BossCensus`** background loop self-resolves it: one short-lived spectate socket at a time, round-
+  robining all 12 shards, probing spider-themed candidate keys (`BOSS_CANDIDATES`) and **locking onto
+  whichever actually streams players** (`snap.region == key` with players present), then counting boss
+  players per shard. Gentle (single socket, paced by `BOSS_CENSUS_INTERVAL`); set `KINTARA_BOSS_REGION`
+  to skip probing once the real key is known. The resolved region is (a) fed into the **server-status
+  bubble** as a 🕷 per-server count + a 🕷 total in the header (`/api/servers` now returns per-server
+  `boss` + top-level `boss_region`/`boss_total`), and (b) added to the **Live World** round-robin so boss
+  players get rostered and grouped under "Spider Boss" (`BOSS_LABEL`); `/api/live` includes the boss
+  realm label. No map for the area yet — the per-player view uses the name-only card (no `REALM_MAPS`
+  entry). New `BossCensus` class + `_boss_census`, started in `main()`.
 
 - **Sales feed starvation fix:** the urgent stats queue was item-level and liquidity-sorted, so constant
   wood removals kept wood urgent and starved stone/coal/cooked-fish/metal for ~40 minutes. Urgency is now

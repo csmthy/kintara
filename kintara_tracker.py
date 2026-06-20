@@ -173,6 +173,19 @@ SPECTATE_REGIONS = {
     "spider": ("Spider Lair", "\U0001F577"),
     "shack": ("Shack", "\U0001F3DA"),
 }
+# New level-20 SPIDER BOSS area (east of the wilderness). Its internal spectate region
+# key isn't in our datamine yet, so the boss census probes these candidates against live
+# servers and locks onto whichever actually streams players (snap.region == key with
+# players present). Override with KINTARA_BOSS_REGION once the real key is known to skip
+# probing. Spider-themed keys are tried first, then generic boss/raid/dungeon names.
+BOSS_REGION_OVERRIDE = os.environ.get("KINTARA_BOSS_REGION") or None
+BOSS_CANDIDATES = [
+    "spider_boss", "spider_queen", "spider_king", "spiderboss", "boss_spider",
+    "spider_nest", "spider_den", "spider_cave", "spider_lair_boss", "spider_ext",
+    "spider_exp", "spider2", "web", "webs", "nest", "boss", "boss_arena", "raid", "dungeon",
+]
+BOSS_LABEL = ("Spider Boss", "\U0001F577")   # 🕷 — display name + emoji for Live World
+BOSS_CENSUS_INTERVAL = _envf("BOSS_CENSUS_INTERVAL", 8)   # gap between per-shard census visits (s)
 PROPERTY_STATUS_URL = "https://kintara.gg/api/property-signs/status"
 # Skin-tone palette (game.js `SKIN_TONE_HEX`) for rendering player avatars.
 SKIN_TONE_HEX = ("#f1e8df", "#e3c19e", "#d4a574", "#7e5f49", "#5c4332")
@@ -1937,7 +1950,6 @@ class SpectateHub:
                 await ws.send("ping")
                 with self.lock:
                     self._state(shard)["err"] = None
-                regions = list(SPECTATE_REGIONS.keys())   # "world" is first
                 idx = 0
                 cur = None
                 last_switch = 0.0
@@ -1949,10 +1961,15 @@ class SpectateHub:
                         break
                     # round-robin the realms so the roster covers the whole world, not
                     # just the hub — lingering on the overworld since its players cycle
-                    # through the spectator's limited view.
+                    # through the spectator's limited view. Include the resolved boss
+                    # region (so boss players get rostered + grouped in Live World).
                     dwell = self.DWELL_WORLD if cur == "world" else self.DWELL_OTHER
                     if cur is None or now - last_switch >= dwell:
-                        cur = regions[idx]
+                        regions = list(SPECTATE_REGIONS.keys())   # "world" is first
+                        br = _boss_census.region
+                        if br and br not in regions:
+                            regions.append(br)
+                        cur = regions[idx % len(regions)]
                         idx = (idx + 1) % len(regions)
                         last_switch = now
                         try:
@@ -2018,6 +2035,135 @@ class SpectateHub:
 
 
 _spectate_hub = SpectateHub()
+
+
+class BossCensus:
+    """Background census of the new boss area. Round-robins shards with a SINGLE short-lived
+    spectate socket at a time (gentle): subscribes to the boss region and counts the distinct
+    players in it, storing a per-shard count for the server-status bubble. Until the boss
+    region key is known it PROBES candidate keys (a few per visit) and locks onto the first
+    that actually streams players (snap.region == key with players present). The resolved key
+    is also fed to Live World so boss players get rostered + grouped."""
+    PROBE_DWELL = 1.6      # seconds listened per candidate while probing
+    COUNT_DWELL = 2.2      # seconds gathering a count once locked on
+
+    def __init__(self):
+        self.loop = None
+        self.lock = threading.Lock()
+        self._started = False
+        self.region = BOSS_REGION_OVERRIDE     # resolved spectate key (None until found)
+        self.counts = {}                       # shard -> (count, ts)
+        self._probe_i = 0
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        try:
+            import websockets  # noqa: F401
+        except ImportError:
+            return             # no census without the websockets package
+        import asyncio
+        self.loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self._main())
+        except Exception as e:
+            print(f"[{now_iso()}] boss census stopped: {e}")
+
+    async def _main(self):
+        import asyncio
+        while True:
+            for shard in SHARDS:
+                try:
+                    await self._visit(shard)
+                except Exception:
+                    pass
+                await asyncio.sleep(BOSS_CENSUS_INTERVAL)
+
+    async def _open(self, shard):
+        import websockets, inspect
+        url = SPECTATE_WS.format(shard=shard)
+        headers = {"User-Agent": BROWSER_UA, "Origin": "https://kintara.gg"}
+        params = inspect.signature(websockets.connect).parameters
+        kw = "additional_headers" if "additional_headers" in params else "extra_headers"
+        return await websockets.connect(url, **{kw: headers}, open_timeout=15,
+                                        max_size=2 ** 21, ping_interval=None)
+
+    async def _count_region(self, ws, region, dwell):
+        """Subscribe to `region`, listen `dwell`s, return distinct player count. Only counts
+        snaps whose echoed region matches what we asked for (so an invalid candidate that the
+        server ignores or echoes differently scores 0)."""
+        import asyncio
+        await ws.send(json.dumps({"t": "spec_reg", "region": region}))
+        seen, deadline = {}, time.time() + dwell
+        while time.time() < deadline:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=1.0)
+            except asyncio.TimeoutError:
+                continue
+            if isinstance(msg, (bytes, bytearray)):
+                continue
+            try:
+                d = json.loads(msg)
+            except Exception:
+                continue
+            for o in (d if isinstance(d, list) else [d]):
+                if not isinstance(o, dict) or o.get("t") != "snap":
+                    continue
+                if o.get("region") != region:
+                    continue
+                for p in o.get("players", []):
+                    pid = p.get("id")
+                    if pid is not None:
+                        seen[pid] = 1
+        return len(seen)
+
+    async def _visit(self, shard):
+        ws = None
+        try:
+            ws = await self._open(shard)
+            try:
+                await ws.send("ping")
+            except Exception:
+                pass
+            if self.region:
+                n = await self._count_region(ws, self.region, self.COUNT_DWELL)
+                with self.lock:
+                    self.counts[shard] = (n, time.time())
+            else:
+                tried = 0
+                while tried < 3 and not self.region:
+                    cand = BOSS_CANDIDATES[self._probe_i % len(BOSS_CANDIDATES)]
+                    self._probe_i += 1
+                    tried += 1
+                    n = await self._count_region(ws, cand, self.PROBE_DWELL)
+                    if n > 0:
+                        with self.lock:
+                            self.region = cand
+                            self.counts[shard] = (n, time.time())
+                        print(f"[{now_iso()}] boss census: locked region '{cand}' "
+                              f"({n} players on shard {shard})")
+                        break
+        finally:
+            if ws is not None:
+                try:
+                    await ws.close()
+                except Exception:
+                    pass
+
+    def snapshot(self):
+        """{region, counts:{shard:count|None}} — None = not measured recently."""
+        with self.lock:
+            now = time.time()
+            counts = {s: (c if now - ts < 300 else None) for s, (c, ts) in self.counts.items()}
+            return {"region": self.region, "counts": counts}
+
+
+_boss_census = BossCensus()
 
 
 # ---------------------------------------------------------------------------
@@ -3500,22 +3646,35 @@ def make_app():
                 raw = _servers_cache["data"]
             else:
                 return jsonify({"ok": False, "error": str(e)}), 502
+        census = _boss_census.snapshot()
+        bc = census["counts"]
+        def boss_for(sid):
+            if sid in bc:
+                return bc[sid]
+            try:
+                return bc.get(int(sid))
+            except (TypeError, ValueError):
+                return None
         out = []
         for s in raw:
+            sid = s.get("id")
             out.append({
-                "id": s.get("id"),
+                "id": sid,
                 "name": s.get("name"),
                 "population": s.get("populationLabel"),
                 "full": bool(s.get("full")),
                 "queue": s.get("queueLength") or 0,
                 "min_level": s.get("minLevel") or 0,
+                "boss": boss_for(sid),           # players in the boss area now (None = not measured)
             })
         n_full = sum(1 for s in out if s["full"])
         n_queue = sum(1 for s in out if s["queue"] > 0)
+        boss_total = sum(v for v in (s["boss"] for s in out) if v)
         return jsonify({"ok": True, "servers": out, "total": len(out),
                         "full": n_full, "open": len(out) - n_full,
                         "queued": n_queue,
-                        "queue_total": sum(s["queue"] for s in out)})
+                        "queue_total": sum(s["queue"] for s in out),
+                        "boss_region": census["region"], "boss_total": boss_total})
 
     @app.route("/api/merchant")
     def merchant():
@@ -3625,8 +3784,10 @@ def make_app():
         keep = ("id", "name", "x", "z", "ry", "y", "avg", "eq", "bdg",
                 "php", "mov", "act", "outfit", "pr", "realm")
         snap["players"] = [{k: p[k] for k in keep if k in p} for p in snap["players"]]
-        snap.update(ok=True, shard=shard, shards=list(SHARDS),
-                    realms={k: {"l": v[0], "e": v[1]} for k, v in SPECTATE_REGIONS.items()})
+        realms = {k: {"l": v[0], "e": v[1]} for k, v in SPECTATE_REGIONS.items()}
+        if _boss_census.region:                 # label the resolved boss area for grouping
+            realms[_boss_census.region] = {"l": BOSS_LABEL[0], "e": BOSS_LABEL[1]}
+        snap.update(ok=True, shard=shard, shards=list(SHARDS), realms=realms)
         return jsonify(snap)
 
     @app.route("/api/live-search")
@@ -3869,6 +4030,10 @@ td.isd{cursor:help}
 .qbadge{padding:2px 8px;border-radius:999px;font:600 11px var(--mono);
   color:var(--gold2);border:1px solid rgba(232,181,74,.35);background:rgba(232,181,74,.07)}
 .qbadge.zero{color:var(--buy);border-color:rgba(52,211,154,.3);background:rgba(52,211,154,.06)}
+.badges2{display:inline-flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
+.qbadge.boss{color:#d98cff;border-color:rgba(190,120,255,.4);background:rgba(190,120,255,.10)}
+.qbadge.boss.zero{color:var(--mut);border-color:var(--line);background:rgba(255,255,255,.02)}
+.sb-boss{color:#d98cff;border-color:rgba(190,120,255,.45);background:rgba(190,120,255,.10)}
 
 /* ===== traveling merchant tab ===== */
 .mwrap{display:grid;grid-template-columns:1.25fr 1fr;gap:18px;align-items:start}
@@ -5694,11 +5859,13 @@ async function loadServers(){
   const el=$("#srv"); if(!el) return;
   if(!d.ok){ el.innerHTML=`<button class="srv-btn">${SRV_ICON}<span>servers n/a</span></button>`; return; }
   const popDot=p=>`<span class="pdot pop-${["High","Medium","Low"].includes(p)?p:'na'}"></span>`;
+  const bossBadge=s=> s.boss!=null
+    ? `<span class="qbadge boss ${s.boss?'':'zero'}" data-tip="players fighting the Spider Boss right now">🕷 ${s.boss}</span>` : '';
   const cards=d.servers.map(s=>`<div class="srv-card">
       <div class="nm">${popDot(s.population)}${s.name||('Server '+s.id)}
         ${s.min_level?`<small style="color:var(--mut);font:11px var(--mono);margin-left:auto">Lv ${s.min_level}+</small>`:''}</div>
       <div class="meta2"><span>${s.full?'<span style="color:var(--sell)">Full</span>':'<span style="color:var(--buy)">Open</span>'} · ${s.population||'—'}</span>
-        <span class="qbadge ${s.queue?'':'zero'}">${s.queue?('queue '+s.queue):'no queue'}</span></div>
+        <span class="badges2">${bossBadge(s)}<span class="qbadge ${s.queue?'':'zero'}">${s.queue?('queue '+s.queue):'no queue'}</span></span></div>
     </div>`).join("");
   el.classList.toggle("open", state.srvOpen);
   el.innerHTML=`
@@ -5711,6 +5878,7 @@ async function loadServers(){
         <span class="sb ${d.open?'sb-open':'sb-mut'}">${d.open} open</span>
         <span class="sb ${d.full?'sb-full':'sb-mut'}">${d.full} full</span>
         <span class="sb ${d.queue_total?'sb-queue':'sb-mut'}">${d.queue_total} queued</span>
+        ${d.boss_total?`<span class="sb sb-boss" data-tip="total players fighting the Spider Boss across all servers">🕷 ${d.boss_total} fighting</span>`:''}
       </div>
       <div class="srv-grid">${cards}</div>
     </div>`;
@@ -6306,6 +6474,7 @@ def main():
     threading.Thread(target=rollup_loop, daemon=True).start()           # daily metrics + prune (Substrate B)
     threading.Thread(target=merchant_snapshot_loop, daemon=True).start()  # merchant campaign history
     _spectate_hub.start()   # live-world spectator hub (connects per shard on demand)
+    _boss_census.start()    # boss-area census for the server bubble (resolves the region key)
     hosted = args.host not in ("127.0.0.1", "localhost")
     url = f"http://{'127.0.0.1' if not hosted else args.host}:{args.port}"
     print(f"Dashboard: {url}   (listing poll {args.interval}s · kintara min-gap "
