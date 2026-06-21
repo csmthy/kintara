@@ -546,6 +546,17 @@ def init_db() -> None:
             gold_stock INTEGER,
             note       TEXT
         );
+
+        -- LAST-SEEN player character. Populated opportunistically from spectate rosters
+        -- (Live World / player lookups — free, reuses data already fetched), so a player's
+        -- avatar/cosmetics/level/area still show on the Player page when they're offline.
+        CREATE TABLE IF NOT EXISTS player_seen (
+            name   TEXT PRIMARY KEY COLLATE NOCASE,
+            id     INTEGER, shard INTEGER, realm TEXT,
+            x REAL, z REAL, avg INTEGER, eq TEXT, bdg TEXT, php INTEGER,
+            outfit TEXT,                        -- JSON outfit blob
+            ts     INTEGER                      -- epoch ms last observed
+        );
         """
     )
 
@@ -2391,6 +2402,41 @@ class BossCensus:
 
 _boss_census = BossCensus()
 
+_seen_last = {}   # shard -> last persist ts (throttle player_seen writes)
+
+
+def record_seen(players, shard):
+    """Persist the last-seen character for each player in a spectate roster we just fetched
+    (free — no extra network). Throttled per shard so Live-World's ~2s polling doesn't hammer
+    the DB. Lets the Player page show an offline player's avatar/level/area + when last seen."""
+    if not players:
+        return
+    now = time.time()
+    if now - _seen_last.get(shard, 0) < 25:
+        return
+    _seen_last[shard] = now
+    try:
+        con = connect()
+        try:
+            ts = int(now * 1000)
+            rows = [(p.get("name"), p.get("id"), shard, p.get("realm"), p.get("x"), p.get("z"),
+                     p.get("avg"), p.get("eq"), p.get("bdg"), p.get("php"),
+                     json.dumps(p.get("outfit") or {}), ts)
+                    for p in players if p.get("name")]
+            if rows:
+                con.executemany(
+                    """INSERT INTO player_seen(name,id,shard,realm,x,z,avg,eq,bdg,php,outfit,ts)
+                       VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(name) DO UPDATE SET id=excluded.id,shard=excluded.shard,
+                         realm=excluded.realm,x=excluded.x,z=excluded.z,avg=excluded.avg,
+                         eq=excluded.eq,bdg=excluded.bdg,php=excluded.php,outfit=excluded.outfit,
+                         ts=excluded.ts""", rows)
+                con.commit()
+        finally:
+            con.close()
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # reconcile (testable offline)
@@ -4048,6 +4094,7 @@ def make_app():
         keep = ("id", "name", "x", "z", "ry", "y", "avg", "eq", "bdg",
                 "php", "mov", "act", "outfit", "pr", "realm")
         snap["players"] = [{k: p[k] for k in keep if k in p} for p in snap["players"]]
+        record_seen(snap["players"], shard)     # cache last-seen characters (throttled)
         realms = {k: {"l": v[0], "e": v[1]} for k, v in SPECTATE_REGIONS.items()}
         if _boss_census.region:                 # label the resolved boss area for grouping
             realms[_boss_census.region] = {"l": BOSS_LABEL[0], "e": BOSS_LABEL[1]}
@@ -4073,6 +4120,7 @@ def make_app():
             players = snap.get("players") or []
             if players:
                 ready += 1
+                record_seen(players, shard)     # cache last-seen characters (throttled)
             for p in players:
                 nm = p.get("name") or ""
                 if q in nm.lower():
@@ -4083,6 +4131,65 @@ def make_app():
         return jsonify({"ok": True, "q": q, "results": results,
                         "shards": list(SHARDS), "ready": ready,
                         "connected": connected})
+
+    @app.route("/api/player-live")
+    def player_live():
+        """Live character for the Player page: sweep all servers' spectate streams for the
+        name and return the FULL matched player (outfit/cosmetics, level, held item, badge,
+        HP, area, coords) + which server. Only works while they're online (spectate only
+        streams online players). Rosters fill over ~20s, so the client polls until found or
+        `ready`==12. On-demand only (fans out to all shards), like the Live-World search."""
+        q = (request.args.get("name") or "").strip().lower()
+        if not q:
+            return jsonify({"ok": False, "error": "name required"})
+        keep = ("id", "name", "x", "z", "ry", "y", "avg", "eq", "bdg",
+                "php", "mov", "act", "outfit", "pr", "realm")
+        ready = connected = 0
+        match = None
+        match_shard = None
+        exact = False
+        for shard in SHARDS:
+            _spectate_hub.request(shard)
+            snap = _spectate_hub.snapshot(shard)
+            if snap.get("connected"):
+                connected += 1
+            players = snap.get("players") or []
+            if players:
+                ready += 1
+                record_seen(players, shard)     # cache last-seen characters (throttled)
+            for p in players:
+                nm = (p.get("name") or "").lower()
+                if nm == q:
+                    match = {k: p[k] for k in keep if k in p}
+                    match_shard = shard
+                    exact = True
+                    break
+                if q in nm and match is None:
+                    match = {k: p[k] for k in keep if k in p}
+                    match_shard = shard
+            if exact:
+                break
+        # offline fallback: last-seen character from the cache, so the page still shows
+        # their avatar/level/area + when/where we last saw them.
+        last_seen = None
+        if match is None:
+            con = connect(readonly=True)
+            row = con.execute("SELECT * FROM player_seen WHERE name=? COLLATE NOCASE",
+                              (request.args.get("name", "").strip(),)).fetchone()
+            con.close()
+            if row:
+                try:
+                    outfit = json.loads(row["outfit"] or "{}")
+                except Exception:
+                    outfit = {}
+                last_seen = {"shard": row["shard"], "ts": row["ts"],
+                             "player": {"id": row["id"], "name": row["name"], "realm": row["realm"],
+                                        "x": row["x"], "z": row["z"], "avg": row["avg"],
+                                        "eq": row["eq"], "bdg": row["bdg"], "php": row["php"],
+                                        "outfit": outfit}}
+        return jsonify({"ok": True, "found": match is not None, "online": match is not None,
+                        "shard": match_shard, "player": match, "last_seen": last_seen,
+                        "ready": ready, "connected": connected, "shards": list(SHARDS)})
 
     @app.route("/api/property")
     def property_map():
@@ -4251,6 +4358,8 @@ def make_app():
             "sell": sell, "top_items": top_items, "recent": recent,
             "inventory": inv, "property": props,
             "wallet": wallet or None,
+            # live character (outfit/cosmetics, level, gear, location) comes from a separate
+            # on-demand /api/player-live spectate sweep — see the Player tab.
             # On-chain layer (KINS spent/earned, wheel spins, club, verification) is not wired
             # yet — it needs the live KINS mint + marketplace/treasury/wheel program addresses
             # captured from a sample transaction (see PLAYER_PAGE_PLAN.md). Surface a clear
@@ -4652,6 +4761,15 @@ td.isd{cursor:help}
 .pl-mansion{color:#e8b54a;border:1px solid #e8b54a55;background:#e8b54a14}
 .pl-house{color:#5aa9e6;border:1px solid #5aa9e655;background:#5aa9e614}
 .pl-trailer{color:#9b7bd8;border:1px solid #9b7bd855;background:#9b7bd814}
+.pl-char{margin-bottom:16px}
+.pl-charbody{display:flex;gap:18px;align-items:center;flex-wrap:wrap}
+.pl-avatar{flex:0 0 auto;width:118px;height:118px;display:grid;place-items:center;border-radius:14px;
+  background:radial-gradient(circle at 50% 35%,rgba(232,181,74,.12),transparent 70%),rgba(255,255,255,.03);
+  border:1px solid var(--line)}
+.pl-charinfo{flex:1 1 220px;min-width:0}
+.pl-charinfo .pl-row .pl-rn{flex:0 0 90px;color:var(--mut)}
+.pl-charinfo .pl-row span:last-child{color:#dbe5f0;text-align:right;margin-left:auto}
+.pl-online{color:var(--buy);font-weight:700}
 .pm-map{position:relative;border:1px solid var(--line);border-radius:16px;overflow:hidden;
   background:#15331c}
 .pm-map svg{display:block;width:100%;height:auto}
@@ -6893,6 +7011,51 @@ async function fetchPlayer(){
   try{ state.playerData=await (await fetch(`/api/player?name=${encodeURIComponent(state.playerName)}&wallet=${encodeURIComponent(state.playerWallet||'')}`)).json(); }
   catch(e){ if($("#plResult")) $("#plResult").innerHTML=`<div class="empty warn">Couldn't load player.</div>`; return; }
   renderPlayer();
+  if(state.playerData&&state.playerData.ok!==false) loadPlayerLive(state.playerData.name);
+}
+/* live character via the spectate stream (only while they're online). Polls until found
+   or all 12 servers have been swept. */
+async function loadPlayerLive(name){
+  const slot=$("#plLive"); if(!slot) return;
+  slot.innerHTML=`<div class="pl-panel pl-char"><div class="pl-h">Character</div><div class="empty">Searching all servers…</div></div>`;
+  let tries=0;
+  const tick=async()=>{
+    if(state.playerName!==name && (state.playerData||{}).name!==name) return;   // user moved on
+    if(TAB!=="player") return;
+    let d; try{ d=await (await fetch("/api/player-live?name="+encodeURIComponent(name))).json(); }catch(e){ return; }
+    const s=$("#plLive"); if(!s || TAB!=="player") return;
+    if(d&&d.found){ s.innerHTML=playerLiveCard(d); return; }
+    tries++;
+    if((d&&d.ready>=12) || tries>=14){ s.innerHTML=playerLiveCard(d||{found:false}); return; }
+    s.innerHTML=`<div class="pl-panel pl-char"><div class="pl-h">Character</div><div class="empty">Searching servers… ${d?(d.ready||0):0}/12</div></div>`;
+    setTimeout(tick,850);
+  };
+  tick();
+}
+function charCard(p, tag){
+  const o=p.outfit||{}, realm=realmInfo(p.realm||'world');
+  const row=(k,v)=>v?`<div class="pl-row"><span class="pl-rn">${k}</span><span>${v}</span></div>`:'';
+  return `<div class="pl-panel pl-char">
+    <div class="pl-h">Character <span class="mut">${tag}</span></div>
+    <div class="pl-charbody">
+      <div class="pl-avatar">${avatarSvg(o,104)}</div>
+      <div class="pl-charinfo">
+        ${row('Level', p.avg!=null?p.avg:null)}
+        ${row('Area', `${realm.e} ${esc(realm.l)}`)}
+        ${row('Holding', p.eq?esc(lbl(p.eq)):null)}
+        ${row('Badge', p.bdg?esc(badgeLabel(p.bdg)):null)}
+        ${row('HP', (p.php==null?100:p.php)+'%')}
+        ${o.aura!=null?row('Aura','✦ equipped'):''}
+        ${row('Position', `x ${(p.x||0).toFixed(1)}, z ${(p.z||0).toFixed(1)}`)}
+      </div>
+    </div></div>`;
+}
+function playerLiveCard(d){
+  if(d&&d.found) return charCard(d.player||{}, `<span class="pl-online">● live</span> · ${esc(serverName(d.shard))}`);
+  if(d&&d.last_seen){ const ls=d.last_seen;
+    return charCard(ls.player||{}, `last seen ${relAbs(ls.ts)} · ${esc(serverName(ls.shard))}`); }
+  return `<div class="pl-panel pl-char"><div class="pl-h">Character</div>
+    <div class="empty">Offline, and we haven't captured this character before. Live cosmetics/level/gear show when they're in-game (swept all 12 servers).</div></div>`;
 }
 function renderPlayer(){
   const d=state.playerData, r=$("#plResult"); if(!r||!d) return;
@@ -6945,7 +7108,7 @@ function renderPlayer(){
   const pr=(d.property||[]);
   const prop=pr.length?`<div class="pl-panel"><div class="pl-h">Property owned</div>
     <div class="pl-proprow">${pr.map(p=>`<span class="pl-prop pl-${p.kind}">${p.kind} #${p.num}${p.locked?' 🔒':''}</span>`).join('')}</div></div>`:'';
-  r.innerHTML=head+earned+`<div class="pl-grid">${items}${recent}${inventory}${prop}</div>`+oc;
+  r.innerHTML=head+`<div id="plLive"></div>`+earned+`<div class="pl-grid">${items}${recent}${inventory}${prop}</div>`+oc;
 }
 
 async function loadProperty(){

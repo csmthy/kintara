@@ -539,9 +539,12 @@ numbered by topic, not bar order.
    (+ optional **wallet**) → header (name, seller id, first seen), stat cards (**marketplace earned** in
    USD/$KINS, items sold, avg sale, gold earned, **active listings + ask value**; a *spent (buy side)* card
    marked pending on-chain), then panels for **top items sold**, **recent sales**, **active listings**, and
-   **property owned**. An **on-chain panel** is a clear pending state (KINS spent/earned, wheel spins,
-   Kintara Club, wallet verification) until the Solana program addresses are wired — see
-   `PLAYER_PAGE_PLAN.md`. All public/on-chain data — uninvasive.
+   **property owned**, plus a **character card** (`/api/player-live`) — their rendered avatar with
+   cosmetics, level, held item, badge, HP and area, swept from the spectate streams; shows **live** when
+   online, else their **last-seen** look (from the `player_seen` cache) tagged with when/where. An
+   **on-chain panel** is a clear pending state (KINS spent/earned, wheel spins, Kintara Club, wallet
+   verification) until the Solana program addresses are wired — see `PLAYER_PAGE_PLAN.md`. All
+   public/on-chain data — uninvasive.
 
 The bubble also shows a **🕷 boss count per server** (players in the new level-20 Venomweaver boss area
 right now) and a **🕷 N fighting** total in the header — from `BossCensus` (see below).
@@ -644,6 +647,14 @@ sees the latest state at a glance.
   plan + on-chain design is in `PLAYER_PAGE_PLAN.md`, building on the existing `check_pump_rewards.py`
   Solana-RPC pattern). Buy-side "spent" is intentionally absent from the DB part (the kintara API doesn't
   expose buyers — that's exactly what the on-chain layer is for). Uninvasive: public + on-chain only.
+- **Live character on the Player page** (`GET /api/player-live?name=`): sweeps all 12 servers' spectate
+  streams for the name and returns the FULL matched player (outfit/cosmetics, level, held item, badge, HP,
+  area, coords) + server. The Player tab renders their **avatar** (`avatarSvg`) + live stats, polling until
+  found or all servers swept. On-demand fan-out like the Live-World search. **Offline fallback:** the
+  spectate rosters seen during any Live-World / player lookup are cached into a **`player_seen`** table
+  (`record_seen()`, throttled per shard — free, reuses fetched data); when a player isn't online,
+  `/api/player-live` returns their **last-seen character + when/where** so the avatar/level/area still
+  show, tagged "last seen Xh ago · Server N".
 
 - **Rare-sale capture hardening (Venom Weaver Mount $800 miss):** official Kintara `/stats` had a
   `mount_venom_weaver` token sale for `$800`, but Recent Sales could still be empty if the listing sold
