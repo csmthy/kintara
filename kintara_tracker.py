@@ -6350,11 +6350,16 @@ function listingControls(){
     <label class="meta"><input type="checkbox" id="auto" ${fstate.auto?'checked':''}> auto</label>
   </div><div id="ltable"></div>`;
 }
-const fstate={q:"",currency:"all",category:"all",sort:"latest",auto:true};
+const fstate={q:"",currency:"all",category:"all",sort:"latest",auto:true,seq:0};
 let ltableOwner=null;   // which tab ('live'/'removed') currently owns the shared #ltable + controls
+let _qDeb=null;         // debounce timer for the search box
 function bindListingControls(reload){
   defineMorph($("#ltable"));   // flicker-free table refreshes
-  $("#q").addEventListener("input",e=>{fstate.q=e.target.value;reload();});
+  // Debounce typing: fire one fetch ~180ms after the user stops, not per keystroke —
+  // otherwise fast typing spawns a fetch per letter and their responses race (see the
+  // seq guard in loadLive/loadRemoved) causing flicker / a stale response blanking the table.
+  $("#q").addEventListener("input",e=>{fstate.q=e.target.value;
+    clearTimeout(_qDeb); _qDeb=setTimeout(reload,180);});
   $("#currency").addEventListener("change",e=>{fstate.currency=e.target.value;reload();});
   $("#category").addEventListener("change",e=>{fstate.category=e.target.value;reload();});
   $("#sort").addEventListener("change",e=>{fstate.sort=e.target.value;reload();});
@@ -6375,8 +6380,9 @@ async function loadLive(){
   // Sales feed share #ltable + the filter bar, so switching between them must rebind).
   if(!$("#ltable") || ltableOwner!=="live"){ await loadItems();
     $("#view").innerHTML=listingControls(); ltableOwner="live"; bindListingControls(loadLive); }
+  const myseq=++fstate.seq;   // tag this request; only the latest is allowed to render
   const rows=await (await fetch("/api/current?"+lqs())).json();
-  if(TAB!=="live" || !$("#ltable")) return;   // tab changed mid-fetch — don't clobber the other table
+  if(TAB!=="live" || !$("#ltable") || myseq!==fstate.seq) return;   // tab changed or a newer fetch superseded this one — don't clobber
   $("#ltable").innerHTML = !rows.length
     ? `<div class="empty">No live listings match.</div>`
     : `<table><thead><tr><th>item</th><th>seller</th><th class="num">qty</th>
@@ -6403,8 +6409,9 @@ function salePrice(r){ return saleAmt(r); }   // back-compat alias
 async function loadRemoved(){   // "Sales feed" tab — ACTUAL completed sales (rich rows)
   if(!$("#ltable") || ltableOwner!=="removed"){ await loadItems();
     $("#view").innerHTML=listingControls(); ltableOwner="removed"; bindListingControls(loadRemoved); }
+  const myseq=++fstate.seq;   // tag this request; only the latest is allowed to render
   const rows=await (await fetch("/api/sales-feed?"+lqs())).json();
-  if(TAB!=="removed" || !$("#ltable")) return;   // tab changed mid-fetch — don't clobber the other table
+  if(TAB!=="removed" || !$("#ltable") || myseq!==fstate.seq) return;   // tab changed or a newer fetch superseded this one — don't clobber
   salesCoverage();   // cross-check vs the in-game number (async, fills the badge when ready)
   $("#ltable").innerHTML = (!rows.length
     ? `<div class="empty">No sales recorded yet. This feed logs <b>actual completed sales</b> — each matched to the listing that vanished, so you see the real stack size, total paid, seller and how long it sat. Cancellations are excluded. Fills in going forward.</div>`
