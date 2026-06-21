@@ -330,6 +330,13 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   `sales_events`, so an item discovered only through official sales stats can still appear in the Index.
 - `GET /api/merchant-history` — each campaign resource's donation **% over time** (and the overall %),
   from `merchant_snapshots`. Drives the click-to-expand chart on each Merchant resource bar.
+- `GET /api/player?name=&wallet=` — one aggregated **player profile** (the Player tab). From our DB
+  (keyed on `seller_name`, case-insensitive): **marketplace earned** (sell side — sales count, units,
+  gross in gold/USD/$KINS, avg sale), **top items sold**, **recent sales**, **active listings / inventory
+  value + category mix**, and **first seen**. Plus **property owned** (live `fetch_property_status()` match
+  on owner name). Echoes `wallet`. The **on-chain block is a pending stub** (`onchain.available=false`) —
+  KINS spent/earned, wheel spins, Kintara Club + wallet verification need the Solana program addresses
+  captured first (see `PLAYER_PAGE_PLAN.md`). All data is public/on-chain — uninvasive by design.
 - `GET /api/sales-audit?days=` — self-check of the sales feed vs the **hard in-game `/stats` count**:
   `in_game_total`, `logged_total`, `missing_total`, `item_days_behind`, and the `gaps` we're behind on.
   Drives the Sales-feed coverage line; the backfill loop keeps `missing_total` ~0.
@@ -528,6 +535,13 @@ numbered by topic, not bar order.
    for an owner card (name + id, owned/for-sale,
    locked/open, how many properties they hold, their live marketplace listing count + value,
    and a "view their listings" jump). Polled ~30s.
+8. **Player** — a per-player profile (`/api/player`, `loadPlayer`/`renderPlayer`). Type a player **name**
+   (+ optional **wallet**) → header (name, seller id, first seen), stat cards (**marketplace earned** in
+   USD/$KINS, items sold, avg sale, gold earned, **active listings + ask value**; a *spent (buy side)* card
+   marked pending on-chain), then panels for **top items sold**, **recent sales**, **active listings**, and
+   **property owned**. An **on-chain panel** is a clear pending state (KINS spent/earned, wheel spins,
+   Kintara Club, wallet verification) until the Solana program addresses are wired — see
+   `PLAYER_PAGE_PLAN.md`. All public/on-chain data — uninvasive.
 
 The bubble also shows a **🕷 boss count per server** (players in the new level-20 Venomweaver boss area
 right now) and a **🕷 N fighting** total in the header — from `BossCensus` (see below).
@@ -618,6 +632,18 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Player profile page (v1 — DB-backed):** new **Player** tab + `GET /api/player?name=&wallet=` that
+  aggregates everything we publicly know about a player into one profile: marketplace **earned** (sell
+  side — count/units/gross in gold/USD/$KINS/avg from `sales_events`), **top items sold**, **recent
+  sales**, **active listings + inventory value + category mix** (`listings`), **first seen**, and
+  **property owned** (live property-feed owner match). Lookup is by in-game name (case-insensitive);
+  `wallet` is accepted + echoed. The **on-chain layer is a clearly-marked pending stub**
+  (`onchain.available=false`) — KINS spent/earned, wheel spins, Kintara Club and wallet verification
+  need the Solana program/mint/treasury addresses captured from a sample transaction first (the build
+  plan + on-chain design is in `PLAYER_PAGE_PLAN.md`, building on the existing `check_pump_rewards.py`
+  Solana-RPC pattern). Buy-side "spent" is intentionally absent from the DB part (the kintara API doesn't
+  expose buyers — that's exactly what the on-chain layer is for). Uninvasive: public + on-chain only.
 
 - **Rare-sale capture hardening (Venom Weaver Mount $800 miss):** official Kintara `/stats` had a
   `mount_venom_weaver` token sale for `$800`, but Recent Sales could still be empty if the listing sold

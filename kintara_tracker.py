@@ -4139,6 +4139,127 @@ def make_app():
                         "counts": {k: sum(1 for p in plots if p["kind"] == k)
                                    for k in ("mansion", "house", "trailer")}})
 
+    @app.route("/api/player")
+    def player():
+        """Aggregate everything we publicly know about one player into a single profile:
+        marketplace earned (sell side) + active listings/inventory from our DB, property
+        owned (live), and a placeholder for the on-chain layer (KINS spent/earned, wheel
+        spins) which needs the on-chain program addresses configured — see PLAYER_PAGE_PLAN.md.
+        Lookup is by in-game name (case-insensitive); `wallet` is accepted + echoed for the
+        on-chain section. All data is public / on-chain — uninvasive by design."""
+        name = (request.args.get("name") or "").strip()
+        wallet = (request.args.get("wallet") or "").strip()
+        if not name:
+            return jsonify({"ok": False, "error": "name required"}), 400
+        con = connect(readonly=True)
+        try:
+            rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
+            kp = current_kins_usd()
+            # canonical name + seller id (most-used id for this name)
+            idrow = con.execute(
+                """SELECT seller_name, seller_id, COUNT(*) n FROM listings
+                   WHERE seller_name = ? COLLATE NOCASE
+                   GROUP BY seller_id ORDER BY n DESC LIMIT 1""", (name,)).fetchone()
+            canon = idrow["seller_name"] if idrow else name
+            seller_id = idrow["seller_id"] if idrow else None
+            found = idrow is not None
+
+            def usd_of(total, currency):
+                if total is None:
+                    return 0.0
+                return total if currency == "token" else (total * rate if rate else 0.0)
+
+            # --- marketplace EARNED (sell side) from sales_events (seller_name) ---
+            sell = {"count": 0, "units": 0, "gross_gold": 0.0, "gross_token_usd": 0.0,
+                    "gross_usd": 0.0}
+            for r in con.execute(
+                    """SELECT currency, COUNT(*) n, COALESCE(SUM(qty),0) u,
+                              COALESCE(SUM(total),0) g
+                       FROM sales_events WHERE seller_name = ? COLLATE NOCASE
+                       GROUP BY currency""", (canon,)):
+                sell["count"] += r["n"]
+                sell["units"] += r["u"]
+                if r["currency"] == "gold":
+                    sell["gross_gold"] += r["g"] or 0
+                else:
+                    sell["gross_token_usd"] += r["g"] or 0
+                sell["gross_usd"] += usd_of(r["g"], r["currency"])
+            sell["gross_kins"] = (sell["gross_usd"] / kp) if kp else None
+            sell["avg_sale_usd"] = (sell["gross_usd"] / sell["count"]) if sell["count"] else None
+            # top items sold (by USD)
+            by_item = []
+            for r in con.execute(
+                    """SELECT item_type, currency, COALESCE(SUM(qty),0) u,
+                              COALESCE(SUM(total),0) g, COUNT(*) n
+                       FROM sales_events WHERE seller_name = ? COLLATE NOCASE
+                       GROUP BY item_type, currency""", (canon,)):
+                by_item.append({"item_type": r["item_type"], "units": r["u"],
+                                "sales": r["n"], "usd": usd_of(r["g"], r["currency"])})
+            agg_item = {}
+            for x in by_item:
+                a = agg_item.setdefault(x["item_type"], {"item_type": x["item_type"],
+                                        "label": item_label(x["item_type"]),
+                                        "units": 0, "sales": 0, "usd": 0.0})
+                a["units"] += x["units"]; a["sales"] += x["sales"]; a["usd"] += x["usd"]
+            top_items = sorted(agg_item.values(), key=lambda a: -a["usd"])[:12]
+            # recent sales
+            recent = [dict(r) for r in con.execute(
+                """SELECT item_type, currency, qty, price, total, day, ts FROM sales_events
+                   WHERE seller_name = ? COLLATE NOCASE ORDER BY ts DESC LIMIT 15""", (canon,))]
+            for r in recent:
+                r["label"] = item_label(r["item_type"])
+
+            # --- active listings / current inventory ---
+            inv = {"count": 0, "ask_usd": 0.0, "items": [], "categories": {}}
+            rclause, rparam = _buyable_clause()
+            for r in con.execute(
+                    f"""SELECT item_type, category, currency, per_unit, quantity, price_gold, price_usd
+                        FROM listings WHERE active=1 AND seller_name = ? COLLATE NOCASE
+                        AND per_unit IS NOT NULL""", (canon,)):
+                u = usd_of(r["per_unit"], r["currency"]) * (r["quantity"] or 1)
+                inv["count"] += 1
+                inv["ask_usd"] += u
+                cat = r["category"] or categorize(r["item_type"])
+                inv["categories"][cat] = inv["categories"].get(cat, 0) + 1
+                inv["items"].append({"item_type": r["item_type"], "label": item_label(r["item_type"]),
+                                     "qty": r["quantity"], "currency": r["currency"],
+                                     "price": r["price_gold"] if r["currency"] == "gold" else r["price_usd"],
+                                     "usd": u})
+            inv["items"].sort(key=lambda x: -x["usd"])
+            inv["items"] = inv["items"][:25]
+            first_seen = con.execute(
+                "SELECT MIN(created_at) c, MIN(first_seen) f FROM listings WHERE seller_name = ? COLLATE NOCASE",
+                (canon,)).fetchone()
+        finally:
+            con.close()
+
+        # --- property owned (live feed) ---
+        props = []
+        try:
+            raw = fetch_property_status()
+            for kind, key in (("mansion", "mansions"), ("house", "houses"), ("trailer", "trailers")):
+                for num, info in (raw.get(key) or {}).items():
+                    if (info.get("ownerName") or "").lower() == canon.lower():
+                        props.append({"kind": kind, "num": num, "locked": bool(info.get("locked"))})
+        except Exception:
+            pass
+
+        return jsonify({
+            "ok": True, "name": canon, "found": found, "seller_id": seller_id,
+            "first_seen": (first_seen["c"] or first_seen["f"]) if first_seen else None,
+            "gold_rate": rate, "kins_price": kp,
+            "sell": sell, "top_items": top_items, "recent": recent,
+            "inventory": inv, "property": props,
+            "wallet": wallet or None,
+            # On-chain layer (KINS spent/earned, wheel spins, club, verification) is not wired
+            # yet — it needs the live KINS mint + marketplace/treasury/wheel program addresses
+            # captured from a sample transaction (see PLAYER_PAGE_PLAN.md). Surface a clear
+            # pending state rather than fake numbers.
+            "onchain": {"available": False,
+                        "note": "On-chain stats (KINS spent/earned, wheel spins, Kintara Club) "
+                                "need the Solana program addresses configured — see PLAYER_PAGE_PLAN.md."},
+        })
+
     return app
 
 
@@ -4498,6 +4619,39 @@ td.isd{cursor:help}
 .pm-sw{width:13px;height:13px;border-radius:4px;display:inline-block;border:1px solid rgba(255,255,255,.2)}
 .pm{display:grid;grid-template-columns:1.4fr .9fr;gap:18px;align-items:start}
 @media(max-width:980px){.pm{grid-template-columns:1fr}}
+/* ===== player profile ===== */
+.pl-search{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:8px}
+.pl-search input{flex:1 1 200px;min-width:0}
+.pl-note{color:var(--mut);font:12.5px var(--ui);margin-bottom:16px}
+.pl-head{display:flex;align-items:center;gap:14px;flex-wrap:wrap;margin-bottom:14px}
+.pl-name{font:800 26px 'Cinzel',serif;color:var(--gold2);letter-spacing:.03em}
+.pl-meta{color:var(--mut);font:12px var(--mono)}
+.pl-wallet{margin-left:auto;font:12px var(--mono);color:#9fb1c8;border:1px solid var(--line);
+  border-radius:999px;padding:5px 11px;background:rgba(255,255,255,.03)}
+.pl-unv{color:var(--sell);font-weight:600}
+.pl-cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:10px;margin-bottom:16px}
+.pl-stat{border:1px solid var(--line);border-radius:12px;padding:12px 14px;
+  background:linear-gradient(180deg,rgba(255,255,255,.035),rgba(255,255,255,.01))}
+.pl-k{color:var(--mut);font:600 10px 'Fredoka';letter-spacing:.04em;text-transform:uppercase}
+.pl-v{color:var(--ink);font:800 20px 'Fredoka';margin-top:3px}
+.pl-sub2{color:#6f86a6;font:11px var(--mono);margin-top:2px}
+.pl-pending{color:var(--gold2);font-size:14px} .pl-pend{color:#9fb1c8;font:13px var(--ui);line-height:1.5}
+.pl-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+@media(max-width:760px){.pl-grid{grid-template-columns:1fr}}
+.pl-panel{border:1px solid var(--line);border-radius:14px;padding:14px 16px;
+  background:linear-gradient(180deg,rgba(25,38,58,.4),rgba(15,24,40,.2))}
+.pl-pendingpanel{margin-top:14px;border-style:dashed}
+.pl-h{font:700 12px 'Cinzel',serif;letter-spacing:.06em;color:var(--gold2);text-transform:uppercase;margin-bottom:9px}
+.pl-h .mut{font:400 11px var(--ui);text-transform:none;letter-spacing:0}
+.pl-row{display:flex;align-items:baseline;gap:10px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05);font:13px 'Fredoka'}
+.pl-rn{flex:1 1 auto;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:#dbe5f0}
+.pl-row .usd{color:var(--buy);font-weight:700} .pl-row .gold{color:var(--gold2);font-weight:700}
+.pl-row .ll-sel{color:#7f93ad;font-size:11.5px}
+.pl-proprow{display:flex;gap:8px;flex-wrap:wrap}
+.pl-prop{font:600 12px 'Fredoka';border-radius:8px;padding:4px 10px;text-transform:capitalize}
+.pl-mansion{color:#e8b54a;border:1px solid #e8b54a55;background:#e8b54a14}
+.pl-house{color:#5aa9e6;border:1px solid #5aa9e655;background:#5aa9e614}
+.pl-trailer{color:#9b7bd8;border:1px solid #9b7bd855;background:#9b7bd814}
 .pm-map{position:relative;border:1px solid var(--line);border-radius:16px;overflow:hidden;
   background:#15331c}
 .pm-map svg{display:block;width:100%;height:auto}
@@ -4878,6 +5032,7 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
     <div class="tab" data-t="merchant">Merchant</div>
     <div class="tab" data-t="world">Live World</div>
     <div class="tab" data-t="props">Property Map</div>
+    <div class="tab" data-t="player">Player</div>
   </div>
   <div id="view"></div>
 </main>
@@ -4891,6 +5046,7 @@ const state={dir:"gold_to_kins", fee:0, goldItem:null, items:[], cats:[], labels
   catOff:new Set(), profitableOnly:false, soldOnly:false, search:"", minQty:0, viewSet:[],
   histItem:null, histCur:"token", histCat:"all", histSort:"most", histOpen:null, histWindow:1,
   goldMode:"gold_usd", goldRange:"1D", srvOpen:false, mintQty:1, merchResOpen:null, salesCov:"",
+  playerName:"", playerWallet:"", playerData:null,
   liveShard:1, liveSel:null, liveSearch:"", liveSearchBusy:false, liveSearchStatus:"", propSel:null, servers:[]};
 
 /* Commodities (materials/potions/food) trade in bulk — a single unit is a fraction of a
@@ -6715,6 +6871,83 @@ async function selectPlayer(){
 }
 
 let PROP=null;
+/* ---------------- player profile ---------------- */
+function loadPlayer(){
+  $("#view").innerHTML=`<div class="pl">
+    <div class="pl-search">
+      <input id="plName" placeholder="player name…" value="${esc(state.playerName||'')}" autocomplete="off">
+      <input id="plWallet" placeholder="Solana wallet (optional)" value="${esc(state.playerWallet||'')}" autocomplete="off">
+      <button class="go" id="plGo">View profile</button>
+    </div>
+    <div class="pl-note">Everything KinScan knows about a player — public marketplace activity, property, and (soon) on-chain stats. Uninvasive: public &amp; on-chain data only.</div>
+    <div id="plResult">${state.playerData?'':'<div class="empty">Enter a player name to build their profile.</div>'}</div>
+  </div>`;
+  const go=()=>{ state.playerName=$("#plName").value.trim(); state.playerWallet=$("#plWallet").value.trim(); fetchPlayer(); };
+  $("#plGo").onclick=go;
+  ["plName","plWallet"].forEach(id=>$("#"+id).addEventListener("keydown",e=>{ if(e.key==="Enter") go(); }));
+  if(state.playerData) renderPlayer();
+}
+async function fetchPlayer(){
+  if(!state.playerName){ const r=$("#plResult"); if(r) r.innerHTML=`<div class="empty">Enter a player name.</div>`; return; }
+  const r=$("#plResult"); if(r) r.innerHTML=skel(5);
+  try{ state.playerData=await (await fetch(`/api/player?name=${encodeURIComponent(state.playerName)}&wallet=${encodeURIComponent(state.playerWallet||'')}`)).json(); }
+  catch(e){ if($("#plResult")) $("#plResult").innerHTML=`<div class="empty warn">Couldn't load player.</div>`; return; }
+  renderPlayer();
+}
+function renderPlayer(){
+  const d=state.playerData, r=$("#plResult"); if(!r||!d) return;
+  if(d.ok===false){ r.innerHTML=`<div class="empty warn">${esc(d.error||'Error')}</div>`; return; }
+  const s=d.sell||{};
+  if(!d.found && !(s.count>0) && !(d.property||[]).length){
+    r.innerHTML=`<div class="empty">No public activity found for "<b>${esc(d.name)}</b>". Names are case-insensitive — check the spelling.</div>`; return; }
+  const usd=v=> v==null?'—':'$'+(v>=1?Number(v).toLocaleString(undefined,{maximumFractionDigits:2}):(+Number(v).toPrecision(3)));
+  const kins=v=> v==null?'—':(v>=1?Math.round(v).toLocaleString():(+v.toFixed(2)))+' $KINS';
+  const stat=(k,v,sub)=>`<div class="pl-stat"><div class="pl-k">${k}</div><div class="pl-v">${v}</div>${sub?`<div class="pl-sub2">${sub}</div>`:''}</div>`;
+  // header
+  const wallet=d.wallet?`<span class="pl-wallet" data-tip="unverified — on-chain link not yet wired">🔗 ${esc(d.wallet.slice(0,4))}…${esc(d.wallet.slice(-4))} <span class="pl-unv">unverified</span></span>`:'';
+  const head=`<div class="pl-head">
+    <div class="pl-id"><div class="pl-name">${esc(d.name)}</div>
+      <div class="pl-meta">${d.seller_id!=null?`id ${d.seller_id} · `:''}${d.first_seen?'first seen '+relAbs(d.first_seen):''}</div></div>
+    ${wallet}</div>`;
+  // earned + (pending) spent
+  const earned=`<div class="pl-cards">
+    ${stat('Marketplace earned', usd(s.gross_usd), kins(s.gross_kins))}
+    ${stat('Items sold', (s.units||0).toLocaleString(), (s.count||0).toLocaleString()+' sales')}
+    ${stat('Avg sale', usd(s.avg_sale_usd))}
+    ${stat('In gold', (s.gross_gold?Math.round(s.gross_gold).toLocaleString()+'g':'—'), 'gold-priced sales')}
+    ${stat('Spent (buy side)', '<span class="pl-pending">on-chain</span>', 'needs wallet + on-chain')}
+    ${stat('Active listings', (d.inventory&&d.inventory.count||0).toLocaleString(), usd(d.inventory&&d.inventory.ask_usd)+' ask value')}
+  </div>`;
+  // on-chain pending panel
+  const oc=`<div class="pl-panel pl-pendingpanel"><div class="pl-h">On-chain (Solana)</div>
+    <div class="pl-pend">⛓ KINS spent &amp; earned, wheel spins, and Kintara Club aren't wired yet — they need the on-chain program addresses configured (see PLAYER_PAGE_PLAN.md). ${d.wallet?'Wallet on file: <b>'+esc(d.wallet)+'</b>.':'Add a wallet above once on-chain is live.'}</div></div>`;
+  // top items sold
+  const ti=(d.top_items||[]);
+  const items=ti.length?`<div class="pl-panel"><div class="pl-h">Top items sold</div>
+    <div class="pl-list">${ti.map(x=>`<div class="pl-row"><span class="pl-rn">${esc(x.label)}</span>
+      <span class="mut">${x.units.toLocaleString()}× · ${x.sales} sale${x.sales===1?'':'s'}</span>
+      <span class="usd">${usd(x.usd)}</span></div>`).join('')}</div></div>`:'';
+  // recent sales
+  const rec=(d.recent||[]);
+  const recent=rec.length?`<div class="pl-panel"><div class="pl-h">Recent sales</div>
+    <div class="pl-list">${rec.map(x=>`<div class="pl-row"><span class="pl-rn">${esc(x.label)}</span>
+      <span class="mut">${x.qty!=null?x.qty.toLocaleString()+'×':''}</span>
+      <span class="${x.currency==='gold'?'gold':'usd'}">${saleAmt({currency:x.currency,total:x.total,price:x.price,qty:x.qty})}</span>
+      <span class="ll-sel" data-tip="${new Date(x.ts).toLocaleString()}">${relAbs(x.ts)}</span></div>`).join('')}</div></div>`:'';
+  // active inventory
+  const inv=d.inventory||{}; const ivit=(inv.items||[]);
+  const cats=Object.entries(inv.categories||{}).sort((a,b)=>b[1]-a[1]).map(([k,n])=>`${k} ${n}`).join(' · ');
+  const inventory=ivit.length?`<div class="pl-panel"><div class="pl-h">Active listings <span class="mut">${cats}</span></div>
+    <div class="pl-list">${ivit.map(x=>`<div class="pl-row"><span class="pl-rn">${esc(x.label)}</span>
+      <span class="mut">${x.qty>1?x.qty.toLocaleString()+'×':''}</span>
+      <span class="${x.currency==='gold'?'gold':'usd'}">${x.currency==='gold'?(+Number(x.price).toPrecision(4))+'g':'$'+Number(x.price)}</span></div>`).join('')}</div></div>`:'';
+  // property
+  const pr=(d.property||[]);
+  const prop=pr.length?`<div class="pl-panel"><div class="pl-h">Property owned</div>
+    <div class="pl-proprow">${pr.map(p=>`<span class="pl-prop pl-${p.kind}">${p.kind} #${p.num}${p.locked?' 🔒':''}</span>`).join('')}</div></div>`:'';
+  r.innerHTML=head+earned+`<div class="pl-grid">${items}${recent}${inventory}${prop}</div>`+oc;
+}
+
 async function loadProperty(){
   if(!document.querySelector('.pm') && TAB==="props") $("#view").innerHTML=skel(6);
   let d; try{ d=await (await fetch("/api/property")).json(); }
@@ -6812,6 +7045,7 @@ function render(){
   else if(TAB==="gold")loadGold();
   else if(TAB==="merchant")loadMerchant();
   else if(TAB==="world")loadWorld();
+  else if(TAB==="player")loadPlayer();
   else loadProperty();
 }
 function schedule(){
