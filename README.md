@@ -147,10 +147,13 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
   `/api/sales-history` and `/api/sales-summary` read from here (live `stats` fetch only
   on a cold miss, then stored).
 - **`stats_loop`** (background thread) is the only thing that calls `/stats`. It
-  refreshes one item+currency every ~0.4s, prioritized by liquidity (most-listed first),
-  re-touching each pair at most every ~30 min, writing to both `sales_daily` (archive)
-  and `item_stats` (last-day summary). Cold start fills the high-volume items within a
-  couple minutes.
+  refreshes one item+currency every ~0.4s from a **wide watchlist**: captured listings,
+  archived sales tables, cached item_stats, the baked in-game label catalog, and critical
+  new-drop items (currently Venomweaver loot). This is intentional: a rare item can list
+  and sell between listing polls, leaving no active-listing row, but `/stats` still knows
+  the sale happened. High-liquidity/urgent pairs are prioritized, but quiet known items are
+  still re-checked on the cold cadence, writing to both `sales_daily` (archive) and
+  `item_stats` (last-day summary).
 - **Gold price (ours)**: `gold_price_loop` writes one `gold_price` row every ~3 min from
   the local `listings` DB (no external call). This is the live gold series.
 - **Servers / merchant / property**: `/api/servers` cached ~30s, `/api/merchant` ~60s,
@@ -323,7 +326,8 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   (`floor_gold` = actual cheapest gold ask, `floor_usd` = cheapest USD-equivalent, `floor_kins`) via
   `item_floors()` — drives the Index tab's floor columns. `item_floors()` applies the **bulk-material
   rule**: for `material` items it ignores listings smaller than `MIN_BULK_QTY` (1000), so a "100 wood for
-  a pittance" dump doesn't set the floor.
+  a pittance" dump doesn't set the floor. The item set is the union of `listings`, `sales_daily`, and
+  `sales_events`, so an item discovered only through official sales stats can still appear in the Index.
 - `GET /api/merchant-history` — each campaign resource's donation **% over time** (and the overall %),
   from `merchant_snapshots`. Drives the click-to-expand chart on each Merchant resource bar.
 - `GET /api/sales-audit?days=` — self-check of the sales feed vs the **hard in-game `/stats` count**:
@@ -576,11 +580,12 @@ A site-wide quality-of-life pass that sits under every tab:
   poll, ~90s) logs reservations-that-completed and collectibles-that-vanished-without-relisting right
   away; a count-based `/stats` reconciler catches everything else (including the first sale of a day) and
   tops up to the authoritative count, deduped against the instant path. `/stats`-only sales still lag the
-  cold-poll cadence (~≤7 min for quiet items). When we can't match a confirmed sale to a captured listing
-  it shows as a `qty —`/`~est` row (price known, stack unknown). Gold sale prices inherit the `/stats`
-  2-dp rounding (coarse for cheap goods); USD/$KINS are exact. **Rare over-count:** if a collectible was
-  truly delisted (not sold) and never relisted, the instant path counts it once — acceptably rare vs the
-  cost of missing real sales.
+  cold-poll cadence (~≤7 min for quiet items). **Recent `/stats` rows are never startup-baselined away**
+  (`SALES_RECENT_BASE_DAYS`, default 3), because losing a recent rare sale is worse than showing an
+  estimated row. When we can't match a confirmed sale to a captured listing it shows as a `qty —`/`~est`
+  row (price known, stack unknown). Gold sale prices inherit the `/stats` 2-dp rounding (coarse for cheap
+  goods); USD/$KINS are exact. **Rare over-count:** if a collectible was truly delisted (not sold) and
+  never relisted, the instant path counts it once — acceptably rare vs the cost of missing real sales.
 - Profit is an upper bound (no buy orders to price against; you'd undercut to sell).
 - KINS pumped ~60× since launch, so KINS/gold over ALL legitimately spans ~45,000→~340
   (auto log-scale handles it — not a bug).
@@ -613,6 +618,18 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Rare-sale capture hardening (Venom Weaver Mount $800 miss):** official Kintara `/stats` had a
+  `mount_venom_weaver` token sale for `$800`, but Recent Sales could still be empty if the listing sold
+  between listing polls or if the first `/stats` sighting was treated as startup backlog. Fixes:
+  - `stats_loop` now polls a wide item universe (`stats_item_universe`) instead of only items captured in
+    `listings`: active/historical DB items + `ITEM_LABELS` + `ALWAYS_STATS_ITEMS` (Venomweaver loot), so
+    rare/new drops can be discovered from `/stats` even with no captured listing row.
+  - Recent official stats rows are forced to `base=0` (`SALES_RECENT_BASE_DAYS`, default 3) and backfilled
+    into `sales_events`; older days can still be startup-baselined to avoid replaying ancient backlog.
+    Backfilled prior-day events get a day-end timestamp so the global feed is not polluted as "just now."
+  - `/api/sales-summary` now builds the Index item list from `listings ∪ sales_daily ∪ sales_events`, so
+    stats-discovered items can appear even without a current listing. Added Venomweaver labels/icons/meta.
 
 - **Sales-feed filter/search fix + Index sort options:**
   - The Sales feed's search/currency/category filters were unreliable because **category and `q` were

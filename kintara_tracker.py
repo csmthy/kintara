@@ -73,6 +73,7 @@ STATS_STALE_COLD = _envi("STATS_STALE_COLD", 420) # re-check quiet items this of
 # After it, a first-sighting with sales is logged as real (e.g. day-rollover / new item).
 SALES_STARTUP_GRACE = _envi("SALES_STARTUP_GRACE", 600)
 SALES_BACKFILL_INTERVAL = _envi("SALES_BACKFILL_INTERVAL", 180)  # reconcile logged events to the in-game count
+SALES_RECENT_BASE_DAYS = _envi("SALES_RECENT_BASE_DAYS", 3)  # never treat recent /stats rows as throwaway startup backlog
 _app_start = time.time()
 KINTARA_MIN_GAP = _envf("KINTARA_MIN_GAP", 0.5)   # global min gap between ANY two kintara.gg hits
 KINTARA_BACKOFF = _envf("KINTARA_BACKOFF", 45)    # pause this long after a 429/403 (rate-limited)
@@ -229,7 +230,7 @@ MOUNT_SPEED = {  # +% move speed while riding (getLocalMoveSpeedFactor)
     "mount_eagle": 50, "mount_unicorn": 45, "mount_tralalero_tralala": 45,
     "mount_tiger": 40, "mount_harambe": 40, "mount_whale_gold": 35,
     "mount_whale": 30, "mount_crocodile": 30, "mount_dragon": 25,
-    "mount_spider": 25, "mount_wolf": 25, "mount_giraffe": 10,
+    "mount_spider": 25, "mount_venom_weaver": 25, "mount_wolf": 25, "mount_giraffe": 10,
     "mount_wooly_mammoth": 10,
 }
 # Mounts that rotate ONE-AT-A-TIME through the alchemist WEEKLY shop (gold price,
@@ -252,6 +253,7 @@ ITEM_DESC = {
     "mount_whale": "Summonable whale mount for crossing deep water quickly.",
     "mount_whale_gold": "Rare golden whale — same ride, faster movement.",
     "mount_spider": "Summonable spider mount for faster overland travel.",
+    "mount_venom_weaver": "A floating Venomweaver mount that hovers beneath you (25% speed boost).",
     "mount_wolf": "A loyal wolf mount tamed with roast chicken in Wilderness East.",
     "mount_tiger": "A fierce tiger mount for faster overland travel.",
     "mount_unicorn": "A radiant golden-maned unicorn for magical overland travel.",
@@ -303,6 +305,18 @@ ITEM_DESC = {
     "cosmetic_fnice_shoes": "Footwear with fire & ice shimmer.",
     "cosmetic_unc_sandals": "Brown slides + crisp white socks. Peak Unc energy.",
     "cosmetic_tan_line": "Tank-top tan-line dad bod — translucent tank, beer belly.",
+    "cosmetic_venomweaver_hat": "Venomweaver Helm — dark spider-knight armor with pulsing amethyst glow.",
+    "cosmetic_venomweaver_top": "Venomweaver Chestplate — dark spider-knight armor with pulsing amethyst glow.",
+    "cosmetic_venomweaver_pants": "Venomweaver Legguards — dark spider-knight armor with pulsing amethyst glow.",
+    "cosmetic_venomweaver_shoes": "Venomweaver Boots — dark spider-knight armor with pulsing amethyst glow.",
+}
+
+ALWAYS_STATS_ITEMS = {
+    "mount_venom_weaver",
+    "cosmetic_venomweaver_hat",
+    "cosmetic_venomweaver_top",
+    "cosmetic_venomweaver_pants",
+    "cosmetic_venomweaver_shoes",
 }
 # range -> (window seconds, bucket seconds). KINS sets the x-grid; gold is
 # interpolated onto it. Mirrors kintaragold's selector, at finer resolution.
@@ -321,6 +335,23 @@ HTTP_TIMEOUT = 20
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+
+
+def utc_day() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+
+def recent_sales_cutoff_day() -> str:
+    days = max(1, SALES_RECENT_BASE_DAYS)
+    return (datetime.now(timezone.utc) - _td(days=days - 1)).strftime("%Y-%m-%d")
+
+
+def day_end_ms(day: str):
+    try:
+        dt = datetime.fromisoformat(day).replace(tzinfo=timezone.utc)
+        return int((dt + _td(days=1, milliseconds=-1)).timestamp() * 1000)
+    except Exception:
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +584,14 @@ def init_db() -> None:
         con.execute("UPDATE sales_daily SET base=COALESCE(sales,0)")
         con.commit()
         set_setting(con, "sales_base_init", "1")
+    # Recent sales are the moat. If a restart/new deploy first sees today's (or
+    # yesterday's) /stats row, never hide it behind the cold-start baseline; turn
+    # the official count into sales_events, even if the listing sold between polls.
+    con.execute(
+        "UPDATE sales_daily SET base=0 WHERE date>=? AND COALESCE(base,0)>0",
+        (recent_sales_cutoff_day(),))
     con.execute("CREATE INDEX IF NOT EXISTS idx_l_sold ON listings(item_type,currency,sold_claimed,removed_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_se_item_day ON sales_events(item_type,currency,day)")
     con.execute(
         "UPDATE listings SET per_unit = unit_price*1.0/quantity "
         "WHERE per_unit IS NULL AND quantity > 0 AND unit_price IS NOT NULL")
@@ -686,6 +724,10 @@ ITEM_LABELS = {
     "cosmetic_unc_sandals": "Unc Sandals",
     "cosmetic_unc_shorts": "Unc Shorts",
     "cosmetic_usa_jersey": "USA Jersey",
+    "cosmetic_venomweaver_hat": "Venomweaver Helm",
+    "cosmetic_venomweaver_top": "Venomweaver Chestplate",
+    "cosmetic_venomweaver_pants": "Venomweaver Legguards",
+    "cosmetic_venomweaver_shoes": "Venomweaver Boots",
     "firepit_kit": "Firepit (Portable)",
     "fish": "Fish",
     "furniture_bed": "Oak Double Bed",
@@ -741,6 +783,7 @@ ITEM_LABELS = {
     "mount_giraffe": "Giraffe Mount",
     "mount_harambe": "Harambe Mount",
     "mount_spider": "Spider Mount",
+    "mount_venom_weaver": "Venom Weaver Mount",
     "mount_tiger": "Tiger Mount",
     "mount_tralalero_tralala": "Tralalero Tralala Mount",
     "mount_unicorn": "Unicorn Mount",
@@ -809,6 +852,7 @@ ICON_OVERRIDES = {
     "mount_crocodile": "mounts/crocodile.png", "mount_dragon": "mounts/dragon.png",
     "mount_eagle": "mounts/mount_eagle.png", "mount_giraffe": "mounts/giraffe.png",
     "mount_harambe": "mounts/harambe.png", "mount_spider": "mounts/spider.png",
+    "mount_venom_weaver": "mounts/mount_venom_weaver.png",
     "mount_tiger": "mounts/tiger.png", "mount_tralalero_tralala": "mounts/tralalero_tralala.png",
     "mount_unicorn": "mounts/unicorn.png", "mount_whale": "mounts/whale.png",
     "mount_whale_gold": "mounts/whale_gold.png", "mount_wolf": "mounts/wolf.png",
@@ -1202,14 +1246,14 @@ def _marginal_price(old_sales, old_avg, new_sales, new_avg, delta):
     return price
 
 
-def _log_sales(con, it, cur, d, n, marginal):
+def _log_sales(con, it, cur, d, n, marginal, observed_ts=None):
     """Log `n` sale events for (it,cur,day), attributing each to a recently-captured,
     unclaimed REMOVED listing of (it,cur) where possible (recovering the real stack qty,
     seller, price and time-on-market), ranked by how close its per-unit is to the marginal
     sold price so the genuinely-sold listing beats a coincidental cancellation. Any sales
     we can't match to a captured listing are logged as synthetic rows (qty/seller unknown)
     so the count still reconciles. Returns how many were matched to real listings."""
-    now = int(time.time() * 1000)
+    now = int(observed_ts if observed_ts is not None else time.time() * 1000)
     cutoff_iso = datetime.fromtimestamp(
         (now - SALE_MATCH_WINDOW_MS) / 1000, timezone.utc).isoformat()
     cands = con.execute(
@@ -1271,14 +1315,23 @@ def _archive_samples(con, it, cur, samples):
             "SELECT sales, avg_price, base FROM sales_daily WHERE item_type=? AND currency=? AND date=?",
             (it, cur, d)).fetchone()
         if prev is None:
-            # first sighting of this item-day. During the startup grace, treat whatever
-            # /stats already shows as pre-existing backlog (skip it); after the grace, a
-            # first sighting is a genuine new day / new item, so count from zero.
-            base = (new_sales or 0) if (time.time() - _app_start < SALES_STARTUP_GRACE) else 0
+            # First sighting of this item-day. Old days can be startup backlog, but
+            # recent days are the product: never baseline them away. If the official
+            # /stats counter says a recent sale happened, create a sales_event even
+            # when the listing sold between our listing polls.
+            if d >= recent_sales_cutoff_day():
+                base = 0
+            else:
+                base = new_sales or 0
             prev_sales, prev_avg = base, None
         else:
             base = prev["base"] or 0
             prev_sales, prev_avg = prev["sales"], prev["avg_price"]
+            if d >= recent_sales_cutoff_day() and base > 0:
+                base = 0
+                con.execute(
+                    "UPDATE sales_daily SET base=0 WHERE item_type=? AND currency=? AND date=?",
+                    (it, cur, d))
         if new_sales is not None:
             logged = con.execute(
                 "SELECT COUNT(*) c FROM sales_events WHERE item_type=? AND currency=? AND day=?",
@@ -1287,7 +1340,8 @@ def _archive_samples(con, it, cur, samples):
             if to_log > 0:
                 inc = new_sales - prev_sales            # true /stats rise (for the price back-out)
                 marg = _marginal_price(prev_sales, prev_avg, new_sales, new_avg, inc if inc > 0 else to_log)
-                _log_sales(con, it, cur, d, to_log, marg)
+                obs_ts = None if d == utc_day() else day_end_ms(d)
+                _log_sales(con, it, cur, d, to_log, marg, obs_ts)
         con.execute(
             """INSERT INTO sales_daily(item_type,currency,date,sales,avg_price,base)
                VALUES(?,?,?,?,?,?)
@@ -1401,7 +1455,8 @@ def backfill_sales(con, days=3):
             (r["item_type"], r["currency"], r["date"])).fetchone()["c"]
         miss = exp - lg
         if miss > 0:
-            _log_sales(con, r["item_type"], r["currency"], r["date"], miss, r["avg_price"])
+            obs_ts = None if r["date"] == utc_day() else day_end_ms(r["date"])
+            _log_sales(con, r["item_type"], r["currency"], r["date"], miss, r["avg_price"], obs_ts)
             fixed += miss
     return fixed
 
@@ -1436,6 +1491,24 @@ def _mark_stats_attempt(con, it, cur):
     con.commit()
 
 
+def stats_item_universe(con):
+    """Every item worth checking against official /stats.
+
+    Active listings alone are not enough: a rare drop can be listed and sold between
+    listing polls, leaving no row in `listings` but still incrementing /stats. Include
+    known label-catalog items and anything ever seen in our derived tables so /stats
+    can create the missing sales_daily/sales_events rows.
+    """
+    items = set(ITEM_LABELS) | set(ALWAYS_STATS_ITEMS)
+    for table in ("listings", "sales_daily", "sales_events", "item_stats"):
+        try:
+            for r in con.execute(f"SELECT DISTINCT item_type FROM {table} WHERE item_type IS NOT NULL"):
+                items.add(r["item_type"])
+        except sqlite3.Error:
+            pass
+    return sorted(items)
+
+
 def _next_stats_pair(con, stale_sec, retry_err_sec=300):
     """Pick the single most worthwhile item+currency to refresh next.
 
@@ -1445,7 +1518,7 @@ def _next_stats_pair(con, stale_sec, retry_err_sec=300):
     stale_sec, or a previous fetch errored (retry after retry_err_sec)."""
     liq = {r["item_type"]: r["n"] for r in con.execute(
         "SELECT item_type, COUNT(*) n FROM listings WHERE active=1 GROUP BY item_type")}
-    items = [r["item_type"] for r in con.execute("SELECT DISTINCT item_type FROM listings")]
+    items = stats_item_universe(con)
     cached = {(r["item_type"], r["currency"]): r for r in con.execute(
         "SELECT item_type,currency,day_sales,updated_at FROM item_stats")}
     # items with a freshly-vanished, not-yet-attributed listing are URGENT: a removal is
@@ -1500,9 +1573,9 @@ def _next_stats_pair(con, stale_sec, retry_err_sec=300):
                     removed_ts = now
                 # Urgent first, but use stats age before liquidity so constant wood
                 # churn cannot starve other items with fresh removals.
-                key = (1, age, removed_ts, liq.get(it, 0), never)
+                key = (2, age, removed_ts, liq.get(it, 0), never)
             else:
-                key = (0, liq.get(it, 0), never, age)
+                key = (1 if it in ALWAYS_STATS_ITEMS else 0, liq.get(it, 0), never, age)
             if best_key is None or key > best_key:
                 best_key, best = key, (it, cur)
     return best
@@ -3740,8 +3813,14 @@ def make_app():
         window = max(1, int(float(request.args.get("window", 1) or 1)))
         con = connect(readonly=True)
         ref = con.execute("SELECT MAX(date) d FROM sales_daily").fetchone()["d"]
-        items = [r["item_type"] for r in con.execute(
-            "SELECT DISTINCT item_type FROM listings ORDER BY item_type")]
+        items = sorted({
+            r["item_type"]
+            for r in con.execute(
+                """SELECT item_type FROM listings
+                   UNION SELECT item_type FROM sales_daily
+                   UNION SELECT item_type FROM sales_events""")
+            if r["item_type"]
+        })
         agg = {}
         if ref:
             start = (_date.fromisoformat(ref) - _td(days=window - 1)).isoformat()
