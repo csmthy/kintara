@@ -29,7 +29,10 @@ CLI flags: `--interval <s>` (listing poll seconds, default **90**), `--port <n>`
 
 **Env-tunable cadence + politeness** (defaults are 24/7-friendly; flags override env):
 `KINTARA_DB` (DB path — point at a volume when hosted), `PORT`, `KINTARA_HOST`,
-`POLL_INTERVAL` (90), `KINTARA_MIN_GAP` (0.5 — global min seconds between **any** two
+`POLL_INTERVAL` (90 — FULL-book poll, pages the whole book for removal detection),
+`FIRSTPAGE_INTERVAL` (3 — fast page-1 capture poll; 1 request, records newest listings
+before they can be created+sold inside a full-poll window — see "Two-tier polling"),
+`KINTARA_MIN_GAP` (0.5 — global min seconds between **any** two
 kintara.gg requests, a shared pacer across all loops ⇒ ≈ ≤2 req/s total),
 `KINTARA_BACKOFF` (45 — pause after a 429/403), `STATS_STALE_HOT`/`STATS_STALE_COLD`
 (120/900 — per-item stats refresh cadence). All kintara.gg requests go through
@@ -55,6 +58,22 @@ Artifacts created in the working dir (or `KINTARA_DB`'s dir): `kintara.db` (SQLi
 mode) and `icons_cache/` (downloaded item art). Both are safe to delete; they rebuild.
 `world_map.jpg` ships alongside the script (the isometric world map, served at
 `/worldmap.jpg`); keep it for the Property Map / Live World backdrops.
+
+**On-chain treasury ledger (optional/offline):** `build_treasury_index.py` downloads the
+Kintara treasury's KINS token-account history into `market_index.db` as a local ledger of
+KINS flows involving the treasury. It stores the full treasury ledger first, then classifies
+marketplace trades as a clean subset. Run with an archival RPC for full depth:
+`RPC=https://<helius-or-quicknode> python build_treasury_index.py`. Useful checks:
+`python build_treasury_index.py --probe`, `--summary`, `--kinds`, and `--wallet <address>`.
+Helius may reject JSON-RPC batch POSTs with HTTP 413/403; the script defaults to
+single-transaction calls (`BATCH=1`) and only batches if you explicitly set `BATCH>1`.
+Oversized/rejected batches are split automatically. Helius docs currently say
+`getTransactionsForAddress` requires Developer plan or higher; if unavailable, the script
+falls back to standard RPC pagination. Fallback mode defaults to the stable single-worker path
+(`TX_WORKERS=1`, `TX_CHUNK=50`, `RPC_RPS=5`), and 429s trigger a shared cooldown plus automatic
+RPS reduction down to `RPC_RPS_MIN=0.5`. Clean chunks gently raise the speed up to
+`RPC_RPS_MAX=8` (`RPC_RPS_STEP=0.5` every `RPC_RPS_UP_EVERY=4` chunks), so it can discover the key's
+usable ceiling. If a key is still hot, run `RPC_RPS=3 TX_WORKERS=1`.
 
 Everything lives in **`kintara_tracker.py`** (~2100 lines): Python backend (Flask +
 sqlite3 + requests) up top, the entire frontend as one embedded `INDEX_HTML` string
@@ -122,6 +141,7 @@ publicly exposed** (no kintara.gg supply/index API; game.js has no edition/suppl
 | **Gold USD price (ours)** | our own `listings` DB | Authoritative while the tracker runs. `gold_price_loop` snapshots one row into `gold_price` every ~3 min = `our_gold_price()` (avg per-gold USD of the 3 cheapest live token gold listings). Drives both the gold chart and the arbitrage gold rate. |
 | **Gold USD price history (fallback)** | (ripped from `kintaragold.xyz` HTML) | The page embeds `"history":[{t,price}]` + `"spotPriceUsd"` in its RSC payload (escaped, can straddle chunk boundaries — we regex the `t`/`price` pairs). Independent gold-USD series (~10-min, ~25 days), NOT derived from KINS. `fetch_kintara_gold_history()`, cached ~3 min. Used **only to backfill the stretch before our own `gold_price` data begins** (see `gold_series_for_chart()`) and as the gold-rate fallback when no live gold listings exist. |
 | **KINS/USD price history** | `GET api.geckoterminal.com/api/v2/networks/solana/pools/<POOL>/ohlcv/<tf>?aggregate=&limit=&currency=usd&token=base` | Pool `F42tZnKPavq1VUcrL6ymhc6YqVpt84fWwgzbNTv2wb3W` (KINS/SOL on pumpswap). `currency=usd` already converts SOL→USD (no separate SOL feed needed). Valid aggregates: minute 1/5/15, hour 1/4/12, day 1. **Rate-limits if hammered** — we cache (see below). |
+| **Treasury KINS ledger** | Solana JSON-RPC on the treasury's KINS token account | `build_treasury_index.py` resolves the KINS mint from the GeckoTerminal pool, finds the treasury wallet's KINS token account, pages Helius `getTransactionsForAddress` when available (full transactions, cursor pagination), otherwise falls back to `getSignaturesForAddress` + parallel `getTransaction`, decodes each transaction's KINS owner deltas, and writes every KINS balance-changing treasury row to `treasury_txns`. It classifies flow shapes (`marketplace_trade`, `treasury_income`, `treasury_payout`, etc.) and also writes proven 5% marketplace-fee trades to `market_txns`. Live sample: marketplace fee is 500 bps and recent marketplace rows use program `L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95`. Default treasury owner: `4zW4zuZb9rXpvw3cTYyGoQ2iHTtG9E17YpdeNUbwuQVt`; current token account: `FawpB6tqFaZybcQjUzHaSXFASmRRzxuFzTEsbGzxHFq4`. Use archival `SOLANA_RPC`/`RPC`; public RPC is okay for probes but not complete history. Helius 413/403 batch errors are avoided by default (`BATCH=1`) and handled by adaptive splitting when batching is enabled. Fallback throughput is governed by `TX_WORKERS`, `TX_CHUNK`, and `RPC_RPS`. |
 | **Server list** | `GET kintara.gg/api/servers` | `{ok, servers:[{id, name, populationLabel, full, queueLength, minLevel}]}`. Live population + queue per game server. Drives the top status bar. `fetch_servers()`, cached ~30s (last-good on failure). |
 | **Traveling-merchant state** | `GET kintara.gg/api/world/merchant-campaign` | kintara.gg's **own** public endpoint (no auth; the game client reads it the same way via `KINTARA_READ_FANOUT_ORIGIN`, also reachable at `ktra-server-b.onrender.com`). Returns `{ok, mode, wood, stone, coal, cooked_fish_meat, metal, goals:{...}, complete, goldTradeEnabled, goldStock, goldStockFull}`. **No overall %** — we compute it as the mean of the five per-resource (capped) percentages. `fetch_merchant()`, cached ~60s (last-good on failure). |
 | **Merchant gold-mint recipe** | (from `kintara.gg/game.js` `MERCHANT_TRADE_COST`) | `MERCHANT_RECIPE` = resources consumed per 1 gold minted: 2500 wood + 1500 stone + 700 coal + 30 cooked_fish_meat. This is now separate from the **donation campaign** resources (`MERCHANT_CAMPAIGN_RESOURCES`: wood, stone, coal, cooked fish, **metal**); the cost calculator follows the current gold-trade recipe, while the left progress tracker follows the live campaign goals. |
@@ -154,6 +174,22 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
   the sale happened. High-liquidity/urgent pairs are prioritized, but quiet known items are
   still re-checked on the cold cadence, writing to both `sales_daily` (archive) and
   `item_stats` (last-day summary).
+- **Two-tier listing poll (capture vs. removal):** listings are polled by *two* loops.
+  **`poll_loop`** (FULL, `POLL_INTERVAL`=90s) pages the **whole book** via
+  `fetch_all_active()` and calls `reconcile(..., complete=True)` — this is the only fetch
+  that sees every listing, so it's the only one that marks vanished listings removed. But
+  a full sweep is ~143 requests at PAGE=40 (~5700 listings) ≈ a minute-plus at ≤2 req/s, so
+  a listing **created *and* sold inside one sweep** was never captured — the sale could only
+  be recovered later as a count tick with no detail (a synthetic row). **`firstpage_loop`**
+  (`FIRSTPAGE_INTERVAL`=3s) closes that blind spot: it fetches **only page 1**
+  (`fetch_all_active(max_pages=1)`, newest-first = 1 request) and calls
+  `reconcile(..., complete=False, record_poll=False)` — **capture-only**: it upserts the
+  newest listings (so every creation is recorded almost immediately) but never marks
+  removals (it can't see the rest of the book) and writes no `polls` row (avoids 17k/day of
+  bloat). Net: we now log essentially every listing the moment it appears, and removal
+  detection still lives with the full poll. `fetch_all_active(max_pages=N)` returns
+  `complete=False` when it hits the page cap with book remaining, so a capped fetch never
+  makes `reconcile` mistake unseen pages for removed listings.
 - **Gold price (ours)**: `gold_price_loop` writes one `gold_price` row every ~3 min from
   the local `listings` DB (no external call). This is the live gold series.
 - **Servers / merchant / property**: `/api/servers` cached ~30s, `/api/merchant` ~60s,
@@ -231,6 +267,22 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
 - **`settings`** — key/value (notably `gold_item`).
 
 Schema migrations are handled inline in `init_db()` (ALTER + backfill for older DBs).
+
+Separate optional DB:
+- **`market_index.db` / `treasury_txns`** — offline Solana treasury ledger built by
+  `build_treasury_index.py`: one row per decoded KINS transaction where the treasury owner balance changes.
+  Key columns: `sig` PK, `slot`, `ts`, `kind`, `confidence`, `primary_wallet`, `buyer`, `seller`,
+  `gross_kins`, `seller_net_kins`, `fee_kins`, `fee_bps`, `treasury_delta_kins`, payer/receiver counts,
+  treasury owner/token account, program IDs, instruction types, and raw owner deltas JSON. Current coarse
+  `kind` values are shape-based (`marketplace_trade`, `treasury_income`, `treasury_payout`,
+  `treasury_income_with_receivers`, `non_treasury_transfer_seen_by_account`, `unknown_kins_treasury`);
+  spin wheel / Kintara Club / KINS purchase buckets should be refined from program IDs, instruction
+  shapes, and repeated amount patterns after a larger archival backfill.
+- **`market_index.db` / `market_txns`** — compatibility/fast subset: only the high-confidence
+  marketplace trades (`buyer` pays KINS, `seller` receives KINS, treasury receives a positive fee;
+  recent rows decode at 500 bps). Cursors live in `meta` per treasury token account (`newest_sig`,
+  `oldest_sig`, `done`). This DB is not yet required by `kintara_tracker.py`; it is the intended
+  replacement for slow per-wallet marketplace RPC scans after validation.
 
 ---
 
@@ -337,9 +389,24 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   (`active_market_unit_usd()` prefers the cheapest buyable listing from another seller, then recent fair
   value, then raw floor/ask as a last resort) because public listings can contain joke asks like 12k wood
   for 112k gold. Plus **property owned** (live `fetch_property_status()` match
-  on owner name). Echoes `wallet`. The **on-chain block is a pending stub** (`onchain.available=false`) —
-  KINS spent/earned, wheel spins, Kintara Club + wallet verification need the Solana program addresses
-  captured first (see `PLAYER_PAGE_PLAN.md`). All data is public/on-chain — uninvasive by design.
+  on owner name). Echoes `wallet`; the on-chain KINS stats load separately from `/api/wallet-onchain` so
+  the DB profile renders instantly. All data is public/on-chain — uninvasive by design.
+  > Marketplace treasury/fee wallet (identified on-chain — it skims ~5% off every trade, present in 137/140
+  > of a known wallet's KINS txns): **`4zW4zuZb9rXpvw3cTYyGoQ2iHTtG9E17YpdeNUbwuQVt`** (`KINS_TREASURY_DEFAULT`,
+  > env-overridable). A tx where it's a KINS participant = a marketplace buy/sell.
+- `GET /api/wallet-onchain?wallet=` — **all-time on-chain KINS stats** for a wallet (the Player page's
+  on-chain panel). Reads Solana via plain JSON-RPC (`_sol_rpc`, no `solders`): finds the wallet's KINS
+  token account(s), pages their signatures, decodes each tx's KINS delta (`_kins_delta` from
+  pre/postTokenBalances). Returns **earned/spent KINS + USD** (priced at each tx's day), **net**, tx count,
+  first/last activity, recent transfers, and a **marketplace earned/spent split** when `KINS_TREASURY` is
+  set. The **KINS mint auto-resolves** from the GeckoTerminal pool (`kins_mint()`) — no config. **Captures
+  the FULL history, not a fixed cap:** the scan backfills incrementally (a forward pass for new txns + a
+  backward chunk of `ONCHAIN_MAX_SIGS` older sigs per call) and persists progress + cursors in
+  `wallet_onchain`, so over a few loads (the Player page auto-repolls until `_done`) it reaches the wallet's
+  first KINS tx. The only depth limit is the RPC node's history — the default public node prunes old
+  `getTransaction`s and rate-limits, so **set `SOLANA_RPC` to an archival Helius/QuickNode URL to get
+  everything**. Cached ~10 min once `_done`. Wheel spins + Kintara Club still need their program addresses
+  (`PLAYER_PAGE_PLAN.md`).
 - `GET /api/sales-audit?days=` — self-check of the sales feed vs the **hard in-game `/stats` count**:
   `in_game_total`, `logged_total`, `missing_total`, `item_days_behind`, and the `gaps` we're behind on.
   Drives the Sales-feed coverage line; the backfill loop keeps `missing_total` ~0.
@@ -638,6 +705,76 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Fast first-page poller (kill the create-and-sell blind spot).** The listing poll was a single
+  full-book sweep every 90s (~143 requests), so a listing created *and* sold inside one sweep was never
+  captured and its sale degraded to a detail-less synthetic row. Added a second loop, `firstpage_loop`
+  (`FIRSTPAGE_INTERVAL`=3s, env-tunable, `--firstpage-interval`): fetches **only page 1**
+  (`fetch_all_active(max_pages=1)`, 1 request) and `reconcile(..., complete=False, record_poll=False)` —
+  **capture-only** (upserts newest listings, never marks removals, writes no `polls` row). `poll_loop`
+  (full, `complete=True`) still owns removal detection. `fetch_all_active()` gained a `max_pages` arg and
+  now returns `complete=False` when it hits the page cap with book remaining, and `reconcile()` gained
+  `record_poll` (default True). Result: nearly every listing is logged the instant it appears, so sales
+  match to real listing detail instead of becoming synthetic. See "Two-tier listing poll" above.
+- **Sales feed: hide synthetic rows + stop mis-attributed (wrong-price) sales.** Two fixes for fake/ugly
+  feed entries:
+  1. **No more "~est" rows.** Synthetic events (a sale confirmed via the /stats counter but with no captured
+     listing → no qty/seller) are now **excluded from `/api/sales-feed`** (`listing_id IS NOT NULL`). They're
+     still kept in the DB for the count reconciliation/audit, just not shown as individual feed rows.
+  2. **Two-factor sale verification.** The /stats counter already gates *whether* a sale happened
+     (cancellations don't move it); now a removed listing is only **attributed** to that sale if its
+     per-unit is within `SALE_MATCH_TOL` (±60%) of the actual marginal sold price — so a coincidental
+     cancellation at a wild price (e.g. a 50g helm on an 11.7g-average day) is no longer logged as the sale
+     (it falls through to a detail-less synthetic, which is hidden). New `purge_implausible_sales()` also
+     cleans **existing** mis-attributed rows (price >`SALE_OUTLIER_TOL`×/<1/tol the item-day avg), run once
+     on upgrade (`sales_purge_v2`) and every cycle in `sales_audit_loop` (purge → backfill, so the count
+     still reconciles). Verified: a 50g cancellation is left unmatched/synthetic+hidden, and an existing
+     50g row on an 11.7g-avg day is purged.
+
+- **Treasury KINS ledger builder:** broadened `build_treasury_index.py` from a marketplace-only indexer
+  into the raw on-chain treasury ledger Connor wanted. It now stores every decoded KINS balance-changing
+  transaction involving the treasury owner in `treasury_txns`, classifies the flow shape, stores program
+  IDs/instruction types/raw owner deltas for later reverse-engineering, and also maintains `market_txns`
+  as the high-confidence marketplace-trade subset. Includes `--probe`, `--summary`, `--kinds`, and
+  `--wallet` query modes. Live probe verified the current KINS mint (`Tqj8yFm...pump`), treasury token
+  account (`FawpB6...HFq4`), recent marketplace rows decoding at 500 bps, and the marketplace program
+  appearing as `L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95`. The downloader now tries Helius
+  `getTransactionsForAddress` first (`transactionDetails=full`, cursor pagination, `HELIUS_LIMIT=1000`)
+  and falls back to standard RPC if unavailable; after Helius returned HTTP 413/403 on batch POSTs, the
+  fallback path defaults to `BATCH=1` single transaction calls and recursively splits oversized/rejected
+  batches if `BATCH>1` is enabled. Fallback is now governed by `TX_WORKERS`, `TX_CHUNK`, and an adaptive
+  `RPC_RPS` throttle; after concurrency triggered persistent 429s, the defaults were moved back to the
+  stable single-worker ~5 tx/s path, then given AIMD-style speed discovery (clean chunks increase RPS,
+  429s cool down and back off). The run also does a final forward catch-up after backfill so transactions
+  created during the long download are captured before exit. This builds `market_index.db`; the web app is
+  not yet reading it.
+
+- **Wallet on-chain: full-history incremental backfill (no fixed cap).** `compute_wallet_onchain` was
+  reworked from a one-shot 2000-tx cap to an incremental scanner that reaches a wallet's **first** KINS
+  transaction: each call does a forward pass (new txns) + a backward chunk of `ONCHAIN_MAX_SIGS` older
+  sigs, folding into a persisted aggregate with `_newest`/`_oldest` cursors + `_done` flag (in
+  `wallet_onchain`). The Player page auto-repolls until `_done` (shows "backfilling… N so far"). Depth is
+  then limited only by the RPC node's history — **set `SOLANA_RPC` to an archival Helius/QuickNode endpoint
+  for the complete history** (the public node prunes old `getTransaction`s + rate-limits). Verified with
+  mocked RPC: chunked backfill aggregates the whole history with no dupes (count/earned/spent exact),
+  forward pass picks up only new txns without re-scanning, fresh-cache short-circuits, and it serves
+  partial progress on RPC failure.
+
+- **On-chain KINS wallet stats (Player page):** new `/api/wallet-onchain?wallet=` reads the Solana chain
+  via plain JSON-RPC (no `solders`) to capture a wallet's **all-time KINS transactions** — total earned &
+  spent (KINS + USD priced at each tx's day), net flow, tx count, first/last activity, recent transfers,
+  and a **marketplace earned/spent split** when the treasury wallet is set. The **KINS mint auto-resolves**
+  from the GeckoTerminal pool (`kins_mint()` — no config); `_kins_delta()` decodes each tx from
+  pre/postTokenBalances; results cached per wallet in the new `wallet_onchain` table (~10 min). The Player
+  tab's on-chain panel is now live (loads async after the DB profile). Config: `SOLANA_RPC` (point at
+  Helius/QuickNode in prod — public RPC rate-limits), `KINS_TREASURY` (comma-sep override; **defaults to the
+  identified treasury so the marketplace split works out of the box**), `KINS_MINT` (override),
+  `ONCHAIN_MAX_SIGS`/`ONCHAIN_CACHE_SEC`. **Treasury identified on-chain:** scanning a real wallet's KINS
+  history, `4zW4zuZb9rXpvw3cTYyGoQ2iHTtG9E17YpdeNUbwuQVt` took exactly ~5% in 137/140 trades — it's the
+  marketplace fee wallet. Verified end-to-end live against mainnet on that wallet (KINS mint auto-resolved
+  to `Tqj8yFmagrg7oorpQkVGYR52r96RFTamvWfth9bpump`; earned/spent/net + marketplace split all populate);
+  degrades gracefully on invalid input / RPC failure. Still pending: wheel spins + Kintara Club (need their
+  program addresses).
 
 - **Killed cancellations-logged-as-sales:** removed the speculative `detect_removal_sales` (it logged a
   "sale" whenever a reserved/collectible listing vanished — but cancellations and abandoned/expired-reserved

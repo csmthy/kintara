@@ -64,7 +64,8 @@ def _envi(name, default):
 DB_PATH = os.environ.get("KINTARA_DB", "kintara.db")
 
 # --- 24/7 cadence + politeness (all tunable via env, with hosting-friendly defaults) ---
-POLL_INTERVAL = _envi("POLL_INTERVAL", 90)        # listing poll seconds (was 45)
+POLL_INTERVAL = _envi("POLL_INTERVAL", 90)        # FULL-book poll seconds (paging the whole book for removal detection; was 45)
+FIRSTPAGE_INTERVAL = _envi("FIRSTPAGE_INTERVAL", 3)  # fast page-1 poll seconds: 1 request, captures newest listings before they can be created+sold between full polls
 STATS_GAP = _envf("STATS_GAP", 0.5)               # spacing between stats requests
 STATS_STALE_HOT = _envi("STATS_STALE_HOT", 120)   # re-check actively-traded items this often
 STATS_STALE_COLD = _envi("STATS_STALE_COLD", 420) # re-check quiet items this often (was 900 — tightened so cold items' sales aren't missed)
@@ -119,6 +120,21 @@ BROWSER_UA = ("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
 GECKO_POOL = "F42tZnKPavq1VUcrL6ymhc6YqVpt84fWwgzbNTv2wb3W"
 GECKO_OHLCV = (f"https://api.geckoterminal.com/api/v2/networks/solana/"
                f"pools/{GECKO_POOL}/ohlcv")
+GECKO_POOL_INFO = (f"https://api.geckoterminal.com/api/v2/networks/solana/"
+                   f"pools/{GECKO_POOL}")
+# --- On-chain (Solana) config for the Player page's wallet stats ---
+# Public Solana JSON-RPC. The default public endpoint rate-limits hard; point SOLANA_RPC at
+# a Helius/QuickNode URL in prod (see check_pump_rewards.py for the same pattern).
+SOLANA_RPC = os.environ.get("SOLANA_RPC") or os.environ.get("RPC") or "https://api.mainnet-beta.solana.com"
+WSOL_MINT = "So11111111111111111111111111111111111111112"
+KINS_MINT_OVERRIDE = os.environ.get("KINS_MINT") or None   # else auto-resolved from the pool
+# The marketplace treasury/fee wallet(s) — it skims ~5% off every marketplace trade, so a tx
+# where it's a KINS participant is a marketplace buy/sell. Identified on-chain from a known
+# wallet's history (it took 5% in 137/140 trades). Comma-separated env override.
+KINS_TREASURY_DEFAULT = "4zW4zuZb9rXpvw3cTYyGoQ2iHTtG9E17YpdeNUbwuQVt"
+KINS_TREASURY = {a.strip() for a in (os.environ.get("KINS_TREASURY") or KINS_TREASURY_DEFAULT).split(",") if a.strip()}
+ONCHAIN_MAX_SIGS = _envi("ONCHAIN_MAX_SIGS", 2000)   # older sigs backfilled per call (NOT a total cap — full history backfills over repeated loads)
+ONCHAIN_CACHE_SEC = _envi("ONCHAIN_CACHE_SEC", 600)  # re-scan a wallet at most this often
 KINTARAGOLD_URL = "https://kintaragold.xyz/"
 # kintara.gg's live server list (population label + queue length per server).
 SERVERS_URL = "https://kintara.gg/api/servers"
@@ -557,6 +573,14 @@ def init_db() -> None:
             outfit TEXT,                        -- JSON outfit blob
             ts     INTEGER                      -- epoch ms last observed
         );
+
+        -- cached on-chain KINS aggregate per wallet (the Player page's on-chain stats).
+        -- Re-scanned at most every ONCHAIN_CACHE_SEC; `data` is the JSON aggregate.
+        CREATE TABLE IF NOT EXISTS wallet_onchain (
+            wallet     TEXT PRIMARY KEY,
+            data       TEXT,
+            updated_at INTEGER
+        );
         """
     )
 
@@ -612,6 +636,17 @@ def init_db() -> None:
                 print(f"[{now_iso()}] purged {n} over-counted (cancellation) sale events")
         except Exception as e:
             print(f"[{now_iso()}] sales purge error: {e}")
+    # ONE-TIME cleanup of MIS-ATTRIBUTED sales (a removed listing tagged as a sale at a price
+    # far from the day's average — e.g. a 50g helm on an 11.7g-average day).
+    if get_setting(con, "sales_purge_v2") != "1":
+        try:
+            n = purge_implausible_sales(con)
+            con.commit()
+            set_setting(con, "sales_purge_v2", "1")
+            if n:
+                print(f"[{now_iso()}] purged {n} mis-attributed (wrong-price) sale events")
+        except Exception as e:
+            print(f"[{now_iso()}] sales purge v2 error: {e}")
     con.execute("CREATE INDEX IF NOT EXISTS idx_l_sold ON listings(item_type,currency,sold_claimed,removed_at)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_se_item_day ON sales_events(item_type,currency,day)")
     con.execute(
@@ -932,16 +967,23 @@ def icon_candidates(item_type):
 # fetching (runs on the user's machine; needs network)
 # ---------------------------------------------------------------------------
 
-def fetch_all_active():
+def fetch_all_active(max_pages=MAX_PAGES):
     """Page through the live listings. kintara.gg is flaky on deep pages, so each
     page is retried a couple times; if a page still fails we return what we already
     have with complete=False (never raise). reconcile() only marks listings gone on a
     complete fetch, so a partial poll just keeps the last-good data instead of erroring
-    — a transient timeout self-heals on the next cycle without surfacing anything."""
+    — a transient timeout self-heals on the next cycle without surfacing anything.
+
+    max_pages caps how deep we page. The full poll uses MAX_PAGES (whole book, for
+    removal detection); the fast first-page poller passes max_pages=1 to grab only the
+    newest listings (1 request) so a listing created+sold between full polls is still
+    captured. Returns (listings, complete). complete is True only if we reached the end
+    of the book — a capped fetch that still hasMore returns complete=False so reconcile
+    won't mistake the unseen pages for removed listings."""
     import requests
     out, offset = [], 0
     headers = {"User-Agent": "kintara-tracker/1.0 (personal market tracker)"}
-    for _ in range(MAX_PAGES):
+    for _ in range(max_pages):
         params = {"sort": "latest", "currency": "all", "category": "all",
                   "limit": PAGE, "offset": offset, "q": ""}
         data = None
@@ -965,7 +1007,8 @@ def fetch_all_active():
         if not data.get("hasMore") or not batch:
             return out, True
         offset += PAGE
-    return out, True
+    # hit the page cap with more book remaining → not a complete view of the book
+    return out, False
 
 
 def fetch_kins_ohlcv(timeframe="day", aggregate=1, limit=1000, before=None):
@@ -1181,6 +1224,319 @@ def current_kins_usd():
     return _kins_px_cache["px"]
 
 
+# ---------------------------------------------------------------------------
+# On-chain (Solana): a wallet's full KINS transaction history. Pure JSON-RPC via
+# `requests` (no solders) so it needs no extra deps. The KINS mint is auto-resolved
+# from the GeckoTerminal pool we already track. Powers the Player page's wallet stats:
+# total KINS spent/earned (and the marketplace split when the treasury wallet is set).
+# ---------------------------------------------------------------------------
+
+_kins_mint_cache = {"mint": KINS_MINT_OVERRIDE, "at": 0}
+
+
+def kins_mint():
+    """The KINS SPL mint address, auto-resolved from the GeckoTerminal pool (the non-WSOL
+    side of the KINS/SOL pair). Override via env KINS_MINT. Cached; None if unresolved."""
+    if _kins_mint_cache["mint"]:
+        return _kins_mint_cache["mint"]
+    try:
+        import requests
+        r = requests.get(GECKO_POOL_INFO, headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        rel = ((r.json() or {}).get("data") or {}).get("relationships") or {}
+        for key in ("base_token", "quote_token"):
+            tid = (((rel.get(key) or {}).get("data") or {}).get("id") or "")
+            if tid.startswith("solana_"):
+                addr = tid[len("solana_"):]
+                if addr and addr != WSOL_MINT:
+                    _kins_mint_cache["mint"] = addr
+                    return addr
+    except Exception:
+        pass
+    return None
+
+
+def _sol_rpc(method, params, retries=5):
+    """Solana JSON-RPC POST with exponential backoff (same pattern as check_pump_rewards.py)."""
+    import requests
+    delay = 0.5
+    for attempt in range(retries):
+        try:
+            r = requests.post(SOLANA_RPC, timeout=30,
+                              json={"jsonrpc": "2.0", "id": 1, "method": method, "params": params})
+            if r.status_code == 429:
+                raise RuntimeError("429 rate limited")
+            r.raise_for_status()
+            j = r.json()
+            if "error" in j:
+                raise RuntimeError(str(j["error"])[:120])
+            return j.get("result")
+        except Exception:
+            if attempt == retries - 1:
+                raise
+            time.sleep(delay * (2 ** attempt))
+
+
+def _kins_delta(owner, mint, meta):
+    """From a parsed tx's meta (pre/postTokenBalances), the OWNER's KINS uiAmount change
+    (+received / −sent) and the counterparty owners (opposite-sign KINS movers). Pure +
+    testable. Returns (delta, [counterparty_owners])."""
+    pre, post = {}, {}
+    for b in (meta.get("preTokenBalances") or []):
+        if b.get("mint") == mint and b.get("owner"):
+            pre[b["owner"]] = float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+    for b in (meta.get("postTokenBalances") or []):
+        if b.get("mint") == mint and b.get("owner"):
+            post[b["owner"]] = float((b.get("uiTokenAmount") or {}).get("uiAmount") or 0)
+    deltas = {o: post.get(o, 0) - pre.get(o, 0) for o in set(pre) | set(post)}
+    mine = deltas.get(owner, 0.0)
+    counter = [o for o, dv in deltas.items()
+               if o != owner and abs(dv) > 1e-9 and (dv > 0) != (mine > 0)]
+    return mine, counter
+
+
+def _b58_ok(s):
+    return bool(s) and 32 <= len(s) <= 44 and all(
+        c in "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz" for c in s)
+
+
+def wallet_kins_history(wallet, max_sigs=None):
+    """All KINS transactions for a wallet: find its KINS token account(s), page through their
+    signatures, and decode each tx's KINS delta. Returns {mint, has_account, txns:[{sig, ts,
+    delta, counter, treasury}]} or None if the mint can't be resolved. Bounded by max_sigs
+    (the heavy part is one getTransaction per signature — cache the aggregate)."""
+    max_sigs = max_sigs or ONCHAIN_MAX_SIGS
+    mint = kins_mint()
+    if not mint:
+        return None
+    accs = _sol_rpc("getTokenAccountsByOwner", [wallet, {"mint": mint}, {"encoding": "jsonParsed"}])
+    tokaccs = [a["pubkey"] for a in ((accs or {}).get("value") or [])]
+    if not tokaccs:
+        return {"mint": mint, "has_account": False, "txns": []}
+    sigs, seen = [], set()
+    for acc in tokaccs:
+        before = None
+        while len(sigs) < max_sigs:
+            params = [acc, {"limit": 1000, **({"before": before} if before else {})}]
+            batch = _sol_rpc("getSignaturesForAddress", params) or []
+            for s in batch:
+                if s["signature"] not in seen:
+                    seen.add(s["signature"])
+                    sigs.append(s)
+            if len(batch) < 1000:
+                break
+            before = batch[-1]["signature"]
+    sigs = sigs[:max_sigs]
+    txns = []
+    for s in sigs:
+        if s.get("err"):
+            continue
+        tx = _sol_rpc("getTransaction", [s["signature"],
+                      {"maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}])
+        meta = (tx or {}).get("meta") or {}
+        if not tx or meta.get("err"):
+            continue
+        mine, counter = _kins_delta(wallet, mint, meta)
+        if abs(mine) < 1e-9:
+            continue
+        bt = tx.get("blockTime")
+        # marketplace = the treasury took its fee in this tx (it's a KINS participant) — works
+        # for both buys (treasury opposite-side) and sells (treasury same-side as us).
+        if KINS_TREASURY:
+            owners = {b.get("owner") for b in
+                      ((meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []))
+                      if b.get("mint") == mint}
+            treasury = bool(KINS_TREASURY & owners)
+        else:
+            treasury = None
+        txns.append({"sig": s["signature"], "ts": (bt * 1000 if bt else None),
+                     "delta": mine, "counter": counter[:3], "treasury": treasury})
+    return {"mint": mint, "has_account": True, "txns": txns}
+
+
+def _empty_agg():
+    return {"earned_kins": 0.0, "spent_kins": 0.0, "earned_usd": 0.0, "spent_usd": 0.0,
+            "mkt_earned_kins": 0.0, "mkt_spent_kins": 0.0, "count": 0,
+            "first_ts": None, "last_ts": None, "recent": []}
+
+
+def _fold_txns(agg, txns):
+    """Fold a chunk of decoded KINS txns INTO an existing aggregate (additive), so history can
+    be backfilled incrementally across calls. USD priced at each tx's day. Keeps the 20 most
+    recent rows. Recomputes net + treasury flag."""
+    kmap = kins_daily_usd()
+    kdates = sorted(kmap)
+
+    def px_on(d):
+        if d in kmap:
+            return kmap[d]
+        prior = [x for x in kdates if x <= d]
+        return kmap[prior[-1]] if prior else None
+
+    for t in txns:
+        dv, ts = t["delta"], t.get("ts")
+        agg["count"] += 1
+        if ts:
+            agg["first_ts"] = min(agg["first_ts"] or ts, ts)
+            agg["last_ts"] = max(agg["last_ts"] or ts, ts)
+        d = datetime.fromtimestamp(ts / 1000, timezone.utc).strftime("%Y-%m-%d") if ts else None
+        px = px_on(d) if d else None
+        usd = abs(dv) * px if px else None
+        if dv > 0:
+            agg["earned_kins"] += dv
+            if usd:
+                agg["earned_usd"] += usd
+            if t.get("treasury"):
+                agg["mkt_earned_kins"] += dv
+        else:
+            agg["spent_kins"] += -dv
+            if usd:
+                agg["spent_usd"] += usd
+            if t.get("treasury"):
+                agg["mkt_spent_kins"] += -dv
+        agg.setdefault("recent", []).append(
+            {"sig": t["sig"], "ts": ts, "kins": dv,
+             "usd": (dv / abs(dv) * usd) if usd else None, "treasury": t.get("treasury")})
+    agg["recent"] = sorted(agg["recent"], key=lambda r: (r["ts"] or 0), reverse=True)[:20]
+    agg["net_kins"] = agg["earned_kins"] - agg["spent_kins"]
+    agg["net_usd"] = agg["earned_usd"] - agg["spent_usd"]
+    agg["has_treasury"] = bool(KINS_TREASURY)
+    return agg
+
+
+def aggregate_onchain(hist):
+    """One-shot aggregate of a txn list (thin wrapper over _fold_txns)."""
+    return _fold_txns(_empty_agg(), hist.get("txns", []))
+
+
+def _process_sigs(wallet, mint, sigs):
+    """getTransaction each signature → decoded KINS txns for the wallet (delta + treasury flag).
+    This is the expensive part (one RPC call per signature)."""
+    txns = []
+    for s in sigs:
+        if s.get("err"):
+            continue
+        tx = _sol_rpc("getTransaction", [s["signature"],
+                      {"maxSupportedTransactionVersion": 0, "encoding": "jsonParsed"}])
+        meta = (tx or {}).get("meta") or {}
+        if not tx or meta.get("err"):
+            continue
+        mine, _counter = _kins_delta(wallet, mint, meta)
+        if abs(mine) < 1e-9:
+            continue
+        bt = tx.get("blockTime")
+        if KINS_TREASURY:
+            owners = {b.get("owner") for b in
+                      ((meta.get("preTokenBalances") or []) + (meta.get("postTokenBalances") or []))
+                      if b.get("mint") == mint}
+            treasury = bool(KINS_TREASURY & owners)
+        else:
+            treasury = None
+        txns.append({"sig": s["signature"], "ts": (bt * 1000 if bt else None),
+                     "delta": mine, "treasury": treasury})
+    return txns
+
+
+def _sig_page(acct, before=None, until=None, limit=1000):
+    params = [acct, {"limit": limit, **({"before": before} if before else {}),
+                     **({"until": until} if until else {})}]
+    return _sol_rpc("getSignaturesForAddress", params) or []
+
+
+def _save_onchain(wallet, agg, now):
+    try:
+        w = connect()
+        w.execute("INSERT INTO wallet_onchain(wallet,data,updated_at) VALUES(?,?,?) "
+                  "ON CONFLICT(wallet) DO UPDATE SET data=excluded.data,updated_at=excluded.updated_at",
+                  (wallet, json.dumps(agg), now))
+        w.commit(); w.close()
+    except Exception:
+        pass
+
+
+def compute_wallet_onchain(con, wallet, max_chunk=None):
+    """Incrementally build a wallet's COMPLETE KINS history (no fixed cap on total — bounded
+    per call so a single request never runs away). Persists progress in wallet_onchain:
+      • forward pass: any sigs newer than what we've seen (keeps the cache current),
+      • backward pass: the next chunk of OLDER sigs (up to `max_chunk`), until we hit the
+        wallet's first KINS tx (`_done`).
+    So over a few loads it backfills everything. Returns the aggregate with `_done` (fully
+    backfilled?) + `count` (txns processed so far). On RPC failure, serves partial progress.
+    Depth is only limited by the RPC node's history — use an archival SOLANA_RPC for the lot."""
+    max_chunk = max_chunk or ONCHAIN_MAX_SIGS
+    now = int(time.time() * 1000)
+    row = con.execute("SELECT data, updated_at FROM wallet_onchain WHERE wallet=?", (wallet,)).fetchone()
+    stored = None
+    if row:
+        try:
+            stored = json.loads(row["data"])
+        except Exception:
+            stored = None
+    # fully backfilled + fresh → return cached as-is
+    if stored and stored.get("_done") and (now - (row["updated_at"] or 0)) < ONCHAIN_CACHE_SEC * 1000:
+        return stored
+
+    mint = kins_mint()
+    if not mint:
+        return stored or {"available": False, "reason": "KINS mint not resolved (pool info unavailable)"}
+    try:
+        accs = _sol_rpc("getTokenAccountsByOwner", [wallet, {"mint": mint}, {"encoding": "jsonParsed"}])
+    except Exception as e:
+        return stored or {"available": False, "reason": "Solana RPC error: " + str(e)[:120]}
+    tokaccs = [a["pubkey"] for a in ((accs or {}).get("value") or [])]
+    if not tokaccs:
+        agg = _empty_agg(); agg.update(available=True, has_account=False, _done=True, scanned=0)
+        _save_onchain(wallet, agg, now)
+        return agg
+
+    acct = tokaccs[0]   # primary KINS account; cursors track this signature stream
+    agg = stored if (stored and "earned_kins" in stored) else _empty_agg()
+    newest, oldest, done = agg.get("_newest"), agg.get("_oldest"), agg.get("_done", False)
+    try:
+        # forward: catch sigs newer than the newest we've processed
+        if newest:
+            new_sigs, before = [], None
+            while True:
+                batch = _sig_page(acct, before=before, until=newest)
+                new_sigs.extend(batch)
+                if len(batch) < 1000:
+                    break
+                before = batch[-1]["signature"]
+            if new_sigs:
+                agg = _fold_txns(agg, _process_sigs(wallet, mint, new_sigs))
+                newest = new_sigs[0]["signature"]
+        # backward: backfill the next chunk of older sigs (until the wallet's first KINS tx)
+        if not done:
+            old_sigs, before = [], oldest
+            while len(old_sigs) < max_chunk:
+                batch = _sig_page(acct, before=before)
+                if not batch:
+                    done = True
+                    break
+                old_sigs.extend(batch)
+                before = batch[-1]["signature"]
+                if len(batch) < 1000:
+                    done = True
+                    break
+            if old_sigs:
+                if not newest:
+                    newest = old_sigs[0]["signature"]
+                agg = _fold_txns(agg, _process_sigs(wallet, mint, old_sigs))
+                oldest = old_sigs[-1]["signature"]
+    except Exception as e:
+        if agg.get("count"):   # save partial progress, serve what we have
+            agg.update(_newest=newest, _oldest=oldest, _done=done, available=True,
+                       has_account=True, scanned=agg["count"])
+            _save_onchain(wallet, agg, now)
+            return agg
+        return stored or {"available": False, "reason": "Solana RPC error: " + str(e)[:120]}
+
+    agg.update(_newest=newest, _oldest=oldest, _done=done, available=True,
+               has_account=True, scanned=agg["count"])
+    _save_onchain(wallet, agg, now)
+    return agg
+
+
 _kgold_cache = {"at": 0, "data": None, "spot": None}
 _goldhist_cache = {}   # range -> (ts, payload), ~3 min TTL (avoids gecko rate limits)
 
@@ -1255,6 +1611,12 @@ def _upsert_stats(con, it, cur, day, day_sales, avg30d, day_avg=None):
 
 
 SALE_MATCH_WINDOW_MS = 45 * 60 * 1000   # only attribute removals we captured this recently
+# A removed listing can only BE the sale if its per-unit is near the actual sold (marginal)
+# price — the buyer paid that price, so a genuine sold listing matches closely while a
+# coincidental cancellation at a different price (e.g. a 50g helm vs an 11.7g sold price)
+# is rejected and left as a detail-less synthetic row instead of a fake sale.
+SALE_MATCH_TOL = _envf("SALE_MATCH_TOL", 0.6)     # accept match within ±60% of marginal
+SALE_OUTLIER_TOL = _envf("SALE_OUTLIER_TOL", 3.0)  # purge logged sales >3× / <1/3 the day avg
 
 
 def _marginal_price(old_sales, old_avg, new_sales, new_avg, delta):
@@ -1295,6 +1657,10 @@ def _log_sales(con, it, cur, d, n, marginal, observed_ts=None):
     for r in sorted(cands, key=closeness):
         if matched >= n:
             break
+        # only accept the listing as the sale if its price is plausibly the sold price;
+        # otherwise it's a coincidental cancellation — leave it for a synthetic row.
+        if closeness(r) > SALE_MATCH_TOL:
+            break                      # candidates are sorted, so the rest are worse
         pu = r["per_unit"]
         total = r["price_gold"] if cur == "gold" else r["price_usd"]
         if total is None and pu is not None and r["quantity"]:
@@ -1409,6 +1775,36 @@ def purge_overcounted_sales(con, days=None):
     return deleted
 
 
+def purge_implausible_sales(con, days=None):
+    """Drop MIS-ATTRIBUTED sales: an attributed event (we matched a removed listing to a
+    confirmed sale) whose price is egregiously far from the item-day's avg sale price is
+    almost certainly a coincidental cancellation we wrongly tagged (e.g. a 50g helm logged on
+    a day whose real sales averaged 11.7g). Delete those (price >SALE_OUTLIER_TOL× or <1/tol
+    the day avg); the count-backfill re-adds a detail-less synthetic row so the in-game count
+    still reconciles, but the fake price/seller is gone. Only touches rows on days with a
+    known avg. Returns # deleted. Caller commits."""
+    deleted = 0
+    where = "WHERE avg_price IS NOT NULL AND avg_price>0"
+    args = []
+    if days:
+        where += " AND date >= ?"
+        args.append((datetime.now(timezone.utc) - _td(days=days)).strftime("%Y-%m-%d"))
+    rows = con.execute(
+        f"SELECT item_type, currency, date, avg_price FROM sales_daily {where}", args).fetchall()
+    hi, lo = SALE_OUTLIER_TOL, (1.0 / SALE_OUTLIER_TOL)
+    for r in rows:
+        for e in con.execute(
+                """SELECT id, price FROM sales_events
+                   WHERE item_type=? AND currency=? AND day=? AND listing_id IS NOT NULL
+                     AND price IS NOT NULL""",
+                (r["item_type"], r["currency"], r["date"])).fetchall():
+            ratio = e["price"] / r["avg_price"] if r["avg_price"] else 1
+            if ratio > hi or ratio < lo:
+                con.execute("DELETE FROM sales_events WHERE id=?", (e["id"],))
+                deleted += 1
+    return deleted
+
+
 def audit_sales(con, days=14):
     """Cross-check our logged sale events against the HARD in-game number — the `/stats`
     daily completed-sale count (the same figure behind the in-game per-day sales graph),
@@ -1477,11 +1873,15 @@ def sales_audit_loop(interval=None):
         try:
             con = connect()
             try:
-                n = backfill_sales(con)              # add up to the in-game count
-                d = purge_overcounted_sales(con, days=4)  # trim anything above it (recent days)
-                if n or d:
+                # purge bad rows FIRST, then backfill replaces any deleted/missing with a
+                # detail-less synthetic so the count still matches the in-game counter.
+                d1 = purge_implausible_sales(con, days=4)   # mis-attributed (wrong-price) sales
+                d2 = purge_overcounted_sales(con, days=4)   # anything above the in-game count
+                n = backfill_sales(con)                      # add up to the in-game count
+                if n or d1 or d2:
                     con.commit()
-                    print(f"[{now_iso()}] sales reconcile: +{n} backfilled, -{d} over-counted")
+                    print(f"[{now_iso()}] sales reconcile: +{n} backfilled, "
+                          f"-{d1} mis-attributed, -{d2} over-counted")
             finally:
                 con.close()
         except Exception as e:
@@ -2438,7 +2838,7 @@ def record_seen(players, shard):
 # reconcile (testable offline)
 # ---------------------------------------------------------------------------
 
-def reconcile(con, listings, complete):
+def reconcile(con, listings, complete, record_poll=True):
     ts = now_iso()
     seen = set()
     for L in listings:
@@ -2483,8 +2883,9 @@ def reconcile(con, listings, complete):
         # sale to the best price-matched recent removal. We just flag items with a fresh
         # removal as URGENT in the stats queue (_next_stats_pair) so they get re-checked
         # fast — speed without ever logging a cancellation.
-    con.execute("INSERT INTO polls(ts,active,removed,ok) VALUES(?,?,?,?)",
-                (ts, len(seen), newly_removed, 1 if complete else 0))
+    if record_poll:
+        con.execute("INSERT INTO polls(ts,active,removed,ok) VALUES(?,?,?,?)",
+                    (ts, len(seen), newly_removed, 1 if complete else 0))
     con.commit()
     return len(seen), newly_removed
 
@@ -3081,6 +3482,31 @@ def poll_loop(interval):
         time.sleep(interval)
 
 
+def firstpage_loop(interval):
+    """Fast capture-only poll of just page 1 (newest listings).
+
+    The full poll (poll_loop) pages the entire book every POLL_INTERVAL seconds — that's
+    ~143 requests at PAGE=40 for ~5700 listings, so a single sweep takes a minute-plus.
+    Anything created AND sold inside that window is never captured, so the sale can only
+    be recovered as a count tick with no listing detail (a synthetic row). This loop hits
+    only offset=0 (1 request) every few seconds and upserts via reconcile(..., complete=
+    False) — capture-only, never marks removals — so newly-created listings are recorded
+    almost immediately and can be matched to sales properly. Removal detection stays with
+    the full poll, which is the only fetch that sees the whole book."""
+    while True:
+        con = connect()
+        try:
+            listings, _ = fetch_all_active(max_pages=1)
+            if listings:
+                a, _ = reconcile(con, listings, complete=False, record_poll=False)
+                _state.update(last_firstpage=now_iso(), last_firstpage_n=len(listings))
+        except Exception as e:
+            print(f"[{now_iso()}] firstpage poll error: {e}")
+        finally:
+            con.close()
+        time.sleep(interval)
+
+
 # ---------------------------------------------------------------------------
 # web app
 # ---------------------------------------------------------------------------
@@ -3375,16 +3801,17 @@ def make_app():
         """ACTUAL completed sales (from `sales_events`), newest first. Each row now carries
         the real stack `qty`, `total` paid, per-unit `price`, the `seller`, and `listing_ms`
         (time the listing sat before it sold) — recovered by matching each confirmed sale to
-        the listing we watched vanish. `qty`/`total`/`seller` are null for the few sales we
-        confirmed via /stats but didn't capture the listing for. Filters: currency, item_type,
-        category, q."""
+        the listing we watched vanish. Synthetic rows — sales confirmed via the /stats counter
+        but with no captured listing (no qty/seller, shown as "~est") — are EXCLUDED from the
+        feed (they're only kept for the count reconciliation); the feed shows real, attributed
+        sales only. Filters: currency, item_type, category, q."""
         item = request.args.get("item_type", "all")
         currency = request.args.get("currency", "all")
         cat = request.args.get("category", "all")
         q = (request.args.get("q") or "").strip().lower()
         limit = min(int(request.args.get("limit", 200)), 1000)
         con = connect(readonly=True)
-        clauses, params = [], []
+        clauses, params = ["listing_id IS NOT NULL"], []   # real attributed sales only (no ~est)
         if currency in ("gold", "token"):
             clauses.append("currency=?"); params.append(currency)
         if item != "all":
@@ -4427,10 +4854,28 @@ def make_app():
             # yet — it needs the live KINS mint + marketplace/treasury/wheel program addresses
             # captured from a sample transaction (see PLAYER_PAGE_PLAN.md). Surface a clear
             # pending state rather than fake numbers.
-            "onchain": {"available": False,
-                        "note": "On-chain stats (KINS spent/earned, wheel spins, Kintara Club) "
-                                "need the Solana program addresses configured — see PLAYER_PAGE_PLAN.md."},
+            # on-chain KINS stats come from the separate (slower) /api/wallet-onchain so the
+            # DB profile renders instantly; the Player page fires it when a wallet is entered.
+            "onchain": {"available": False, "deferred": bool(wallet),
+                        "note": "Enter a wallet to load on-chain KINS spent/earned."},
         })
+
+    @app.route("/api/wallet-onchain")
+    def wallet_onchain():
+        """All-time on-chain KINS stats for a wallet: total spent/earned (KINS + USD priced
+        at each tx's day), net, transaction count, first/last activity, recent transfers, and
+        the marketplace split when KINS_TREASURY is configured. Reads the Solana chain via
+        JSON-RPC (cached per wallet ~10 min). Slow on the first scan of a busy wallet — the
+        Player page loads it asynchronously. Set SOLANA_RPC to a Helius/QuickNode URL in prod."""
+        wallet = (request.args.get("wallet") or "").strip()
+        if not _b58_ok(wallet):
+            return jsonify({"ok": True, "available": False, "reason": "Enter a valid Solana wallet address."})
+        con = connect(readonly=True)
+        try:
+            agg = compute_wallet_onchain(con, wallet)
+        finally:
+            con.close()
+        return jsonify({"ok": True, "wallet": wallet, "mint": kins_mint(), **agg})
 
     return app
 
@@ -4813,6 +5258,7 @@ td.isd{cursor:help}
 .pl-panel{border:1px solid var(--line);border-radius:14px;padding:14px 16px;
   background:linear-gradient(180deg,rgba(25,38,58,.4),rgba(15,24,40,.2))}
 .pl-pendingpanel{margin-top:14px;border-style:dashed}
+.pl-onchain{margin-top:16px}
 .pl-h{font:700 12px 'Cinzel',serif;letter-spacing:.06em;color:var(--gold2);text-transform:uppercase;margin-bottom:9px}
 .pl-h .mut{font:400 11px var(--ui);text-transform:none;letter-spacing:0}
 .pl-row{display:flex;align-items:baseline;gap:10px;padding:5px 0;border-bottom:1px solid rgba(255,255,255,.05);font:13px 'Fredoka'}
@@ -7074,7 +7520,56 @@ async function fetchPlayer(){
   try{ state.playerData=await (await fetch(`/api/player?name=${encodeURIComponent(state.playerName)}&wallet=${encodeURIComponent(state.playerWallet||'')}`)).json(); }
   catch(e){ if($("#plResult")) $("#plResult").innerHTML=`<div class="empty warn">Couldn't load player.</div>`; return; }
   renderPlayer();
-  if(state.playerData&&state.playerData.ok!==false) loadPlayerLive(state.playerData.name);
+  if(state.playerData&&state.playerData.ok!==false){
+    loadPlayerLive(state.playerData.name);
+    loadWalletOnchain(state.playerWallet);
+  }
+}
+/* on-chain KINS stats (separate, slower call — the DB profile renders first). The scan
+   backfills the FULL history in chunks across calls, so we re-poll until `_done`. */
+async function loadWalletOnchain(wallet){
+  const w=$("#plOnchain"); if(!w) return;
+  if(!wallet){ w.innerHTML=`<div class="pl-panel pl-pendingpanel"><div class="pl-h">On-chain (Solana)</div>
+    <div class="pl-pend">⛓ Add a Solana wallet above to load all-time <b>KINS spent &amp; earned</b>, net flow, and transaction history from the chain.</div></div>`; return; }
+  w.innerHTML=`<div class="pl-panel"><div class="pl-h">On-chain (Solana)</div><div class="empty">Scanning the chain for KINS transactions…</div></div>`;
+  const step=async()=>{
+    let d; try{ d=await (await fetch("/api/wallet-onchain?wallet="+encodeURIComponent(wallet))).json(); }
+    catch(e){ const s=$("#plOnchain"); if(s) s.innerHTML=`<div class="pl-panel"><div class="pl-h">On-chain</div><div class="empty warn">Couldn't reach the chain.</div></div>`; return; }
+    if(state.playerWallet!==wallet || TAB!=="player") return;   // user moved on
+    const s=$("#plOnchain"); if(!s) return;
+    s.innerHTML=onchainHTML(d);
+    if(d&&d.available&&d._done===false) setTimeout(step, 900);   // keep backfilling older history
+  };
+  step();
+}
+function onchainHTML(d){
+  if(!d||d.available===false) return `<div class="pl-panel pl-pendingpanel"><div class="pl-h">On-chain (Solana)</div>
+    <div class="pl-pend">⛓ ${esc((d&&d.reason)||'On-chain data unavailable right now.')}</div></div>`;
+  const k=v=> v==null?'—':((Math.abs(v)>=1?Math.round(v).toLocaleString():(+v.toFixed(2)))+' $KINS');
+  const usd=v=> v==null?'—':'$'+(Math.abs(v)>=1?Number(v).toLocaleString(undefined,{maximumFractionDigits:2}):(+Number(v).toPrecision(3)));
+  const when=ms=> ms?relAbs(ms):'—';
+  const stat=(kk,v,sub)=>`<div class="pl-stat"><div class="pl-k">${kk}</div><div class="pl-v">${v}</div>${sub?`<div class="pl-sub2">${sub}</div>`:''}</div>`;
+  if(!d.has_account && !(d.count>0)) return `<div class="pl-panel pl-pendingpanel"><div class="pl-h">On-chain (Solana)</div>
+    <div class="pl-pend">No KINS token activity found for this wallet.</div></div>`;
+  const net=d.net_kins;
+  const scanTag = d._done===false ? `<span class="mut">backfilling… ${(d.count||0).toLocaleString()} so far</span>`
+                                  : `<span class="mut">full history</span>`;
+  let cards=`<div class="pl-cards">
+    ${stat('KINS earned', k(d.earned_kins), usd(d.earned_usd))}
+    ${stat('KINS spent', k(d.spent_kins), usd(d.spent_usd))}
+    ${stat('Net flow', `<span class="${net>=0?'pl-online':'neg'}">${(net>=0?'+':'')+k(net)}</span>`, usd(d.net_usd))}
+    ${stat('KINS transfers', (d.count||0).toLocaleString(), d._done===false?'still loading…':'all-time')}
+    ${stat('First activity', when(d.first_ts))}
+    ${stat('Last activity', when(d.last_ts))}`;
+  if(d.has_treasury) cards+=stat('Marketplace earned', k(d.mkt_earned_kins))+stat('Marketplace spent', k(d.mkt_spent_kins));
+  cards+=`</div>`;
+  const note=d.has_treasury?'':`<div class="pl-sub2" style="margin-top:6px">Tip: set the treasury wallet (KINS_TREASURY) to split marketplace spend vs other transfers.</div>`;
+  const recent=(d.recent||[]).length?`<div class="pl-h" style="margin-top:12px">Recent KINS transfers</div>
+    <div class="pl-list">${d.recent.map(t=>`<div class="pl-row">
+      <span class="pl-rn">${t.kins>=0?'received':'sent'}${t.treasury?' · market':''}</span>
+      <span class="${t.kins>=0?'pl-online':'neg'}">${(t.kins>=0?'+':'')+k(t.kins)}</span>
+      <span class="ll-sel">${when(t.ts)}</span></div>`).join('')}</div>`:'';
+  return `<div class="pl-panel"><div class="pl-h">On-chain (Solana) <span class="mut">KINS</span> · ${scanTag}</div>${cards}${note}${recent}</div>`;
 }
 /* live character via the spectate stream (only while they're online). Polls until found
    or all 12 servers have been swept. */
@@ -7146,9 +7641,8 @@ function renderPlayer(){
       usd(d.inventory&&d.inventory.market_usd)+' market value'+
       (d.inventory&&d.inventory.outlier_count?` · ${d.inventory.outlier_count} ask outlier${d.inventory.outlier_count===1?'':'s'}`:''))}
   </div>`;
-  // on-chain pending panel
-  const oc=`<div class="pl-panel pl-pendingpanel"><div class="pl-h">On-chain (Solana)</div>
-    <div class="pl-pend">⛓ KINS spent &amp; earned, wheel spins, and Kintara Club aren't wired yet — they need the on-chain program addresses configured (see PLAYER_PAGE_PLAN.md). ${d.wallet?'Wallet on file: <b>'+esc(d.wallet)+'</b>.':'Add a wallet above once on-chain is live.'}</div></div>`;
+  // on-chain panel slot (filled async by loadWalletOnchain)
+  const oc=`<div id="plOnchain" class="pl-onchain"></div>`;
   // top items sold
   const ti=(d.top_items||[]);
   const items=ti.length?`<div class="pl-panel"><div class="pl-h">Top items sold</div>
@@ -7314,7 +7808,9 @@ setInterval(loadStatus,6000); setInterval(loadServers,30000); setInterval(loadKi
 def main():
     ap = argparse.ArgumentParser(description="KinScan")
     ap.add_argument("--interval", type=int, default=POLL_INTERVAL,
-                    help=f"listing poll seconds (default {POLL_INTERVAL}; env POLL_INTERVAL)")
+                    help=f"FULL-book poll seconds (default {POLL_INTERVAL}; env POLL_INTERVAL)")
+    ap.add_argument("--firstpage-interval", type=int, default=FIRSTPAGE_INTERVAL,
+                    help=f"fast page-1 capture poll seconds (default {FIRSTPAGE_INTERVAL}; env FIRSTPAGE_INTERVAL)")
     ap.add_argument("--port", type=int, default=_envi("PORT", 8765),
                     help="port (default 8765; env PORT — set by most hosts)")
     ap.add_argument("--host", default=os.environ.get("KINTARA_HOST", "127.0.0.1"),
@@ -7337,6 +7833,7 @@ def main():
     app = make_app()
 
     threading.Thread(target=poll_loop, args=(args.interval,), daemon=True).start()
+    threading.Thread(target=firstpage_loop, args=(args.firstpage_interval,), daemon=True).start()  # fast page-1 capture
     threading.Thread(target=stats_loop, daemon=True).start()
     threading.Thread(target=gold_price_loop, daemon=True).start()
     threading.Thread(target=snapshot_loop, daemon=True).start()         # order-book history (Substrate A)
@@ -7347,8 +7844,8 @@ def main():
     _boss_census.start()    # boss-area census for the server bubble (resolves the region key)
     hosted = args.host not in ("127.0.0.1", "localhost")
     url = f"http://{'127.0.0.1' if not hosted else args.host}:{args.port}"
-    print(f"Dashboard: {url}   (listing poll {args.interval}s · kintara min-gap "
-          f"{KINTARA_MIN_GAP}s; Ctrl+C to stop)")
+    print(f"Dashboard: {url}   (full poll {args.interval}s · page-1 poll "
+          f"{args.firstpage_interval}s · kintara min-gap {KINTARA_MIN_GAP}s; Ctrl+C to stop)")
     if not args.no_browser and not hosted:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     app.run(host=args.host, port=args.port, threaded=True)
