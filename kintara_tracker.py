@@ -3219,35 +3219,43 @@ def make_app():
         cat = request.args.get("category", "all")
         q = (request.args.get("q") or "").strip().lower()
         limit = min(int(request.args.get("limit", 200)), 1000)
+        con = connect(readonly=True)
         clauses, params = [], []
         if currency in ("gold", "token"):
             clauses.append("currency=?"); params.append(currency)
         if item != "all":
             clauses.append("item_type=?"); params.append(item)
+        # Resolve category + free-text search to a set of item_types and filter in SQL — so
+        # the LIMIT is applied AFTER filtering (the old code filtered in Python over only the
+        # most-recent slice, so searching an item outside that slice found nothing). `q`
+        # matches the itemType OR its in-game label.
+        if cat != "all" or q:
+            allt = [r["item_type"] for r in con.execute(
+                "SELECT DISTINCT item_type FROM sales_events")]
+            def _match(it):
+                if cat != "all" and categorize(it) != cat:
+                    return False
+                if q and q not in it.lower() and q not in item_label(it).lower():
+                    return False
+                return True
+            keep = [it for it in allt if _match(it)]
+            if not keep:
+                con.close()
+                return jsonify([])
+            clauses.append("item_type IN (%s)" % ",".join("?" * len(keep)))
+            params.extend(keep)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-        con = connect(readonly=True)
         rows = con.execute(
             f"""SELECT item_type,currency,units,qty,price,total,seller_name,listing_ms,day,ts
-                FROM sales_events {where}
-                ORDER BY (seller_name IS NULL AND listing_ms IS NULL), ts DESC LIMIT ?""",
-            params + [limit * 3]).fetchall()
+                FROM sales_events {where} ORDER BY ts DESC LIMIT ?""",
+            params + [limit]).fetchall()
         con.close()
-        out = []
-        for r in rows:
-            it = r["item_type"]
-            c = categorize(it)
-            if cat != "all" and c != cat:
-                continue
-            lbl = item_label(it)
-            if q and q not in it.lower() and q not in lbl.lower():
-                continue
-            out.append({"item_type": it, "label": lbl, "category": c,
-                        "units": r["units"], "qty": r["qty"], "price": r["price"],
-                        "total": r["total"], "seller": r["seller_name"],
-                        "listing_ms": r["listing_ms"],
-                        "currency": r["currency"], "day": r["day"], "ts": r["ts"]})
-            if len(out) >= limit:
-                break
+        out = [{"item_type": r["item_type"], "label": item_label(r["item_type"]),
+                "category": categorize(r["item_type"]),
+                "units": r["units"], "qty": r["qty"], "price": r["price"],
+                "total": r["total"], "seller": r["seller_name"],
+                "listing_ms": r["listing_ms"],
+                "currency": r["currency"], "day": r["day"], "ts": r["ts"]} for r in rows]
         return jsonify(out)
 
     @app.route("/api/sales-audit")
@@ -3746,6 +3754,9 @@ def make_app():
                 agg[(r["item_type"], r["currency"])] = r
         rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
         floors = item_floors(con, rate)        # current floor per item (bulk-material rule)
+        # all-time first sale date per item (drives the Index "newest/oldest added" sort)
+        firsts = {r["item_type"]: r["f"] for r in con.execute(
+            "SELECT item_type, MIN(date) f FROM sales_daily WHERE sales>0 GROUP BY item_type")}
         con.close()
         kins_px = current_kins_usd()
         out = []
@@ -3764,6 +3775,7 @@ def make_app():
                 "sales": gs + ts, "avg_gold": ga, "avg_usd": ta, "kins": kins,
                 "floor_gold": ff.get("gold"), "floor_usd": f_usd,
                 "floor_kins": (f_equiv / kins_px) if (f_equiv and kins_px) else None,
+                "first_sale": firsts.get(it),
             })
         return jsonify({"ok": True, "ref_day": ref, "window": window,
                         "kins_price": kins_px, "gold_rate": rate, "items": out})
@@ -4463,6 +4475,8 @@ td.isd{cursor:help}
 .gw-pill:hover{border-color:#3d5274;color:#e7ecf2}
 .gw-pill.on{background:linear-gradient(180deg,rgba(232,181,74,.22),rgba(232,181,74,.06));
   color:var(--gold2);border-color:rgba(232,181,74,.45)}
+.gw-sortsel{padding:7px 12px;border-radius:999px;border:1px solid #2c3c56;background:rgba(255,255,255,.03);
+  color:var(--gold2);font:500 13px 'Fredoka';cursor:pointer}
 .gw-note{color:#6f86a6;font:400 12px 'Fredoka';margin:10px 0 6px}
 .gw-head,.gw-row{display:grid;grid-template-columns:1.6fr .8fr .9fr .9fr .9fr;align-items:center;gap:8px}
 .gw-head{padding:6px 12px;color:#6f86a6;font:600 11px 'Fredoka';letter-spacing:.14em;text-transform:uppercase;
@@ -5587,7 +5601,17 @@ function renderHist(){
     `${k!=="all"?`<span class="c">${counts[k]||0}</span>`:`<span class="c">${items.length}</span>`}</button>`).join("");
   const catName=(CAT_ORDER.find(([k])=>k===cat)||[,"All Items"])[1];
   let rows=cat==="all"?items.slice():items.filter(r=>r.category===cat);
-  rows.sort((a,b)=> state.histSort==="least" ? a.sales-b.sales : b.sales-a.sales);
+  const byDate=(a,b,dir)=>{ const x=a.first_sale||'', y=b.first_sale||'';
+    if(!x&&!y)return 0; if(!x)return 1; if(!y)return -1; return dir*x.localeCompare(y); };
+  const HSORT={
+    most:    (a,b)=> (b.sales||0)-(a.sales||0),
+    least:   (a,b)=> (a.sales||0)-(b.sales||0),
+    newest:  (a,b)=> byDate(a,b,-1),     // latest first_sale first (nulls last)
+    oldest:  (a,b)=> byDate(a,b,1),
+    cheapest:(a,b)=> (a.floor_kins==null?Infinity:a.floor_kins)-(b.floor_kins==null?Infinity:b.floor_kins),
+    expensive:(a,b)=>(b.floor_kins==null?-Infinity:b.floor_kins)-(a.floor_kins==null?-Infinity:a.floor_kins),
+  };
+  rows.sort(HSORT[state.histSort]||HSORT.most);
   const body=rows.map(r=>{
     const open=r.item_type===state.histOpen;
     return `<div class="gw-row ${open?'open':''}" data-item="${r.item_type}">
@@ -5611,8 +5635,11 @@ function renderHist(){
         <button class="gw-pill ${state.histWindow==7?'on':''}" data-win="7">Last 7 days</button>
         <button class="gw-pill ${state.histWindow==30?'on':''}" data-win="30">Last 30 days</button>
         <span style="width:14px"></span>
-        <button class="gw-pill ${state.histSort!=="least"?'on':''}" data-sort="most">Most sales</button>
-        <button class="gw-pill ${state.histSort==="least"?'on':''}" data-sort="least">Least sales</button>
+        <select id="histSortSel" class="gw-sortsel">
+          ${[['most','Most sold'],['least','Least sold'],['cheapest','Cheapest ($KINS)'],
+             ['expensive','Most expensive ($KINS)'],['newest','Newest added'],['oldest','Oldest added']]
+            .map(([v,l])=>`<option value="${v}" ${(state.histSort||'most')===v?'selected':''}>${l}</option>`).join('')}
+        </select>
         <span style="width:14px"></span>
         <button class="gw-pill" id="histRefresh" data-tip="Refresh now">↻</button>
       </div>
@@ -5621,7 +5648,7 @@ function renderHist(){
       <div id="gwrows">${body||`<div class="gw-empty">No items in this category.</div>`}</div>
     </div></div>`;
   document.querySelectorAll(".gw-cat").forEach(b=>b.onclick=()=>{state.histCat=b.dataset.cat;state.histOpen=null;renderHist();});
-  document.querySelectorAll(".gw-pill[data-sort]").forEach(b=>b.onclick=()=>{state.histSort=b.dataset.sort;renderHist();});
+  const ss=$("#histSortSel"); if(ss) ss.onchange=()=>{state.histSort=ss.value;renderHist();};
   const hr=$("#histRefresh"); if(hr) hr.onclick=()=>loadHist();
   document.querySelectorAll(".gw-pill[data-win]").forEach(b=>b.onclick=()=>{state.histWindow=+b.dataset.win;state.histOpen=null;loadHist();});
   document.querySelectorAll("#gwrows .gw-row").forEach(row=>row.onclick=()=>{

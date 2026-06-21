@@ -421,7 +421,9 @@ numbered by topic, not bar order.
    when. Each sale is matched to the listing that vanished, so "13,251 stone for 1g" reads correctly
    instead of the old misleading "5 units". Cancellations excluded.
 3. **Index** (was "Sales history") — game "index" layout: category **sidebar**, **Today / 7d / 30d**
-   window selector, **Most/Least sales** sort, columns ITEM · SALES · **FLOOR GOLD · FLOOR USD ·
+   window selector, a **sort dropdown** (Most/Least sold · Cheapest/Most expensive by the $KINS floor ·
+   Newest/Oldest added by first-sale date — `first_sale` from `/api/sales-summary`; cheapest/newest are
+   sort-only, no extra column), columns ITEM · SALES · **FLOOR GOLD · FLOOR USD ·
    FLOOR $KINS** (the live cheapest price per item, from `item_floors()` — replaced the old avg-sales
    columns). Cheap commodities show **items-per-gold** (e.g. `24k/g`) instead of a tiny gold fraction, and
    **material/food/potion** show **USD/$KINS per 1,000**. Click a row → expands to a full **Item
@@ -611,6 +613,16 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Sales-feed filter/search fix + Index sort options:**
+  - The Sales feed's search/currency/category filters were unreliable because **category and `q` were
+    filtered in Python over only the most-recent ~600-row slice** (after the SQL LIMIT) — so searching an
+    item outside that slice found nothing. Now `category` + `q` (matches itemType OR in-game label) resolve
+    to an item_type set and filter **in SQL**, with `ORDER BY ts DESC LIMIT` applied *after* filtering, so
+    every filter searches the full dataset. (`/api/sales-feed`.)
+  - **Index sort dropdown:** replaced the Most/Least pills with a 6-way sort — Most/Least sold, Cheapest /
+    Most expensive (by the computed **$KINS floor**, sort-only — no new column), Newest / Oldest added (by
+    first sale date). `/api/sales-summary` now returns `first_sale` (all-time MIN sale date per item).
 
 - **Sales cross-check against the hard in-game number + auto-backfill:** the `/stats` per-day
   completed-sale count (the figure behind the in-game sales graph) is treated as ground truth and we now
