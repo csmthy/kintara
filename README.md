@@ -333,7 +333,10 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
 - `GET /api/player?name=&wallet=` — one aggregated **player profile** (the Player tab). From our DB
   (keyed on `seller_name`, case-insensitive): **marketplace earned** (sell side — sales count, units,
   gross in gold/USD/$KINS, avg sale), **top items sold**, **recent sales**, **active listings / inventory
-  value + category mix**, and **first seen**. Plus **property owned** (live `fetch_property_status()` match
+  market value + category mix**, and **first seen**. Active-listing value is market-anchored
+  (`active_market_unit_usd()` prefers the cheapest buyable listing from another seller, then recent fair
+  value, then raw floor/ask as a last resort) because public listings can contain joke asks like 12k wood
+  for 112k gold. Plus **property owned** (live `fetch_property_status()` match
   on owner name). Echoes `wallet`. The **on-chain block is a pending stub** (`onchain.available=false`) —
   KINS spent/earned, wheel spins, Kintara Club + wallet verification need the Solana program addresses
   captured first (see `PLAYER_PAGE_PLAN.md`). All data is public/on-chain — uninvasive by design.
@@ -649,10 +652,15 @@ sees the latest state at a glance.
   outlier down to the 2 real ones; a 0-real-sale cosmetic cancellation deleted; an under-counted item left
   untouched.
 
+- **Player profile active-listing valuation hardening:** active listings still show if Kintara's public
+  API returns them, but player/property totals no longer treat a seller's ask as value. `active_market_unit_usd()`
+  values listed stacks from another-seller floor first, then recent fair value, then raw floor/ask only as a
+  last resort, and the Player tab flags huge ask outliers. This fixes profiles like LEX1 where 12,911 wood
+  listed for 112,321g made a fake ~$477k inventory value.
 - **Player profile page (v1 — DB-backed):** new **Player** tab + `GET /api/player?name=&wallet=` that
   aggregates everything we publicly know about a player into one profile: marketplace **earned** (sell
   side — count/units/gross in gold/USD/$KINS/avg from `sales_events`), **top items sold**, **recent
-  sales**, **active listings + inventory value + category mix** (`listings`), **first seen**, and
+  sales**, **active listings + market-anchored inventory value + category mix** (`listings`), **first seen**, and
   **property owned** (live property-feed owner match). Lookup is by in-game name (case-insensitive);
   `wallet` is accepted + echoed. The **on-chain layer is a clearly-marked pending stub**
   (`onchain.available=false`) — KINS spent/earned, wheel spins, Kintara Club and wallet verification

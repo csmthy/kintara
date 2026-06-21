@@ -2827,6 +2827,54 @@ def item_floors(con, rate, item_type=None):
     return out
 
 
+def listing_unit_usd(per_unit, currency, rate):
+    if per_unit is None:
+        return None
+    if currency == "token":
+        return per_unit
+    return per_unit * rate if rate else None
+
+
+def active_market_unit_usd(con, item_type, rate, exclude_seller=None):
+    """Market-value anchor for a listed stack.
+
+    Seller asks are not value: players can list 12k wood for 112k gold and poison
+    profile/property totals. Prefer the cheapest buyable listing from another seller,
+    then recent fair value, then the raw floor including the seller as a last resort.
+    """
+    rclause, rparam = _buyable_clause()
+    qfilter = f" AND (category != 'material' OR quantity >= {MIN_BULK_QTY})"
+
+    def floor(exclude):
+        seller_clause = ""
+        params = [item_type, rparam]
+        if exclude:
+            seller_clause = " AND (seller_name IS NULL OR seller_name != ? COLLATE NOCASE)"
+            params.append(exclude)
+        cands = []
+        for r in con.execute(
+                f"""SELECT currency, MIN(per_unit) p FROM listings
+                    WHERE active=1 AND item_type=? AND per_unit IS NOT NULL
+                      AND quantity > 0{rclause}{qfilter}{seller_clause}
+                    GROUP BY currency""", params):
+            usd = listing_unit_usd(r["p"], r["currency"], rate)
+            if usd and usd > 0:
+                cands.append(usd)
+        return min(cands) if cands else None
+
+    if exclude_seller:
+        usd = floor(exclude_seller)
+        if usd is not None:
+            return usd, "market_floor"
+    fair, n = recent_fair_usd(con, item_type)
+    if fair and n:
+        return fair, "recent_fair"
+    usd = floor(None)
+    if usd is not None:
+        return usd, "floor"
+    return None, None
+
+
 def liquidity_score(velocity, listed_qty, sellers, last_age_days):
     """0–100 'can I actually exit this' score from sales velocity, available depth,
     seller competition and recency of the last trade. Deliberately simple + monotone
@@ -4215,7 +4263,8 @@ def make_app():
                     "locked": bool(info.get("locked")),
                     "col0": c[0] if c else None, "col1": c[1] if c else None,
                     "row0": c[2] if c else None, "row1": c[3] if c else None})
-        # cross-ref the marketplace: each owner's active-listing count + USD value
+        # cross-ref the marketplace: each owner's active-listing count + market USD value.
+        # Use market anchors, not seller asks, so joke listings do not inflate property cards.
         names = sorted({p["owner"] for p in plots if p["owner"]})
         market = {}
         if names:
@@ -4227,8 +4276,10 @@ def make_app():
                         f"""SELECT seller_name, currency, per_unit, quantity FROM listings
                             WHERE active=1 AND per_unit IS NOT NULL
                               AND seller_name IN ({qmarks})""", names):
-                    usd = r["per_unit"] if r["currency"] == "token" else (
-                        r["per_unit"] * gold_rate if gold_rate else 0)
+                    ask_unit = listing_unit_usd(r["per_unit"], r["currency"], gold_rate)
+                    market_unit, _src = active_market_unit_usd(
+                        con, r["item_type"], gold_rate, r["seller_name"])
+                    usd = market_unit if market_unit is not None else ask_unit
                     m = market.setdefault(r["seller_name"], {"n": 0, "v": 0.0})
                     m["n"] += 1
                     m["v"] += (usd or 0) * (r["quantity"] or 1)
@@ -4314,22 +4365,37 @@ def make_app():
                 r["label"] = item_label(r["item_type"])
 
             # --- active listings / current inventory ---
-            inv = {"count": 0, "ask_usd": 0.0, "items": [], "categories": {}}
+            inv = {"count": 0, "ask_usd": 0.0, "market_usd": 0.0,
+                   "outlier_count": 0, "items": [], "categories": {}}
             rclause, rparam = _buyable_clause()
             for r in con.execute(
                     f"""SELECT item_type, category, currency, per_unit, quantity, price_gold, price_usd
                         FROM listings WHERE active=1 AND seller_name = ? COLLATE NOCASE
                         AND per_unit IS NOT NULL""", (canon,)):
-                u = usd_of(r["per_unit"], r["currency"]) * (r["quantity"] or 1)
+                qty = r["quantity"] or 1
+                ask_unit = usd_of(r["per_unit"], r["currency"])
+                ask_usd = ask_unit * qty
+                market_unit, value_source = active_market_unit_usd(
+                    con, r["item_type"], rate, canon)
+                if market_unit is None:
+                    market_unit, value_source = ask_unit, "ask"
+                market_usd = (market_unit or 0) * qty
+                ask_multiple = (ask_usd / market_usd) if market_usd else None
+                outlier = bool(ask_multiple and ask_multiple >= 5 and (ask_usd - market_usd) >= 10)
                 inv["count"] += 1
-                inv["ask_usd"] += u
+                inv["ask_usd"] += ask_usd
+                inv["market_usd"] += market_usd
+                if outlier:
+                    inv["outlier_count"] += 1
                 cat = r["category"] or categorize(r["item_type"])
                 inv["categories"][cat] = inv["categories"].get(cat, 0) + 1
                 inv["items"].append({"item_type": r["item_type"], "label": item_label(r["item_type"]),
                                      "qty": r["quantity"], "currency": r["currency"],
                                      "price": r["price_gold"] if r["currency"] == "gold" else r["price_usd"],
-                                     "usd": u})
-            inv["items"].sort(key=lambda x: -x["usd"])
+                                     "ask_usd": ask_usd, "market_usd": market_usd,
+                                     "usd": market_usd, "value_source": value_source,
+                                     "ask_multiple": ask_multiple, "ask_outlier": outlier})
+            inv["items"].sort(key=lambda x: -x["market_usd"])
             inv["items"] = inv["items"][:25]
             first_seen = con.execute(
                 "SELECT MIN(created_at) c, MIN(first_seen) f FROM listings WHERE seller_name = ? COLLATE NOCASE",
@@ -7076,7 +7142,9 @@ function renderPlayer(){
     ${stat('Avg sale', usd(s.avg_sale_usd))}
     ${stat('In gold', (s.gross_gold?Math.round(s.gross_gold).toLocaleString()+'g':'—'), 'gold-priced sales')}
     ${stat('Spent (buy side)', '<span class="pl-pending">on-chain</span>', 'needs wallet + on-chain')}
-    ${stat('Active listings', (d.inventory&&d.inventory.count||0).toLocaleString(), usd(d.inventory&&d.inventory.ask_usd)+' ask value')}
+    ${stat('Active listings', (d.inventory&&d.inventory.count||0).toLocaleString(),
+      usd(d.inventory&&d.inventory.market_usd)+' market value'+
+      (d.inventory&&d.inventory.outlier_count?` · ${d.inventory.outlier_count} ask outlier${d.inventory.outlier_count===1?'':'s'}`:''))}
   </div>`;
   // on-chain pending panel
   const oc=`<div class="pl-panel pl-pendingpanel"><div class="pl-h">On-chain (Solana)</div>
@@ -7100,7 +7168,8 @@ function renderPlayer(){
   const inventory=ivit.length?`<div class="pl-panel"><div class="pl-h">Active listings <span class="mut">${cats}</span></div>
     <div class="pl-list">${ivit.map(x=>`<div class="pl-row"><span class="pl-rn">${esc(x.label)}</span>
       <span class="mut">${x.qty>1?x.qty.toLocaleString()+'×':''}</span>
-      <span class="${x.currency==='gold'?'gold':'usd'}">${x.currency==='gold'?(+Number(x.price).toPrecision(4))+'g':'$'+Number(x.price)}</span></div>`).join('')}</div></div>`:'';
+      <span class="${x.currency==='gold'?'gold':'usd'}">${x.currency==='gold'?(+Number(x.price).toPrecision(4))+'g':'$'+Number(x.price)}</span>
+      ${x.ask_outlier?`<span class="ll-sel" data-tip="seller ask is far above market; profile value uses the market anchor">${usd(x.market_usd)} mkt</span>`:''}</div>`).join('')}</div></div>`:'';
   // property
   const pr=(d.property||[]);
   const prop=pr.length?`<div class="pl-panel"><div class="pl-h">Property owned</div>
