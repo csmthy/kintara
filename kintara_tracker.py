@@ -67,7 +67,13 @@ DB_PATH = os.environ.get("KINTARA_DB", "kintara.db")
 POLL_INTERVAL = _envi("POLL_INTERVAL", 90)        # listing poll seconds (was 45)
 STATS_GAP = _envf("STATS_GAP", 0.5)               # spacing between stats requests
 STATS_STALE_HOT = _envi("STATS_STALE_HOT", 120)   # re-check actively-traded items this often
-STATS_STALE_COLD = _envi("STATS_STALE_COLD", 900) # re-check quiet items this often
+STATS_STALE_COLD = _envi("STATS_STALE_COLD", 420) # re-check quiet items this often (was 900 — tightened so cold items' sales aren't missed)
+# Sale detection: short startup window during which the FIRST sighting of an item-day is
+# treated as pre-existing backlog (so a restart doesn't replay the whole day as "now").
+# After it, a first-sighting with sales is logged as real (e.g. day-rollover / new item).
+SALES_STARTUP_GRACE = _envi("SALES_STARTUP_GRACE", 600)
+SALES_BACKFILL_INTERVAL = _envi("SALES_BACKFILL_INTERVAL", 180)  # reconcile logged events to the in-game count
+_app_start = time.time()
 KINTARA_MIN_GAP = _envf("KINTARA_MIN_GAP", 0.5)   # global min gap between ANY two kintara.gg hits
 KINTARA_BACKOFF = _envf("KINTARA_BACKOFF", 45)    # pause this long after a 429/403 (rate-limited)
 # Historical order-book pipeline. Snapshots are computed from our OWN DB (no kintara
@@ -386,6 +392,8 @@ def init_db() -> None:
         CREATE TABLE IF NOT EXISTS sales_daily (
             item_type TEXT, currency TEXT, date TEXT,
             sales INTEGER, avg_price REAL,
+            base INTEGER DEFAULT 0,     -- /stats count to skip (cold-start backlog); sale
+                                        -- logging reconciles events up to (sales - base)
             PRIMARY KEY (item_type, currency, date)
         );
         CREATE INDEX IF NOT EXISTS idx_sd_item ON sales_daily(item_type, currency);
@@ -533,6 +541,18 @@ def init_db() -> None:
             if c not in se_cols:
                 con.execute(f"ALTER TABLE sales_events ADD COLUMN {c} {decl}")
         con.execute("DELETE FROM sales_events")   # legacy rows had count-not-quantity semantics
+    sd_cols = {r["name"] for r in con.execute("PRAGMA table_info(sales_daily)")}
+    if "base" not in sd_cols:
+        con.execute("ALTER TABLE sales_daily ADD COLUMN base INTEGER DEFAULT 0")
+    # ONE-TIME baseline: existing sales_daily rows hold the full in-game backlog (counts
+    # accumulated before this detector existed). Mark that backlog as already-accounted
+    # (base = sales) so the audit/backfill don't replay thousands of historical sales as
+    # "now"; only NEW sales past this point get logged. Guarded by a settings flag so it
+    # runs exactly once even though the `base` column may already exist (added empty earlier).
+    if get_setting(con, "sales_base_init") != "1":
+        con.execute("UPDATE sales_daily SET base=COALESCE(sales,0)")
+        con.commit()
+        set_setting(con, "sales_base_init", "1")
     con.execute("CREATE INDEX IF NOT EXISTS idx_l_sold ON listings(item_type,currency,sold_claimed,removed_at)")
     con.execute(
         "UPDATE listings SET per_unit = unit_price*1.0/quantity "
@@ -1169,7 +1189,6 @@ def _upsert_stats(con, it, cur, day, day_sales, avg30d, day_avg=None):
 
 
 SALE_MATCH_WINDOW_MS = 45 * 60 * 1000   # only attribute removals we captured this recently
-SALE_PRICE_TOL = 0.18                    # first-baseline: per_unit must be within this of marginal
 
 
 def _marginal_price(old_sales, old_avg, new_sales, new_avg, delta):
@@ -1183,14 +1202,13 @@ def _marginal_price(old_sales, old_avg, new_sales, new_avg, delta):
     return price
 
 
-def _log_sales(con, it, cur, d, delta, marginal, strict):
-    """Attribute `delta` CONFIRMED sales (the /stats sale-count rise — cancellations don't
-    move it) to recently-captured, unclaimed REMOVED listings of (it,cur), recovering the
-    real stack quantity, seller, price and time-on-market. Candidates are ranked by how
-    close their per-unit is to the marginal sold price, so the genuinely-sold listing wins
-    over a coincidental cancellation. `strict` (the first time we ever see this item-day)
-    requires a price match AND emits no synthetic rows — so pre-tracking history is never
-    replayed as 'now'; we only log sales whose listing we actually watched vanish."""
+def _log_sales(con, it, cur, d, n, marginal):
+    """Log `n` sale events for (it,cur,day), attributing each to a recently-captured,
+    unclaimed REMOVED listing of (it,cur) where possible (recovering the real stack qty,
+    seller, price and time-on-market), ranked by how close its per-unit is to the marginal
+    sold price so the genuinely-sold listing beats a coincidental cancellation. Any sales
+    we can't match to a captured listing are logged as synthetic rows (qty/seller unknown)
+    so the count still reconciles. Returns how many were matched to real listings."""
     now = int(time.time() * 1000)
     cutoff_iso = datetime.fromtimestamp(
         (now - SALE_MATCH_WINDOW_MS) / 1000, timezone.utc).isoformat()
@@ -1207,12 +1225,10 @@ def _log_sales(con, it, cur, d, delta, marginal, strict):
             return 1e9
         return abs(pu - marginal) / marginal
 
-    logged = 0
+    matched = 0
     for r in sorted(cands, key=closeness):
-        if logged >= delta:
+        if matched >= n:
             break
-        if strict and closeness(r) > SALE_PRICE_TOL:
-            continue
         pu = r["per_unit"]
         total = r["price_gold"] if cur == "gold" else r["price_usd"]
         if total is None and pu is not None and r["quantity"]:
@@ -1226,30 +1242,25 @@ def _log_sales(con, it, cur, d, delta, marginal, strict):
             (it, cur, 1, r["quantity"], pu if pu is not None else marginal, total,
              r["seller_id"], r["seller_name"], lms, r["id"], d, now))
         con.execute("UPDATE listings SET sold_claimed=1 WHERE id=?", (r["id"],))
-        logged += 1
-    # confirmed-but-unmatched: we know a sale happened (count + price) but missed the
-    # listing capture — log a synthetic row (qty unknown) so we don't re-detect it. Never
-    # on the first baseline (that delta may be pre-tracking history we never witnessed).
-    if not strict:
-        for _ in range(delta - logged):
-            con.execute(
-                """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
-                   seller_id,seller_name,listing_ms,listing_id,day,ts)
-                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-                (it, cur, 1, None, marginal, None, None, None, None, None, d, now))
-    return logged
+        matched += 1
+    for _ in range(n - matched):       # confirmed sales we couldn't match a listing to
+        con.execute(
+            """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
+               seller_id,seller_name,listing_ms,listing_id,day,ts)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (it, cur, 1, None, marginal, None, None, None, None, None, d, now))
+    return matched
 
 
 def _archive_samples(con, it, cur, samples):
-    """Persist every daily sample. Past days are immutable; the current day's
-    partial figure updates in place. Caller commits.
-
-    Also detects ACTUAL SALES: when a day we've already recorded shows MORE completed
-    sales than before, the increment is real (cancellations don't touch /stats' sale
-    count), so we log a `sales_events` row for the newly-sold units at their marginal
-    price. We only log on an UPDATE (a day we'd already baselined) — the first time we
-    see a day we just record the count silently, so pre-existing sales aren't replayed
-    as if they happened now."""
+    """Persist every daily sample AND detect ACTUAL SALES against the authoritative /stats
+    completed-sale COUNT (cancellations don't move it). Detection is count-based and
+    self-healing: for each item-day we keep the number of sale events we've logged equal to
+    `stats_count − base`, where `base` is the cold-start backlog we deliberately skip (set
+    only the FIRST time we see an item-day during the startup grace, so a restart doesn't
+    replay the whole day as 'now'). Because it reconciles by *count of logged events*, it
+    cooperates with the instant removal/reservation detector (those events already count) —
+    no double-logging — and it no longer silently swallows the first sale of a new day."""
     for sm in samples or []:
         d = sm.get("date")
         if not d:
@@ -1257,25 +1268,162 @@ def _archive_samples(con, it, cur, samples):
         new_sales = sm.get("sales")
         new_avg = sm.get("avgUnitPrice")
         prev = con.execute(
-            "SELECT sales, avg_price FROM sales_daily WHERE item_type=? AND currency=? AND date=?",
+            "SELECT sales, avg_price, base FROM sales_daily WHERE item_type=? AND currency=? AND date=?",
             (it, cur, d)).fetchone()
+        if prev is None:
+            # first sighting of this item-day. During the startup grace, treat whatever
+            # /stats already shows as pre-existing backlog (skip it); after the grace, a
+            # first sighting is a genuine new day / new item, so count from zero.
+            base = (new_sales or 0) if (time.time() - _app_start < SALES_STARTUP_GRACE) else 0
+            prev_sales, prev_avg = base, None
+        else:
+            base = prev["base"] or 0
+            prev_sales, prev_avg = prev["sales"], prev["avg_price"]
         if new_sales is not None:
-            if prev is None:
-                # first time we've ever seen this item-day: catch sales we can corroborate
-                # with a recently-captured, price-matching removal; don't replay history.
-                if new_sales > 0:
-                    marg = _marginal_price(0, None, new_sales, new_avg, new_sales)
-                    _log_sales(con, it, cur, d, new_sales, marg, strict=True)
-            elif prev["sales"] is not None and new_sales > prev["sales"]:
-                delta = new_sales - prev["sales"]
-                marg = _marginal_price(prev["sales"], prev["avg_price"], new_sales, new_avg, delta)
-                _log_sales(con, it, cur, d, delta, marg, strict=False)
+            logged = con.execute(
+                "SELECT COUNT(*) c FROM sales_events WHERE item_type=? AND currency=? AND day=?",
+                (it, cur, d)).fetchone()["c"]
+            to_log = new_sales - base - logged
+            if to_log > 0:
+                inc = new_sales - prev_sales            # true /stats rise (for the price back-out)
+                marg = _marginal_price(prev_sales, prev_avg, new_sales, new_avg, inc if inc > 0 else to_log)
+                _log_sales(con, it, cur, d, to_log, marg)
         con.execute(
-            """INSERT INTO sales_daily(item_type,currency,date,sales,avg_price)
-               VALUES(?,?,?,?,?)
+            """INSERT INTO sales_daily(item_type,currency,date,sales,avg_price,base)
+               VALUES(?,?,?,?,?,?)
                ON CONFLICT(item_type,currency,date) DO UPDATE SET
                  sales=excluded.sales, avg_price=excluded.avg_price""",
-            (it, cur, d, new_sales, new_avg))
+            (it, cur, d, new_sales, new_avg, base))
+
+
+def detect_removal_sales(con, gone_ids):
+    """Instant, high-confidence sale detection from the listing poll (every ~90s) — so a
+    valuable sale is caught the moment its listing vanishes, independent of the slower
+    /stats rotation. A just-removed listing is logged as a sale when:
+      • it was RESERVED (reserved_by/until set) and then vanished — a reservation that
+        completes IS a purchase (works for any item), or
+      • it's a collectible (cosmetic/mount/pet) and the same seller does NOT still have an
+        active listing of that item — i.e. it wasn't a cancel-and-relist undercut.
+    Events are logged with the captured qty/price/seller/time-on-market and the listing is
+    marked sold_claimed, so the count-based /stats reconciler credits them (no double-log).
+    Caller passes the ids just marked removed; caller commits."""
+    if not gone_ids:
+        return 0
+    now_ms = int(time.time() * 1000)
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    logged = 0
+    qmarks = ",".join("?" * len(gone_ids))
+    rows = con.execute(
+        f"""SELECT id,item_type,category,currency,quantity,per_unit,price_gold,price_usd,
+                   seller_id,seller_name,reserved_by,reserved_until,created_at,removed_at,sold_claimed
+            FROM listings WHERE id IN ({qmarks})""", list(gone_ids)).fetchall()
+    for r in rows:
+        if r["sold_claimed"]:
+            continue
+        cat = r["category"] or categorize(r["item_type"])
+        was_reserved = (r["reserved_by"] is not None) or (r["reserved_until"] is not None)
+        is_sale = False
+        if was_reserved:
+            is_sale = True                       # a reservation that vanished = completed purchase
+        elif cat in ("cosmetic", "mount", "pet"):
+            relisted = con.execute(
+                "SELECT 1 FROM listings WHERE active=1 AND item_type=? AND seller_id=? LIMIT 1",
+                (r["item_type"], r["seller_id"])).fetchone()
+            is_sale = relisted is None           # not a cancel-and-relist by the same seller
+        if not is_sale:
+            continue
+        pu = r["per_unit"]
+        total = r["price_gold"] if r["currency"] == "gold" else r["price_usd"]
+        if total is None and pu is not None and r["quantity"]:
+            total = pu * r["quantity"]
+        c0, c1 = _parse_iso_ms(r["created_at"]), _parse_iso_ms(r["removed_at"])
+        lms = (c1 - c0) if (c0 and c1 and c1 >= c0) else None
+        con.execute(
+            """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
+               seller_id,seller_name,listing_ms,listing_id,day,ts)
+               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (r["item_type"], r["currency"], 1, r["quantity"], pu, total,
+             r["seller_id"], r["seller_name"], lms, r["id"], today, now_ms))
+        con.execute("UPDATE listings SET sold_claimed=1 WHERE id=?", (r["id"],))
+        logged += 1
+    return logged
+
+
+def audit_sales(con, days=14):
+    """Cross-check our logged sale events against the HARD in-game number — the `/stats`
+    daily completed-sale count (the same figure behind the in-game per-day sales graph),
+    stored in sales_daily. For each item-day: `sales` = in-game count, `base` = cold-start
+    backlog we skip, `logged` = sale events we recorded, `missing = sales − base − logged`
+    (>0 ⇒ we're behind the in-game number). Returns totals + the item-days we're behind on."""
+    cutoff = (datetime.now(timezone.utc) - _td(days=days)).strftime("%Y-%m-%d")
+    logged = {}
+    for r in con.execute(
+            "SELECT item_type,currency,day,COUNT(*) c FROM sales_events WHERE day>=? "
+            "GROUP BY item_type,currency,day", (cutoff,)):
+        logged[(r["item_type"], r["currency"], r["day"])] = r["c"]
+    tot_ingame = tot_logged = tot_missing = behind = 0
+    gaps = []
+    for r in con.execute(
+            "SELECT item_type,currency,date,COALESCE(sales,0) s,COALESCE(base,0) b "
+            "FROM sales_daily WHERE date>=?", (cutoff,)):
+        exp = max(0, r["s"] - r["b"])
+        lg = logged.get((r["item_type"], r["currency"], r["date"]), 0)
+        miss = exp - lg
+        tot_ingame += r["s"]
+        tot_logged += lg
+        if miss > 0:
+            tot_missing += miss
+            behind += 1
+            gaps.append({"item_type": r["item_type"], "label": item_label(r["item_type"]),
+                         "currency": r["currency"], "day": r["date"],
+                         "in_game": r["s"], "logged": lg, "missing": miss})
+    gaps.sort(key=lambda g: -g["missing"])
+    return {"days": days, "in_game_total": tot_ingame, "logged_total": tot_logged,
+            "missing_total": tot_missing, "item_days_behind": behind, "gaps": gaps}
+
+
+def backfill_sales(con, days=3):
+    """Safety net using the hard in-game number: for recent item-days, ensure logged sale
+    events == in-game count − base, backfilling any shortfall (e.g. a transient miss or an
+    item that wasn't polled when the sale happened). Count-based, so it never double-logs
+    what the instant/poll detectors already recorded. Caller commits. Returns # backfilled."""
+    cutoff = (datetime.now(timezone.utc) - _td(days=days)).strftime("%Y-%m-%d")
+    rows = con.execute(
+        "SELECT item_type,currency,date,COALESCE(sales,0) s,COALESCE(base,0) b,avg_price "
+        "FROM sales_daily WHERE date>=?", (cutoff,)).fetchall()
+    fixed = 0
+    for r in rows:
+        exp = r["s"] - r["b"]
+        if exp <= 0:
+            continue
+        lg = con.execute(
+            "SELECT COUNT(*) c FROM sales_events WHERE item_type=? AND currency=? AND day=?",
+            (r["item_type"], r["currency"], r["date"])).fetchone()["c"]
+        miss = exp - lg
+        if miss > 0:
+            _log_sales(con, r["item_type"], r["currency"], r["date"], miss, r["avg_price"])
+            fixed += miss
+    return fixed
+
+
+def sales_audit_loop(interval=None):
+    """Periodically reconcile logged sale events to the hard in-game /stats count (DB-only,
+    no network). The guarantee that we converge on the in-game number even if a per-poll
+    detection slipped."""
+    interval = interval or SALES_BACKFILL_INTERVAL
+    while True:
+        time.sleep(interval)
+        try:
+            con = connect()
+            try:
+                n = backfill_sales(con)
+                if n:
+                    con.commit()
+                    print(f"[{now_iso()}] sales backfill: +{n} from in-game count")
+            finally:
+                con.close()
+        except Exception as e:
+            print(f"[{now_iso()}] sales backfill error: {e}")
 
 
 def _mark_stats_attempt(con, it, cur):
@@ -2212,6 +2360,13 @@ def reconcile(con, listings, complete):
             con.execute("UPDATE listings SET active=0,removed_at=? WHERE id=?",
                         (ts, lid))
         newly_removed = len(gone)
+        # instant sale detection: a reserved listing that vanished (any item) or a
+        # collectible that vanished without the seller relisting = a completed sale,
+        # caught now rather than waiting for the slow /stats rotation.
+        try:
+            detect_removal_sales(con, gone)
+        except Exception as e:
+            print(f"[{now_iso()}] removal-sale detect error: {e}")
     con.execute("INSERT INTO polls(ts,active,removed,ok) VALUES(?,?,?,?)",
                 (ts, len(seen), newly_removed, 1 if complete else 0))
     con.commit()
@@ -3094,6 +3249,19 @@ def make_app():
             if len(out) >= limit:
                 break
         return jsonify(out)
+
+    @app.route("/api/sales-audit")
+    def sales_audit():
+        """Self-check: compare our logged sale events against the HARD in-game number (the
+        /stats per-day completed-sale count behind the in-game sales graph). Returns
+        in-game vs logged totals over the window + any item-days we're behind on. A healthy
+        feed has `missing_total` ~0; the backfill loop keeps it converged."""
+        days = min(60, max(1, int(request.args.get("days", 14) or 14)))
+        con = connect(readonly=True)
+        try:
+            return jsonify({"ok": True, **audit_sales(con, days)})
+        finally:
+            con.close()
 
     @app.route("/icon/<item_type>")
     def icon(item_type):
@@ -4035,6 +4203,9 @@ td.isd{cursor:help}
 .qbadge{padding:2px 8px;border-radius:999px;font:600 11px var(--mono);
   color:var(--gold2);border:1px solid rgba(232,181,74,.35);background:rgba(232,181,74,.07)}
 .qbadge.zero{color:var(--buy);border-color:rgba(52,211,154,.3);background:rgba(52,211,154,.06)}
+.sales-cov{font:600 12px var(--ui);margin:0 2px 10px}
+.sales-cov .cov-ok{color:var(--buy)} .sales-cov .cov-warn{color:var(--gold2)}
+.sales-cov b{font-family:var(--mono)}
 .badges2{display:inline-flex;gap:5px;align-items:center;flex-wrap:wrap;justify-content:flex-end}
 .qbadge.boss{color:#d98cff;border-color:rgba(190,120,255,.4);background:rgba(190,120,255,.10)}
 .qbadge.boss.zero{color:var(--mut);border-color:var(--line);background:rgba(255,255,255,.02)}
@@ -4626,7 +4797,7 @@ const state={dir:"gold_to_kins", fee:0, goldItem:null, items:[], cats:[], labels
   mpCur:"kins", mpOpen:null, mpRowMap:{}, mpCatOff:new Set(), mpCatInit:false,
   catOff:new Set(), profitableOnly:false, soldOnly:false, search:"", minQty:0, viewSet:[],
   histItem:null, histCur:"token", histCat:"all", histSort:"most", histOpen:null, histWindow:1,
-  goldMode:"gold_usd", goldRange:"1D", srvOpen:false, mintQty:1, merchResOpen:null,
+  goldMode:"gold_usd", goldRange:"1D", srvOpen:false, mintQty:1, merchResOpen:null, salesCov:"",
   liveShard:1, liveSel:null, liveSearch:"", liveSearchBusy:false, liveSearchStatus:"", propSel:null, servers:[]};
 
 /* Commodities (materials/potions/food) trade in bulk — a single unit is a fraction of a
@@ -5304,6 +5475,7 @@ function listingControls(){
   </div><div id="ltable"></div>`;
 }
 const fstate={q:"",currency:"all",category:"all",sort:"latest",auto:true};
+let ltableOwner=null;   // which tab ('live'/'removed') currently owns the shared #ltable + controls
 function bindListingControls(reload){
   defineMorph($("#ltable"));   // flicker-free table refreshes
   $("#q").addEventListener("input",e=>{fstate.q=e.target.value;reload();});
@@ -5323,9 +5495,12 @@ function rowIcon(r){ const fb=(CAT_EMO[r.category]||"📦").replace(/'/g,"");
     `onerror="this.parentElement.textContent='${fb}'"></span>`; }
 
 async function loadLive(){
-  if(!$("#ltable")){ await loadItems();
-    $("#view").innerHTML=listingControls(); bindListingControls(loadLive); }
+  // (re)build the shared controls if this tab doesn't already own them (Live listings and
+  // Sales feed share #ltable + the filter bar, so switching between them must rebind).
+  if(!$("#ltable") || ltableOwner!=="live"){ await loadItems();
+    $("#view").innerHTML=listingControls(); ltableOwner="live"; bindListingControls(loadLive); }
   const rows=await (await fetch("/api/current?"+lqs())).json();
+  if(TAB!=="live" || !$("#ltable")) return;   // tab changed mid-fetch — don't clobber the other table
   $("#ltable").innerHTML = !rows.length
     ? `<div class="empty">No live listings match.</div>`
     : `<table><thead><tr><th>item</th><th>seller</th><th class="num">qty</th>
@@ -5350,10 +5525,12 @@ function saleAmt(r){
 }
 function salePrice(r){ return saleAmt(r); }   // back-compat alias
 async function loadRemoved(){   // "Sales feed" tab — ACTUAL completed sales (rich rows)
-  if(!$("#ltable")){ await loadItems();
-    $("#view").innerHTML=listingControls(); bindListingControls(loadRemoved); }
+  if(!$("#ltable") || ltableOwner!=="removed"){ await loadItems();
+    $("#view").innerHTML=listingControls(); ltableOwner="removed"; bindListingControls(loadRemoved); }
   const rows=await (await fetch("/api/sales-feed?"+lqs())).json();
-  $("#ltable").innerHTML = !rows.length
+  if(TAB!=="removed" || !$("#ltable")) return;   // tab changed mid-fetch — don't clobber the other table
+  salesCoverage();   // cross-check vs the in-game number (async, fills the badge when ready)
+  $("#ltable").innerHTML = (!rows.length
     ? `<div class="empty">No sales recorded yet. This feed logs <b>actual completed sales</b> — each matched to the listing that vanished, so you see the real stack size, total paid, seller and how long it sat. Cancellations are excluded. Fills in going forward.</div>`
     : `<table><thead><tr><th>item</th><th class="num">qty sold</th><th class="num">total paid</th>
         <th>seller</th><th class="num">time listed</th><th class="num">when</th></tr></thead><tbody>`+
@@ -5362,7 +5539,20 @@ async function loadRemoved(){   // "Sales feed" tab — ACTUAL completed sales (
         <td class="num ${r.currency==='gold'?'gold':'usd'}">${saleAmt(r)}</td>
         <td class="mut">${r.seller?esc(r.seller):'<span data-tip="listing not captured">~est</span>'}</td>
         <td class="num mut">${r.listing_ms!=null?durStr(r.listing_ms):'—'}</td>
-        <td class="num mut">${relAbs(r.ts)}</td></tr>`).join("")+`</tbody></table>`;
+        <td class="num mut">${relAbs(r.ts)}</td></tr>`).join("")+`</tbody></table>`);
+  // coverage badge slot (filled by salesCoverage) — sits above the table
+  if($("#ltable") && !$("#salescov")) $("#ltable").insertAdjacentHTML("beforebegin",
+    `<div id="salescov" class="sales-cov">${state.salesCov||''}</div>`);
+}
+/* cross-check the feed against the hard in-game /stats count and show coverage */
+async function salesCoverage(){
+  let d; try{ d=await (await fetch("/api/sales-audit?days=14")).json(); }catch(e){ return; }
+  if(!d||d.ok===false) return;
+  const miss=d.missing_total;          // shortfall vs the in-game /stats count (skips pre-tracking backlog)
+  state.salesCov = miss<=0
+    ? `<span class="cov-ok">✓ in sync with the in-game sales counter (14d)</span>`
+    : `<span class="cov-warn">⚠ behind the in-game counter by <b>${miss.toLocaleString()}</b> sale${miss===1?'':'s'} on ${d.item_days_behind} item-day${d.item_days_behind===1?'':'s'} — backfilling</span>`;
+  const el=$("#salescov"); if(el && TAB==="removed") el.innerHTML=state.salesCov;
 }
 
 /* ---------------- sales index (game-styled, real Kintara sales) ----------- */
@@ -6583,6 +6773,7 @@ def main():
     threading.Thread(target=snapshot_loop, daemon=True).start()         # order-book history (Substrate A)
     threading.Thread(target=rollup_loop, daemon=True).start()           # daily metrics + prune (Substrate B)
     threading.Thread(target=merchant_snapshot_loop, daemon=True).start()  # merchant campaign history
+    threading.Thread(target=sales_audit_loop, daemon=True).start()  # reconcile sales to in-game count
     _spectate_hub.start()   # live-world spectator hub (connects per shard on demand)
     _boss_census.start()    # boss-area census for the server bubble (resolves the region key)
     hosted = args.host not in ("127.0.0.1", "localhost")

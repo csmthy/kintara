@@ -326,6 +326,9 @@ Schema migrations are handled inline in `init_db()` (ALTER + backfill for older 
   a pittance" dump doesn't set the floor.
 - `GET /api/merchant-history` — each campaign resource's donation **% over time** (and the overall %),
   from `merchant_snapshots`. Drives the click-to-expand chart on each Merchant resource bar.
+- `GET /api/sales-audit?days=` — self-check of the sales feed vs the **hard in-game `/stats` count**:
+  `in_game_total`, `logged_total`, `missing_total`, `item_days_behind`, and the `gaps` we're behind on.
+  Drives the Sales-feed coverage line; the backfill loop keeps `missing_total` ~0.
 - `GET /api/merchant-events` — **merchant RESTOCK timestamps** (campaign-fill / gold-stock-refill), last
   ~90 days, from `merchant_events`. The frontend overlays these as **gold markers** on the floor, sales and
   gold-price charts (a restock is a market-wide shock worth anchoring for research).
@@ -567,12 +570,15 @@ A site-wide quality-of-life pass that sits under every tab:
 - `removed`/`active=0` ≠ guaranteed sale (that's why the **Sales feed** is now driven by `sales_events`,
   detected from kintara's own completed-sale counter, not by listing removals).
 - The actual-sales feed is **per-sale** (one row per completed sale, matched to the vanished listing for
-  the real stack qty/seller/duration), but its **timing** is still gated by the `/stats` poll cadence —
-  a sale is detected when the stats loop next re-checks that item (items with a fresh unclaimed removal
-  jump the queue, so high-value sales surface within a poll; quiet items can lag minutes). When we can't
-  match a confirmed sale to a captured listing, it shows as a `qty —`/`~est` row (price known, stack
-  unknown). Gold sale prices inherit the `/stats` 2-dp rounding (coarse for cheap goods); USD/$KINS are
-  exact.
+  the real stack qty/seller/duration). Detection is **multi-signal**: an instant path (run every listing
+  poll, ~90s) logs reservations-that-completed and collectibles-that-vanished-without-relisting right
+  away; a count-based `/stats` reconciler catches everything else (including the first sale of a day) and
+  tops up to the authoritative count, deduped against the instant path. `/stats`-only sales still lag the
+  cold-poll cadence (~≤7 min for quiet items). When we can't match a confirmed sale to a captured listing
+  it shows as a `qty —`/`~est` row (price known, stack unknown). Gold sale prices inherit the `/stats`
+  2-dp rounding (coarse for cheap goods); USD/$KINS are exact. **Rare over-count:** if a collectible was
+  truly delisted (not sold) and never relisted, the instant path counts it once — acceptably rare vs the
+  cost of missing real sales.
 - Profit is an upper bound (no buy orders to price against; you'd undercut to sell).
 - KINS pumped ~60× since launch, so KINS/gold over ALL legitimately spans ~45,000→~340
   (auto log-scale handles it — not a bug).
@@ -605,6 +611,37 @@ A site-wide quality-of-life pass that sits under every tab:
 
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
+
+- **Sales cross-check against the hard in-game number + auto-backfill:** the `/stats` per-day
+  completed-sale count (the figure behind the in-game sales graph) is treated as ground truth and we now
+  continuously reconcile to it. New `audit_sales()` compares our logged `sales_events` vs the in-game
+  count per item-day (`missing = sales − base − logged`); `backfill_sales()` (run by `sales_audit_loop`
+  every ~3 min, DB-only) tops up any shortfall so we converge on the in-game number even if a per-poll
+  detection slipped. New `/api/sales-audit?days=` returns the comparison, and the **Sales feed** shows a
+  coverage line ("✓ in sync with the in-game sales counter" / "⚠ behind by N — backfilling"). A **one-time
+  baseline** (`sales_base_init` settings flag) sets `base = sales` on existing `sales_daily` rows so the
+  pre-detector historical backlog isn't replayed as "now" (verified: a seeded 3-sale shortfall was
+  detected and backfilled to 0; live audit shows missing 0 after baseline).
+
+- **Sale detection overhaul — stop missing sales (top priority):** we were still missing sales (e.g. a
+  $333 purple-aura sale). Root cause: the **first sale of an item-day was silently swallowed** — the old
+  detector only logged on a /stats COUNT *increment* against an already-baselined day, and the first
+  sighting baselined silently unless we'd captured a price-matching removal. Rebuilt detection to be
+  multi-signal and self-healing:
+  1. **Count-based reconciliation** (`_archive_samples`): for each item-day we keep the number of logged
+     `sales_events` equal to `stats_count − base`, where new `sales_daily.base` is the cold-start backlog
+     we deliberately skip (set only on a first sighting *within* a short `SALES_STARTUP_GRACE`, so a
+     restart doesn't replay the whole day, but a genuine first-sale-of-day/new-day IS logged). Because it
+     reconciles by **count of events**, it cooperates with the instant detector below — no double-logging
+     — and no longer swallows first sales. `_log_sales` now matches each sale to the closest captured
+     removal (real qty/seller/price/time-on-market) and logs a synthetic row for any it can't match.
+  2. **Instant removal/reservation detection** (`detect_removal_sales`, run every listing poll): a
+     **reserved** listing that vanishes (a completed purchase, any item) or a **collectible** that vanishes
+     **without the seller relisting** (not a cancel-and-relist undercut) is logged as a sale immediately —
+     catching valuable sales within ~90s, independent of the slower /stats rotation, with exact details.
+  3. **Tighter cold polling:** `STATS_STALE_COLD` 900→**420s** so quiet items (auras/cosmetics) get
+     re-checked far more often. Verified: first-sale-of-day caught, reservation completion caught instantly,
+     /stats reconcile doesn't double-count, /stats still tops up missed sales, cancel-and-relist ignored.
 
 - **Mobile layout pass:** added a phone stylesheet (`@media (max-width:680px)` + a ≤400px tweak at the end
   of the `<style>` block) — **desktop is untouched**, everything is an override for small screens.
