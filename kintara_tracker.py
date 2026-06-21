@@ -601,6 +601,17 @@ def init_db() -> None:
     con.execute(
         "UPDATE sales_daily SET base=0 WHERE date>=? AND COALESCE(base,0)>0",
         (recent_sales_cutoff_day(),))
+    # ONE-TIME cleanup: delete cancellations-logged-as-sales (any item-day where we have more
+    # sale events than kintara's /stats count of real sales — see purge_overcounted_sales).
+    if get_setting(con, "sales_purge_v1") != "1":
+        try:
+            n = purge_overcounted_sales(con)
+            con.commit()
+            set_setting(con, "sales_purge_v1", "1")
+            if n:
+                print(f"[{now_iso()}] purged {n} over-counted (cancellation) sale events")
+        except Exception as e:
+            print(f"[{now_iso()}] sales purge error: {e}")
     con.execute("CREATE INDEX IF NOT EXISTS idx_l_sold ON listings(item_type,currency,sold_claimed,removed_at)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_se_item_day ON sales_events(item_type,currency,day)")
     con.execute(
@@ -1361,57 +1372,41 @@ def _archive_samples(con, it, cur, samples):
             (it, cur, d, new_sales, new_avg, base))
 
 
-def detect_removal_sales(con, gone_ids):
-    """Instant, high-confidence sale detection from the listing poll (every ~90s) — so a
-    valuable sale is caught the moment its listing vanishes, independent of the slower
-    /stats rotation. A just-removed listing is logged as a sale when:
-      • it was RESERVED (reserved_by/until set) and then vanished — a reservation that
-        completes IS a purchase (works for any item), or
-      • it's a collectible (cosmetic/mount/pet) and the same seller does NOT still have an
-        active listing of that item — i.e. it wasn't a cancel-and-relist undercut.
-    Events are logged with the captured qty/price/seller/time-on-market and the listing is
-    marked sold_claimed, so the count-based /stats reconciler credits them (no double-log).
-    Caller passes the ids just marked removed; caller commits."""
-    if not gone_ids:
-        return 0
-    now_ms = int(time.time() * 1000)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    logged = 0
-    qmarks = ",".join("?" * len(gone_ids))
+def purge_overcounted_sales(con, days=None):
+    """Clean cancellations-logged-as-sales: kintara's /stats completed-sale COUNT is the hard
+    ceiling on real sales for an item-day (cancellations never move it), so if we have MORE
+    sale events than that count, the excess are false (from old removed-listings logging or
+    the since-removed speculative removal detector). For each (item,currency,date) we delete
+    `logged − in_game_count` events, removing the most price-IMPLAUSIBLE first (biggest
+    distance from the day's avg sale price — so absurd ones like $500 wood go first). Never
+    deletes when logged ≤ count, so genuine data is safe. `days` limits to recent dates.
+    Returns # deleted. Caller commits."""
+    deleted = 0
+    where = "WHERE sales IS NOT NULL"
+    args = []
+    if days:
+        where += " AND date >= ?"
+        args.append((datetime.now(timezone.utc) - _td(days=days)).strftime("%Y-%m-%d"))
     rows = con.execute(
-        f"""SELECT id,item_type,category,currency,quantity,per_unit,price_gold,price_usd,
-                   seller_id,seller_name,reserved_by,reserved_until,created_at,removed_at,sold_claimed
-            FROM listings WHERE id IN ({qmarks})""", list(gone_ids)).fetchall()
+        f"SELECT item_type, currency, date, COALESCE(sales,0) cnt, avg_price "
+        f"FROM sales_daily {where}", args).fetchall()
     for r in rows:
-        if r["sold_claimed"]:
+        it, cur, d, cnt, avg = r["item_type"], r["currency"], r["date"], r["cnt"], r["avg_price"]
+        evs = con.execute(
+            "SELECT id, price FROM sales_events WHERE item_type=? AND currency=? AND day=?",
+            (it, cur, d)).fetchall()
+        excess = len(evs) - cnt
+        if excess <= 0:
             continue
-        cat = r["category"] or categorize(r["item_type"])
-        was_reserved = (r["reserved_by"] is not None) or (r["reserved_until"] is not None)
-        is_sale = False
-        if was_reserved:
-            is_sale = True                       # a reservation that vanished = completed purchase
-        elif cat in ("cosmetic", "mount", "pet"):
-            relisted = con.execute(
-                "SELECT 1 FROM listings WHERE active=1 AND item_type=? AND seller_id=? LIMIT 1",
-                (r["item_type"], r["seller_id"])).fetchone()
-            is_sale = relisted is None           # not a cancel-and-relist by the same seller
-        if not is_sale:
-            continue
-        pu = r["per_unit"]
-        total = r["price_gold"] if r["currency"] == "gold" else r["price_usd"]
-        if total is None and pu is not None and r["quantity"]:
-            total = pu * r["quantity"]
-        c0, c1 = _parse_iso_ms(r["created_at"]), _parse_iso_ms(r["removed_at"])
-        lms = (c1 - c0) if (c0 and c1 and c1 >= c0) else None
-        con.execute(
-            """INSERT INTO sales_events(item_type,currency,units,qty,price,total,
-               seller_id,seller_name,listing_ms,listing_id,day,ts)
-               VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (r["item_type"], r["currency"], 1, r["quantity"], pu, total,
-             r["seller_id"], r["seller_name"], lms, r["id"], today, now_ms))
-        con.execute("UPDATE listings SET sold_claimed=1 WHERE id=?", (r["id"],))
-        logged += 1
-    return logged
+        # delete the least-plausible first: furthest from the day's avg sale price
+        def implausible(e):
+            if avg and e["price"] is not None and avg > 0:
+                return abs(e["price"] - avg) / avg
+            return 0
+        for e in sorted(evs, key=implausible, reverse=True)[:excess]:
+            con.execute("DELETE FROM sales_events WHERE id=?", (e["id"],))
+            deleted += 1
+    return deleted
 
 
 def audit_sales(con, days=14):
@@ -1482,14 +1477,15 @@ def sales_audit_loop(interval=None):
         try:
             con = connect()
             try:
-                n = backfill_sales(con)
-                if n:
+                n = backfill_sales(con)              # add up to the in-game count
+                d = purge_overcounted_sales(con, days=4)  # trim anything above it (recent days)
+                if n or d:
                     con.commit()
-                    print(f"[{now_iso()}] sales backfill: +{n} from in-game count")
+                    print(f"[{now_iso()}] sales reconcile: +{n} backfilled, -{d} over-counted")
             finally:
                 con.close()
         except Exception as e:
-            print(f"[{now_iso()}] sales backfill error: {e}")
+            print(f"[{now_iso()}] sales reconcile error: {e}")
 
 
 def _mark_stats_attempt(con, it, cur):
@@ -2479,13 +2475,14 @@ def reconcile(con, listings, complete):
             con.execute("UPDATE listings SET active=0,removed_at=? WHERE id=?",
                         (ts, lid))
         newly_removed = len(gone)
-        # instant sale detection: a reserved listing that vanished (any item) or a
-        # collectible that vanished without the seller relisting = a completed sale,
-        # caught now rather than waiting for the slow /stats rotation.
-        try:
-            detect_removal_sales(con, gone)
-        except Exception as e:
-            print(f"[{now_iso()}] removal-sale detect error: {e}")
+        # NOTE: a removed listing is NOT logged as a sale here — removals include
+        # cancel-and-relist undercutting and abandoned/expired-reserved listings (which
+        # produced false "sales" like $500 wood / cancelled cosmetics). The ONLY thing
+        # that confirms a real sale is kintara's /stats completed-sale counter (cancels
+        # don't move it); the stats loop reconciles to it and attributes each confirmed
+        # sale to the best price-matched recent removal. We just flag items with a fresh
+        # removal as URGENT in the stats queue (_next_stats_pair) so they get re-checked
+        # fast — speed without ever logging a cancellation.
     con.execute("INSERT INTO polls(ts,active,removed,ok) VALUES(?,?,?,?)",
                 (ts, len(seen), newly_removed, 1 if complete else 0))
     con.commit()

@@ -636,6 +636,19 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Killed cancellations-logged-as-sales:** removed the speculative `detect_removal_sales` (it logged a
+  "sale" whenever a reserved/collectible listing vanished — but cancellations and abandoned/expired-reserved
+  listings vanish too, producing false sales like "$500 wood" / a cancelled $58 cosmetic). Sales are now
+  confirmed **only** by kintara's /stats completed-sale counter (cancellations never move it); a removal
+  just makes an item **urgent** in the stats queue so it's re-checked fast. Added
+  **`purge_overcounted_sales()`**: for any item-day where logged sale events exceed the in-game /stats
+  count, it deletes the excess, removing the most price-implausible first (so absurd entries like $500 wood
+  go before real ones) and never touching under-counted/legit data. Runs once on upgrade
+  (`sales_purge_v1` flag) to clean existing bad rows, and every ~3 min in `sales_audit_loop` (recent days)
+  as ongoing insurance. Verified: a 4-event wood day with 2 real /stats sales purged the $500 + worst
+  outlier down to the 2 real ones; a 0-real-sale cosmetic cancellation deleted; an under-counted item left
+  untouched.
+
 - **Player profile page (v1 — DB-backed):** new **Player** tab + `GET /api/player?name=&wallet=` that
   aggregates everything we publicly know about a player into one profile: marketplace **earned** (sell
   side — count/units/gross in gold/USD/$KINS/avg from `sales_events`), **top items sold**, **recent
@@ -701,13 +714,14 @@ sees the latest state at a glance.
      reconciles by **count of events**, it cooperates with the instant detector below — no double-logging
      — and no longer swallows first sales. `_log_sales` now matches each sale to the closest captured
      removal (real qty/seller/price/time-on-market) and logs a synthetic row for any it can't match.
-  2. **Instant removal/reservation detection** (`detect_removal_sales`, run every listing poll): a
-     **reserved** listing that vanishes (a completed purchase, any item) or a **collectible** that vanishes
-     **without the seller relisting** (not a cancel-and-relist undercut) is logged as a sale immediately —
-     catching valuable sales within ~90s, independent of the slower /stats rotation, with exact details.
+  2. **No speculative removal→sale logging.** (An earlier `detect_removal_sales` that logged a sale when a
+     reserved/collectible listing vanished was REMOVED — it produced false sales from cancellations and
+     abandoned/expired-reserved listings, e.g. "$500 wood" / a cancelled $58 cosmetic.) The **only** thing
+     that confirms a sale is kintara's /stats counter; removals just supply the *details* for sales the
+     counter confirms, and items with a fresh removal are flagged **urgent** in the stats queue so they're
+     re-checked fast (speed without ever logging a cancellation).
   3. **Tighter cold polling:** `STATS_STALE_COLD` 900→**420s** so quiet items (auras/cosmetics) get
-     re-checked far more often. Verified: first-sale-of-day caught, reservation completion caught instantly,
-     /stats reconcile doesn't double-count, /stats still tops up missed sales, cancel-and-relist ignored.
+     re-checked far more often.
 
 - **Mobile layout pass:** added a phone stylesheet (`@media (max-width:680px)` + a ≤400px tweak at the end
   of the `<style>` block) — **desktop is untouched**, everything is an override for small screens.
