@@ -27,7 +27,10 @@ land on the volume. If you skip the volume, the DB is wiped on every deploy/rest
 | Var | Default | What |
 |---|---|---|
 | `KINTARA_DB` | `/data/kintara.db` | DB path — put on the volume |
-| `KINTARA_MARKET_DB` | `/opt/kintara-data/market.db` | compact on-chain dataset for the **Market Watch** home page (read-only; ship it to the volume — see below). Absent ⇒ the home page shows a placeholder, nothing crashes. |
+| `KINTARA_MARKET_DB` | `/opt/kintara-data/market.db` | compact on-chain dataset for the **Market Watch** home page. Seed it once (see below); the server then keeps it current itself. Absent ⇒ home page shows a placeholder, nothing crashes. |
+| `MARKET_SYNC` | `1` | server pulls **new** treasury txns from chain every ~5min and appends to `market.db` (keeps market numbers live). `0` to disable. |
+| `MARKET_SYNC_INTERVAL` | `300` | seconds between incremental treasury pulls |
+| `SOLANA_RPC` (or `RPC`) | _(public)_ | Solana JSON-RPC for the treasury sync + wallet stats. Public works for the light incremental load; set a Helius/QuickNode URL for reliability/headroom. |
 | `PORT` | `8765` | listen port (most hosts inject this) |
 | `KINTARA_HOST` | `0.0.0.0` (in Docker) | bind address |
 | `POLL_INTERVAL` | `90` | listing poll seconds |
@@ -102,9 +105,12 @@ python3 build_market_dataset.py                                   # market_index
 scp market.db root@159.203.132.20:/opt/kintara-data/market.db    # land it on the data volume
 ssh root@159.203.132.20 'chown kintara:kintara /opt/kintara-data/market.db'
 ```
-The app opens it read-only on each request; replacing the file is picked up live. Re-run whenever you
-refresh the treasury download. (Until the file exists, the home page just shows a "dataset not loaded"
-placeholder — everything else works.)
+This is a **one-time seed**. After it lands, the server keeps `market.db` current itself — the
+`market_sync_loop` pulls new treasury txns from chain every ~5min and appends them (set `MARKET_SYNC=0`
+to turn that off). So you only do the heavy laptop backfill + this scp once; the live numbers update on
+their own thereafter. (Re-run the laptop pipeline + scp only to rebuild from scratch or re-price the
+full history.) Until the file exists, the home page shows a "dataset not loaded" placeholder —
+everything else works.
 
 ### Updating later on the Droplet
 If you're already SSH'd into the Droplet, run:

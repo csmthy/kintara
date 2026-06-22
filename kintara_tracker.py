@@ -71,6 +71,12 @@ DB_PATH = os.environ.get("KINTARA_DB", "kintara.db")
 MARKET_DB = os.environ.get("KINTARA_MARKET_DB",
                            "/opt/kintara-data/market.db" if os.path.exists("/opt/kintara-data")
                            else "market.db")
+# Server-side incremental treasury sync: keep market.db caught up by pulling NEW treasury txns
+# from chain (reusing build_treasury_index's decode), so the website's market numbers stay
+# current without re-shipping the file. The big historical backfill stays a one-time laptop job;
+# this only fetches what's new (~2 txns/min). MARKET_SYNC=0 disables it.
+MARKET_SYNC = (os.environ.get("MARKET_SYNC", "1") == "1")
+MARKET_SYNC_INTERVAL = _envi("MARKET_SYNC_INTERVAL", 300)   # seconds between incremental pulls
 
 # --- 24/7 cadence + politeness (all tunable via env, with hosting-friendly defaults) ---
 POLL_INTERVAL = _envi("POLL_INTERVAL", 90)        # FULL-book poll seconds (paging the whole book for removal detection; was 45)
@@ -419,6 +425,129 @@ def market_connect():
         return con
     except Exception:
         return None
+
+
+# --- server-side incremental treasury sync (keeps market.db current) -------------------
+# Same kind→category mapping as build_market_dataset.py.
+_MARKET_KIND_CATEGORY = {
+    "marketplace_trade": "marketplace",
+    "treasury_income": "sink",
+    "treasury_income_with_receivers": "sink",
+    "treasury_payout": "payout",
+}
+_market_sync_meta = {"mint": None, "accounts": None}   # resolved once, cached
+
+
+def _market_write_connect():
+    con = sqlite3.connect(MARKET_DB, timeout=30)
+    con.row_factory = sqlite3.Row
+    con.execute("PRAGMA journal_mode=WAL;")   # let read-only endpoints read while we append
+    return con
+
+
+def _recent_kins_series():
+    """Recent 1-minute KINS/USD candles (~18h) for pricing freshly-synced txns at their minute."""
+    try:
+        return fetch_kins_ohlcv("minute", 1, 1000)   # [(ts_sec, close)] ascending
+    except Exception:
+        return []
+
+
+def _price_at(series, ts_ms):
+    """KINS/USD nearest the txn minute; None if no series."""
+    if not series or not ts_ms:
+        return None
+    import bisect
+    t = ts_ms / 1000.0
+    ks = [x[0] for x in series]
+    i = bisect.bisect_left(ks, t)
+    best = None
+    for j in (i - 1, i):
+        if 0 <= j < len(series) and (best is None or abs(series[j][0] - t) < abs(best[0] - t)):
+            best = series[j]
+    return best[1] if best else None
+
+
+def market_sync_once():
+    """Pull treasury txns newer than what market.db already has and append the compact rows
+    (priced in USD). Cursor is self-derived as the newest tx already stored, so it never
+    drifts and is idempotent (INSERT OR IGNORE). Returns the number of new rows added."""
+    if not MARKET_SYNC or not os.path.exists(MARKET_DB):
+        return 0
+    import build_treasury_index as bti   # decode/classify lives here (same dir, in the repo)
+    # resolve mint + treasury KINS token account(s) once
+    if not _market_sync_meta["accounts"]:
+        mint = bti.resolve_mint()
+        owner = next(iter(KINS_TREASURY))
+        accts = bti.treasury_token_accounts(owner, mint)
+        if not accts:
+            return 0
+        _market_sync_meta.update(mint=mint, owner=owner, accounts=accts)
+    mint, owner, accounts = (_market_sync_meta["mint"], _market_sync_meta["owner"],
+                             _market_sync_meta["accounts"])
+    con = _market_write_connect()
+    try:
+        row = con.execute("SELECT sig FROM market_txns ORDER BY ts DESC LIMIT 1").fetchone()
+        cursor = row["sig"] if row else None
+        if not cursor:
+            return 0   # no seed yet — wait for the one-time laptop snapshot to be in place
+        # gather new signatures (newest-first), paging back until we reach the cursor
+        seen, parsed = set(), []
+        for acct in accounts:
+            before = None
+            for _ in range(20):   # safety cap (20k sigs) — first catch-up after a gap may page
+                batch = bti.sig_page(acct, before=before, until=cursor)
+                if not batch:
+                    break
+                for srow in batch:
+                    s = srow["signature"]
+                    if s in seen:
+                        continue
+                    seen.add(s)
+                    p = bti.fetch_and_parse_sig(srow, mint, owner, acct)
+                    if p:
+                        parsed.append(p)
+                before = batch[-1]["signature"]
+                if len(batch) < 1000:
+                    break
+        if not parsed:
+            return 0
+        series = _recent_kins_series()
+        added = 0
+        for r in parsed:
+            cat = _MARKET_KIND_CATEGORY.get(r.get("kind"), "other")
+            ts = r.get("ts") or 0
+            date = datetime.utcfromtimestamp(ts / 1000).strftime("%Y-%m-%d") if ts else None
+            gross = r.get("gross_kins") or 0.0
+            to_player = r.get("seller_net_kins") or 0.0
+            to_treasury = r.get("fee_kins")
+            if to_treasury is None:
+                to_treasury = abs(r.get("treasury_delta_kins") or 0.0)
+            burned = max(0.0, gross - to_treasury - to_player) if cat == "sink" else 0.0
+            kusd = _price_at(series, ts) or current_kins_usd()
+            usd = (gross * kusd) if kusd else None
+            cur = con.execute(
+                "INSERT OR IGNORE INTO market_txns VALUES (?,?,?,?,?,?,?,?,?,?,?,?)",
+                (r.get("sig"), ts, date, cat, r.get("buyer"), r.get("seller"),
+                 gross, to_player, to_treasury, burned, kusd, usd))
+            added += cur.rowcount
+        con.commit()
+        return added
+    finally:
+        con.close()
+
+
+def market_sync_loop(interval):
+    """Background: keep market.db caught up with new treasury txns. Light (only what's new);
+    last-good on failure. Skips entirely if MARKET_SYNC is off or no seed DB is present."""
+    while True:
+        try:
+            n = market_sync_once()
+            if n:
+                print(f"[{now_iso()}] market sync: +{n} new treasury txns")
+        except Exception as e:
+            print(f"[{now_iso()}] market sync error: {e}")
+        time.sleep(interval)
 
 
 def init_db() -> None:
@@ -8436,6 +8565,8 @@ def main():
     threading.Thread(target=merchant_snapshot_loop, daemon=True).start()  # merchant campaign history
     threading.Thread(target=merchant_watch_loop, args=(MERCHANT_WATCH_INTERVAL,), daemon=True).start()  # donation-drive phone alert
     threading.Thread(target=world_supply_loop, args=(WORLD_INDEX_CACHE_SEC,), daemon=True).start()  # keep in-world supply fresh + persisted
+    if MARKET_SYNC:
+        threading.Thread(target=market_sync_loop, args=(MARKET_SYNC_INTERVAL,), daemon=True).start()  # incremental treasury pull → market.db
     threading.Thread(target=sales_audit_loop, daemon=True).start()  # reconcile sales to in-game count
     _spectate_hub.start()   # live-world spectator hub (connects per shard on demand)
     _boss_census.start()    # boss-area census for the server bubble (resolves the region key)

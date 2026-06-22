@@ -323,8 +323,13 @@ distills it into a small, indexed **`market.db`** that the website actually serv
 - Run `python3 build_market_dataset.py` (`--src`/`--out` to override; takes ~2 min for the paced
   1-minute price download). Captured month 2026-05-22 → 06-22: 95,716 txns → marketplace **118.9M
   KINS / ~$528k** (minute-priced), sinks **5.97M KINS burned**, totals **~$582k volume / 4,089
-  buyers**. Ship it out of band (DBs are gitignored; the hosted data volume is never touched by git
-  deploys): `scp market.db root@<host>:/opt/kintara-data/market.db`.
+  buyers**. Ship it out of band **once** as the seed (DBs are gitignored; the hosted data volume is
+  never touched by git deploys): `scp market.db root@<host>:/opt/kintara-data/market.db`.
+- **After the seed, the server keeps `market.db` current itself** — `market_sync_loop` in
+  `kintara_tracker.py` incrementally pulls new treasury txns from chain every ~5min (reusing
+  `build_treasury_index.py`'s decode) and appends compact USD-priced rows. So you only run the heavy
+  laptop backfill + one scp once; thereafter the live numbers update on their own. (Re-run the laptop
+  pipeline + scp only if you ever need to rebuild from scratch or re-price history.)
 
 ---
 
@@ -785,6 +790,16 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Server-side incremental treasury sync (market.db self-updates).** The market dataset is no longer
+  a static one-time ship: a new `market_sync_loop` (every `MARKET_SYNC_INTERVAL`≈5min) pulls only the
+  **new** treasury txns from chain and appends the compact, USD-priced rows straight into `market.db`,
+  so Market Watch / market caps stay current without re-shipping the file. Reuses
+  `build_treasury_index.py`'s decode/classify (`sig_page`/`fetch_and_parse_sig`/`parse_treasury_tx`,
+  imported on the server); cursor is **self-derived** from the newest row already stored (no drift) and
+  inserts are `INSERT OR IGNORE` (idempotent). Recent txns are priced at their minute via fresh 1m
+  candles (fallback live KINS). The big historical backfill stays a one-time laptop job; the laptop
+  `market.db` is scp'd **once** as the seed, then the server keeps it caught up itself. `MARKET_SYNC=0`
+  disables. market.db is opened WAL so read endpoints serve while it appends.
 - **In-world supply: persisted + background-refreshed (instant on load).** Previously
   `world_item_supply()` fetched the fanout on the request path with only an in-memory cache, so a cold
   start / post-restart load blocked on the (often `fanout_unavailable`) fetch and market caps showed
