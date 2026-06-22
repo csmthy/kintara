@@ -13,11 +13,12 @@ Why a separate file: the raw download is huge and full of bytes the website neve
 who/when/how much/what kind/how much in USD. We compute that once here and ship the small
 result. The big file stays on the laptop; never commit it, never put it on the server.
 
-KINS pumped ~300x over the captured month, so a transaction's USD value depends heavily on
-*which day* it happened — we price each txn at that day's KINS/USD close (GeckoTerminal
-daily candles via kintara_tracker.fetch_kins_ohlcv), with nearest-prior carry-forward for
-any gap day. Pricing everything at today's rate would overstate early volume by orders of
-magnitude.
+These are reconstructions of real sales, so each txn is priced with the KINS/USD at the
+*minute of the trade*, not a daily average — KINS pumped ~300x over the captured month and
+moves several % intraday during spikes. build_price_series() pages GeckoTerminal 1-minute
+candles backward across the range (paced to dodge 429s) with an hourly baseline underneath
+for any older span the minute feed can't reach; price_at() snaps each txn to its nearest
+candle. See those functions for the resolution/coverage detail.
 
 Run:
     python3 build_market_dataset.py                 # market_index.db -> market.db
@@ -59,8 +60,8 @@ CREATE TABLE IF NOT EXISTS market_txns(
     to_player    REAL,      -- KINS that reached the other player (seller net)
     to_treasury  REAL,      -- KINS that reached the treasury (fee / take)
     burned_kins  REAL,      -- KINS burned (sinks)
-    kins_usd     REAL,      -- KINS/USD close used for this day
-    usd_value    REAL       -- gross_kins * kins_usd  (economic size in USD at the time)
+    kins_usd     REAL,      -- KINS/USD at the trade's minute (nearest candle, 1m where reachable)
+    usd_value    REAL       -- gross_kins * kins_usd  (economic size in USD at the time of the trade)
 );
 CREATE INDEX IF NOT EXISTS idx_mt_ts     ON market_txns(ts);
 CREATE INDEX IF NOT EXISTS idx_mt_date   ON market_txns(date);
@@ -71,38 +72,107 @@ CREATE TABLE IF NOT EXISTS meta(k TEXT PRIMARY KEY, v TEXT);
 """
 
 
-def kins_usd_by_date():
-    """{ 'YYYY-MM-DD' (UTC): KINS close USD } from GeckoTerminal daily candles.
-    Reuses kintara_tracker.fetch_kins_ohlcv so the source matches the live site."""
+import bisect
+
+# These are reconstructions of real sales, so each transaction is priced with the KINS/USD
+# *at the time of the trade*, not a daily average. GeckoTerminal gives 1-minute candles but
+# only ~18h per 1000-candle page (so the full month needs ~45 paged requests) and rate-limits
+# hard; 1-hour candles cover the whole month in a single request. We therefore page 1m
+# backward across the range (paced to dodge 429s) and lay an hourly baseline underneath so
+# every minute the 1m feed can't reach still has a price within ±30min, then price each txn by
+# its NEAREST candle.
+GECKO_PACE_S = 2.6        # spacing between GeckoTerminal requests (≈ <30/min)
+MINUTE_PAGE_BUDGET = 80   # safety cap on 1m pages (≈55 days of minute coverage)
+
+
+def _fetch_retry(kt, tf, agg, before=None, tries=5):
+    """fetch_kins_ohlcv with backoff on 429/transient errors. Returns [] if it keeps failing."""
+    for i in range(tries):
+        try:
+            return kt.fetch_kins_ohlcv(tf, agg, 1000, before=before)
+        except Exception as e:
+            wait = GECKO_PACE_S * (i + 2)
+            print(f"   …{tf}/{agg} retry {i+1} after error ({str(e)[:60]}); sleep {wait:.0f}s")
+            time.sleep(wait)
+    return []
+
+
+def build_price_series(ts_min_s, ts_max_s):
+    """Sorted [(ts_seconds, close_usd)] covering [ts_min_s, ts_max_s] at the finest feasible
+    resolution: 1-minute paged back to ts_min (or the page budget), hourly underneath for any
+    older span the minute feed didn't reach. Returns (series, coverage_note)."""
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
     import kintara_tracker as kt
-    rows = kt.fetch_kins_ohlcv("day", 1, 1000)
-    out = {}
-    for ts, px in rows:
-        out[dt.datetime.utcfromtimestamp(ts).strftime("%Y-%m-%d")] = px
-    return out
+    pts = {}  # ts_seconds -> close  (1m overwrites hourly at the same ts)
+
+    # hourly baseline (one request usually covers the whole month)
+    print("== pricing: hourly baseline …")
+    before = None
+    for _ in range(6):
+        rows = _fetch_retry(kt, "hour", 1, before=before)
+        if not rows:
+            break
+        for ts, px in rows:
+            pts[ts] = px
+        oldest = min(r[0] for r in rows)
+        if oldest <= ts_min_s:
+            break
+        before = oldest
+        time.sleep(GECKO_PACE_S)
+
+    # 1-minute overlay, paged backward until we cover ts_min (or hit the budget)
+    print("== pricing: 1-minute overlay (paged, paced) …")
+    before, pages, minute_floor = None, 0, ts_max_s
+    while pages < MINUTE_PAGE_BUDGET:
+        rows = _fetch_retry(kt, "minute", 1, before=before)
+        if not rows:
+            break
+        for ts, px in rows:
+            pts[ts] = px
+        oldest = min(r[0] for r in rows)
+        minute_floor = min(minute_floor, oldest)
+        pages += 1
+        print(f"   1m page {pages}: back to {dt.datetime.utcfromtimestamp(oldest)}", end="\r")
+        if oldest <= ts_min_s:
+            break
+        before = oldest
+        time.sleep(GECKO_PACE_S)
+    print()
+
+    series = sorted(pts.items())
+    note = (f"1m back to {dt.datetime.utcfromtimestamp(minute_floor):%Y-%m-%d %H:%M}, "
+            f"hourly before; {len(series)} candles")
+    return series, note
 
 
-def price_for(date, pmap, sorted_dates):
-    """KINS/USD for a date, nearest-prior carry-forward (then nearest-next) if missing."""
-    if date in pmap:
-        return pmap[date]
-    prior = [d for d in sorted_dates if d <= date]
-    if prior:
-        return pmap[prior[-1]]
-    return pmap[sorted_dates[0]] if sorted_dates else None
+def price_at(series, ts_ms):
+    """KINS/USD at a transaction time: the close of the candle NEAREST (by absolute time) to
+    the txn. series is sorted (ts_seconds, close). Minute-covered txns land on their own
+    minute; older txns snap to the nearest hourly candle (±30min)."""
+    if not series or not ts_ms:
+        return None
+    t = ts_ms / 1000.0
+    i = bisect.bisect_left(series, (t,))
+    best = None
+    for j in (i - 1, i):
+        if 0 <= j < len(series):
+            if best is None or abs(series[j][0] - t) < abs(best[0] - t):
+                best = series[j]
+    return best[1] if best else None
 
 
 def distill(src_path, out_path):
     if not os.path.exists(src_path):
         sys.exit(f"source not found: {src_path}")
-    print(f"== pricing: fetching KINS daily closes …")
-    pmap = kins_usd_by_date()
-    sorted_dates = sorted(pmap)
-    print(f"   {len(pmap)} daily prices  ({sorted_dates[0]} … {sorted_dates[-1]})")
-
     src = sqlite3.connect(src_path)
     src.row_factory = sqlite3.Row
+
+    rng = src.execute("SELECT MIN(ts) a, MAX(ts) b FROM treasury_txns").fetchone()
+    ts_min_s, ts_max_s = (rng["a"] or 0) / 1000.0, (rng["b"] or 0) / 1000.0
+    print(f"== txn range {dt.datetime.utcfromtimestamp(ts_min_s)} → {dt.datetime.utcfromtimestamp(ts_max_s)}")
+    series, price_note = build_price_series(ts_min_s, ts_max_s)
+    print(f"   price series: {price_note}")
+
     if os.path.exists(out_path):
         os.remove(out_path)
     out = sqlite3.connect(out_path)
@@ -126,7 +196,7 @@ def distill(src_path, out_path):
         burned = 0.0
         if cat == "sink":
             burned = max(0.0, gross - to_treasury - to_player)
-        kins_usd = price_for(date, pmap, sorted_dates) if date else None
+        kins_usd = price_at(series, ts)        # KINS/USD nearest the trade's actual minute
         usd_value = (gross * kins_usd) if (kins_usd is not None) else None
         batch.append((r["sig"], ts, date, cat, r["buyer"], r["seller"],
                       gross, to_player, to_treasury, burned, kins_usd, usd_value))
@@ -152,7 +222,7 @@ def distill(src_path, out_path):
         "ts_max": str(rng[1] or 0),
         "kins_mint": smeta.get("kins_mint", ""),
         "treasury_owner": smeta.get("treasury_owner", ""),
-        "price_dates": f"{sorted_dates[0]}..{sorted_dates[-1]}" if sorted_dates else "",
+        "price_resolution": price_note,   # how finely each txn was priced (1m where reachable)
     }
     out.executemany("INSERT OR REPLACE INTO meta VALUES (?,?)", list(meta.items()))
     out.commit()

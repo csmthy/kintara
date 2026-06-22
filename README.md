@@ -310,14 +310,19 @@ distills it into a small, indexed **`market.db`** that the website actually serv
   → **marketplace** (player↔player, ~5% treasury fee); `treasury_income`(`_with_receivers`) →
   **sink** (player pays, ~50% burned + ~50% to treasury, no seller — casino/wheel/spinner wagers +
   other KINS burn-sinks); `treasury_payout` → **payout** (treasury → player); else **other**.
-- **USD valuation:** each txn is priced at its own day's **KINS/USD close** (GeckoTerminal daily
-  candles via `kintara_tracker.fetch_kins_ohlcv`, nearest-prior carry-forward for gaps). This matters
-  enormously — KINS pumped ~300× over the captured month, so pricing everything at today's rate would
-  overstate early volume by orders of magnitude.
-- Run `python3 build_market_dataset.py` (`--src`/`--out` to override). Captured month 2026-05-22 →
-  06-22: 95,716 txns → marketplace **118.9M KINS / ~$542k**, sinks **5.97M KINS burned**, totals
-  **$598k volume / 4,089 buyers**. Ship it out of band (DBs are gitignored; the hosted data volume
-  is never touched by git deploys): `scp market.db root@<host>:/opt/kintara-data/market.db`.
+- **USD valuation (per-minute, not daily):** these are reconstructions of real sales, so each txn is
+  priced with the **KINS/USD at the trade's actual minute**, not a daily average. `build_price_series()`
+  pages GeckoTerminal **1-minute** candles backward across the whole range (paced ~2.6s/req to dodge
+  429s; ~45 pages for a month) and lays an **hourly** baseline underneath for any older span the minute
+  feed can't reach (1m only returns ~18h per 1000-candle page; 1h covers the month in one request).
+  `price_at()` then snaps each txn to its **nearest candle** (its own minute where reachable, ±30min
+  hourly before). The resolution used is recorded in `meta.price_resolution`. This precision matters
+  enormously — KINS pumped ~300× over the captured month, and moves several % intraday during spikes.
+- Run `python3 build_market_dataset.py` (`--src`/`--out` to override; takes ~2 min for the paced
+  1-minute price download). Captured month 2026-05-22 → 06-22: 95,716 txns → marketplace **118.9M
+  KINS / ~$528k** (minute-priced), sinks **5.97M KINS burned**, totals **~$582k volume / 4,089
+  buyers**. Ship it out of band (DBs are gitignored; the hosted data volume is never touched by git
+  deploys): `scp market.db root@<host>:/opt/kintara-data/market.db`.
 
 ---
 
@@ -330,7 +335,7 @@ distills it into a small, indexed **`market.db`** that the website actually serv
 - `GET /api/status` — poller state, tracking-since, row count.
 - `GET /api/market-watch` — whole-market on-chain stats for the **Market Watch** home page,
   aggregated live from the compact `market.db` (~95k treasury-derived txns, each priced in USD at
-  its day's KINS close). Returns `{ok, generated_at, ts_min, ts_max, kins_price, totals:{txns,
+  the KINS/USD of the trade's own minute). Returns `{ok, generated_at, ts_min, ts_max, kins_price, totals:{txns,
   volume_kins, volume_usd, treasury_kins, burned_kins, unique_buyers/sellers/traders},
   categories:{marketplace|sink|payout|other → {n, kins, usd, treasury, burned, to_player}},
   daily:[{date, txns, kins, usd, market_usd, sink_usd}], top_trades:[…]}`. Returns `503
@@ -764,10 +769,11 @@ sees the latest state at a glance.
   an interactive daily-volume SVG chart, a category breakdown, and biggest-trades. Backed by a new
   pipeline: `build_market_dataset.py` distills the ~200MB laptop treasury download (`market_index.db`)
   into a small indexed **`market.db`** (`market_txns`: buyer/seller/ts/category/gross/to_player/
-  to_treasury/burned + **USD priced at each txn's own-day KINS close**), served read-only by the new
+  to_treasury/burned + **USD priced at each txn's actual minute** via paged 1m GeckoTerminal candles,
+  hourly fallback), served read-only by the new
   `GET /api/market-watch` (env `KINTARA_MARKET_DB`, default `/opt/kintara-data/market.db` hosted).
   Categories: marketplace / sink (casino-wheel burn) / payout / other. Captured month totals: 95,716
-  txns, $598k volume, 4,089 buyers, 5.97M KINS burned. Ship the dataset out of band via `scp` (it's
+  txns, ~$582k volume (minute-priced), 4,089 buyers, 5.97M KINS burned. Ship the dataset out of band via `scp` (it's
   gitignored; the data volume isn't touched by git deploys). See "On-chain market dataset" + "Market
   Watch" tab.
 - **Fast first-page poller (kill the create-and-sell blind spot).** The listing poll was a single

@@ -7998,7 +7998,7 @@ async function loadMarket(){
     </div>
 
     <section class="mw-panel">
-      <div class="mw-panel-h"><span class="t">Daily trading volume</span><span class="s">USD priced at each day's $KINS close</span></div>
+      <div class="mw-panel-h"><span class="t">Daily trading volume</span><span class="s">USD priced at each trade's $KINS minute</span></div>
       <div class="mw-panel-b"><div id="mwChart"></div></div>
     </section>
 
