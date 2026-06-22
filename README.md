@@ -127,18 +127,19 @@ denominates in — the nominal-gold listing lag is the exploitable edge); KINS i
 economically but, being the most volatile denominator, is the *worst* unit to carry a stale price
 forward in. **Farmable/grindable mounts** (wolf/dragon/whale — high volume, cheap) are the exception:
 they're USD/utility-anchored commodities, not collectibles, and should be bucketed with the
-commodity (gold↔KINS) logic, not the CMP mispricing scan. Total world supply per item **does exist
-but is login-gated** (we can't use it anonymously). It's served by `GET /api/world-item-index?category=
-<cat>&sort=<dir>` (and the sibling `world-marketplace-index`), which powers kintara.gg's own `/#index`
-page (rendered by `site/js/components/itemIndex.js` → `createItemIndex`). Response: `{ok, rows:[{id,
-label, icon, count}], playerCount, generatedAt}` where **`count` = total units of that item across every
-player inventory, bank, and bag** (the homepage labels it "Totals across N players"). Both endpoints
-require a **wallet-authenticated session** — the authoritative origin returns `{"ok":false,"error":
-"unauthorized"}` without cookies, and the public `fanout.kintara.gg` mirror returns `fanout_unavailable`
-for them (it *does* mirror `merchant-campaign`/`servers`/`blimp-stats`, so they deliberately keep
-inventory totals behind login). No guest cookie is issued on page load, so there's no anonymous path;
-adding a "world supply" column would need the user's kintara.gg session cookie. (`game.js` itself has no
-edition/supply concept — the totals are computed server-side.)
+commodity (gold↔KINS) logic, not the CMP mispricing scan. **Total world supply per item IS available**
+and is now shown in the Index ("In world" column) — see `world_item_supply()`. It's served by `GET
+/api/world-item-index?category=<cat>&sort=<dir>`, which powers kintara.gg's own `/#index` page
+(rendered by `site/js/components/itemIndex.js` → `createItemIndex`). Response: `{ok, playerCount,
+generatedAt, rows:[{id (=our item_type), label, icon, count, category}]}` where **`count` = total units
+of that item across every player inventory, bank, and bag** ("Totals across N players"). The
+authoritative origin (`kintara.gg`) requires a **logged-in wallet session** (`{"ok":false,"error":
+"unauthorized"}` without cookies), BUT the public **`fanout.kintara.gg` mirror serves it without auth**
+— so we fetch it from there (it sometimes returns `fanout_unavailable` transiently; we cache last-good).
+The sibling `world-marketplace-index` (per-item sales + `tokenPriceUsd`) is also public on the fanout.
+(`game.js` itself has no edition/supply concept — the totals are computed server-side.) **Earlier note
+(now resolved):** this was thought login-only because the fanout was temporarily down for these two
+endpoints when first probed.
 
 ---
 
@@ -158,6 +159,7 @@ edition/supply concept — the totals are computed server-side.)
 | **Server list** | `GET kintara.gg/api/servers` | `{ok, servers:[{id, name, populationLabel, full, queueLength, minLevel}]}`. Live population + queue per game server. Drives the top status bar. `fetch_servers()`, cached ~30s (last-good on failure). |
 | **Traveling-merchant state** | `GET kintara.gg/api/world/merchant-campaign` | kintara.gg's **own** public endpoint (no auth; the game client reads it the same way via `KINTARA_READ_FANOUT_ORIGIN`, also reachable at `ktra-server-b.onrender.com`). Returns `{ok, mode, wood, stone, coal, cooked_fish_meat, metal, goals:{...}, complete, goldTradeEnabled, goldStock, goldStockFull}`. **No overall %** — we compute it as the mean of the five per-resource (capped) percentages. `fetch_merchant()`, cached ~60s (last-good on failure). |
 | **Merchant gold-mint recipe** | (from `kintara.gg/game.js` `MERCHANT_TRADE_COST`) | `MERCHANT_RECIPE` = resources consumed per 1 gold minted: 2500 wood + 1500 stone + 700 coal + 30 cooked_fish_meat. This is now separate from the **donation campaign** resources (`MERCHANT_CAMPAIGN_RESOURCES`: wood, stone, coal, cooked fish, **metal**); the cost calculator follows the current gold-trade recipe, while the left progress tracker follows the live campaign goals. |
+| **World item supply** | `GET fanout.kintara.gg/api/world-item-index?category=all&sort=desc` | Total units of each item across **all** player inventories/banks/bags — powers kintara.gg's `/#index`. `{ok, playerCount, generatedAt, rows:[{id (=item_type), label, icon, count, category}]}`. The authoritative origin needs a logged-in session; the **public read-fanout mirror serves it without auth** (occasionally `fanout_unavailable` transiently → we keep last-good). `world_item_supply()`, cached ~10min (`WORLD_INDEX_CACHE_SEC`). Drives the Index "In world" column. |
 | **Property ownership** | `GET kintara.gg/api/property-signs/status` | Public. `{ok, mansions:{1..3}, houses:{1..5}, trailers:{1..8}}` each → `ownerName, ownerId, sold, locked`. `fetch_property_status()`, cached ~30s, last-good on failure. Drives the Property Map. |
 | **Property map coordinates** | (from `kintara.gg/game.js`: `MANSIONS`, `REGULAR_HOUSES`+`REGULAR_HOUSE_SLOT_TO_ID`, `TRAILERS`) | Each property's world-grid footprint `(col0,col1,row0,row1)`, baked into `PROPERTY_PLOTS`, so the map matches the in-game estate row. |
 | **Live world roster + positions** | `wss://kintara.gg/ws/spectate/sN` (per **server**, N = 1–12) | **Public spectator WebSocket, plain JSON, no auth.** Streams `{t:"snap", region, onlineTotal, players:[{id,name,x,z,ry,avg(level),eq(held item),bdg(badge),php(hp%),mov,outfit{hat,top,pants,shoe,skinTone,*C colors,aura,...}}]}`. **`sN` is the server number** (the same `s${shardId}` the game opens for queue/presence after you pick a server). All **12 servers** are separate worlds (zero player overlap). Note the read-fanout mirror (`ktra-server-b.onrender.com`) only carries servers 1–4 — kintara.gg itself serves all 12, so we use it. `onlineTotal` is the **global** count (identical across all 4). The spectator is only sent players in the **realm** it's subscribed to (set via `{t:"spec_reg",region}`), and within the big `world` realm only those near the hub camera. So `SpectateHub` **round-robins every realm** (`SPECTATE_REGIONS`: world/pond/beach/eldergrove/frostmere/arena/wild/mine/spider/…, lingering longer on `world`), accumulating a per-world roster tagged by realm — ~75–80 named players per world after a ~20s sweep, vs ~25 from the hub alone. Each player carries its `realm`. One socket per world, opened lazily on the first `/api/live` hit, closed after ~75s idle. Needs the `websockets` package. |
@@ -425,7 +427,9 @@ distills it into a small, indexed **`market.db`** that the website actually serv
   proxy (exact rotating shop gold prices are server-side/auth-gated, not public), plus the derived
   availability window + supply status from `sales_daily` (`item_index_meta()`).
 - `GET /api/sales-summary?window=1|7|30` — per-item totals over the window: sales,
-  sales-weighted avg gold/USD, `$KINS`, `ref_day`. Also returns the **current floor** per item
+  sales-weighted avg gold/USD, `$KINS`, `ref_day`. Each item also carries **`world_supply`** (total
+  units across all players, from `world_item_supply()` — the Index "In world" column), and the payload
+  adds `world_players` + `world_generated`. Also returns the **current floor** per item
   (`floor_gold` = actual cheapest gold ask, `floor_usd` = cheapest USD-equivalent, `floor_kins`) via
   `item_floors()` — drives the Index tab's floor columns. `item_floors()` applies the **bulk-material
   rule**: for `material` items it ignores listings smaller than `MIN_BULK_QTY` (1000), so a "100 wood for
@@ -565,11 +569,13 @@ second. The tabs below are numbered by topic, not bar order.
    when. Each sale is matched to the listing that vanished, so "13,251 stone for 1g" reads correctly
    instead of the old misleading "5 units". Cancellations excluded.
 3. **Index** (was "Sales history") — game "index" layout: category **sidebar**, **Today / 7d / 30d**
-   window selector, a **sort dropdown** (Most/Least sold · Cheapest/Most expensive by the $KINS floor ·
-   Newest/Oldest added by first-sale date — `first_sale` from `/api/sales-summary`; cheapest/newest are
-   sort-only, no extra column), columns ITEM · SALES · **FLOOR GOLD · FLOOR USD ·
-   FLOOR $KINS** (the live cheapest price per item, from `item_floors()` — replaced the old avg-sales
-   columns). Cheap commodities show **items-per-gold** (e.g. `24k/g`) instead of a tiny gold fraction, and
+   window selector, a **sort dropdown** (Most/Least sold · **Most in world / Rarest in world** by total
+   world supply · Cheapest/Most expensive by the $KINS floor · Newest/Oldest added by first-sale date —
+   `first_sale` from `/api/sales-summary`; cheapest/newest are sort-only, no extra column), columns
+   ITEM · SALES · **IN WORLD** · **FLOOR GOLD · FLOOR USD · FLOOR $KINS**. **IN WORLD** = total units of
+   that item across every player (kintara.gg world index, `world_supply`; the note shows "across N
+   players"). Floors are the live cheapest price per item, from `item_floors()`. (On phones the Sales +
+   Floor-Gold columns are hidden to keep In-world + USD/$KINS legible.) Cheap commodities show **items-per-gold** (e.g. `24k/g`) instead of a tiny gold fraction, and
    **material/food/potion** show **USD/$KINS per 1,000**. Click a row → expands to a full **Item
    Scorecard** (stock-page) view:
    - **Scorecard header** (`/api/scorecard`, `loadScorecard`/`scorecardHTML`): the floor in
@@ -769,6 +775,14 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Index: "In world" total-supply column.** Each item now shows its **total world supply** (units
+  across every player's inventory/bank/bag) — the number from kintara.gg's own `/#index`. Source:
+  `GET /api/world-item-index` on the **public `fanout.kintara.gg` mirror** (no auth needed after all —
+  the fanout was just transiently down when first probed; the authoritative origin is login-gated).
+  New `world_item_supply()` (cached ~10min, last-good), surfaced via `world_supply` + `world_players`
+  on `/api/sales-summary`. Added an **IN WORLD** column to the Index table and two sorts (**Most in
+  world**, **Rarest in world**); the note shows "across N players" (14,476 at capture). Captured
+  sample: wood 62.5M, stone 33.0M, coal 21.7M units in the world.
 - **Market Watch: spin wheel split out of trading volume.** The paid spin wheel is the `sink`
   category (the only txns that burn ~50% of the stake — confirmed nothing else does), so it's
   gambling, not trading. `/api/market-watch` now returns separate `market` (marketplace-only trading)

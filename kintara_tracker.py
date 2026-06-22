@@ -152,6 +152,12 @@ SERVERS_URL = "https://kintara.gg/api/servers"
 # {ok, mode, wood, stone, coal, cooked_fish_meat, metal, goals:{...}, complete,
 #  goldTradeEnabled, goldStock, goldStockFull}.
 MERCHANT_URL = "https://kintara.gg/api/world/merchant-campaign"
+# Total world supply per item (units of each item across ALL player inventories, banks, and
+# bags) — powers kintara.gg's own /#index. The authoritative origin (kintara.gg) requires a
+# logged-in wallet session ("unauthorized"); the public read-fanout mirror serves it without
+# auth. Returns {ok, playerCount, generatedAt, rows:[{id (=item_type), label, icon, count, category}]}.
+WORLD_INDEX_URL = "https://fanout.kintara.gg/api/world-item-index"
+WORLD_INDEX_CACHE_SEC = _envi("WORLD_INDEX_CACHE_SEC", 600)   # global data; re-fetch at most this often
 # Traveling-merchant donation campaign resources, from kintara.gg game.js
 # (`MERCHANT_CAMPAIGN_GOALS`) and the live `/api/world/merchant-campaign` payload.
 # The server can override goal quantities in the payload; this tuple controls order
@@ -2308,6 +2314,35 @@ def fetch_merchant():
         raise
 
 
+_world_supply_cache = {"at": 0, "map": {}, "players": 0, "generated": 0}
+
+
+def world_item_supply():
+    """Total world units per item across all player inventories/banks/bags, from the public
+    read-fanout mirror of kintara.gg's /#index. Returns the cache dict
+    {map:{item_type:count}, players, generated, at}. Cached ~10min, last-good on failure —
+    this is global data that updates slowly, so we never hammer it. Powers the Index
+    'in world' supply column."""
+    import requests
+    now = time.time()
+    c = _world_supply_cache
+    if c["map"] and now - c["at"] < WORLD_INDEX_CACHE_SEC:
+        return c
+    try:
+        r = requests.get(WORLD_INDEX_URL, params={"category": "all", "sort": "desc"},
+                         headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
+        r.raise_for_status()
+        d = r.json() or {}
+        if d.get("ok"):
+            c["map"] = {row["id"]: row.get("count") for row in d.get("rows", []) if row.get("id")}
+            c["players"] = d.get("playerCount") or 0
+            c["generated"] = d.get("generatedAt") or 0
+            c["at"] = now
+    except Exception:
+        pass   # keep last-good (map stays as-is); the column just shows '—' until it loads
+    return c
+
+
 def order_book_usd(con, item_type, gold_rate):
     """The live buy-side depth for item_type as a price ladder: a list of
     [unit_usd, quantity] levels sorted cheapest-first, across BOTH currencies
@@ -4460,6 +4495,8 @@ def make_app():
             "SELECT item_type, MIN(date) f FROM sales_daily WHERE sales>0 GROUP BY item_type")}
         con.close()
         kins_px = current_kins_usd()
+        wsupply = world_item_supply()          # {item_type: total world units} (cached ~10min)
+        supply_map = wsupply["map"]
         out = []
         for it in items:
             g, t = agg.get((it, "gold")), agg.get((it, "token"))
@@ -4477,9 +4514,11 @@ def make_app():
                 "floor_gold": ff.get("gold"), "floor_usd": f_usd,
                 "floor_kins": (f_equiv / kins_px) if (f_equiv and kins_px) else None,
                 "first_sale": firsts.get(it),
+                "world_supply": supply_map.get(it),   # total units of this item across all players
             })
         return jsonify({"ok": True, "ref_day": ref, "window": window,
-                        "kins_price": kins_px, "gold_rate": rate, "items": out})
+                        "kins_price": kins_px, "gold_rate": rate, "items": out,
+                        "world_players": wsupply["players"], "world_generated": wsupply["generated"]})
 
     @app.route("/api/gold-history")
     def gold_history():
@@ -5442,7 +5481,7 @@ td.isd{cursor:help}
 .gw-sortsel{padding:7px 12px;border-radius:999px;border:1px solid #2c3c56;background:rgba(255,255,255,.03);
   color:var(--gold2);font:500 13px 'Fredoka';cursor:pointer}
 .gw-note{color:#6f86a6;font:400 12px 'Fredoka';margin:10px 0 6px}
-.gw-head,.gw-row{display:grid;grid-template-columns:1.6fr .8fr .9fr .9fr .9fr;align-items:center;gap:8px}
+.gw-head,.gw-row{display:grid;grid-template-columns:1.6fr .8fr .9fr .9fr .9fr .9fr;align-items:center;gap:8px}
 .gw-head{padding:6px 12px;color:#6f86a6;font:600 11px 'Fredoka';letter-spacing:.14em;text-transform:uppercase;
   border-bottom:1px solid rgba(255,255,255,.07)}
 .gw-head .r,.gw-row .r{text-align:right}
@@ -5614,9 +5653,10 @@ a{color:var(--gold2)}
   .gw-sub{font-size:12.5px}
   .gw-pills{flex-wrap:wrap}
 
-  /* index rows: drop the Sales column on phones, keep the three floors */
+  /* index rows: drop Sales + Floor Gold on phones, keep In world + USD/$KINS floors */
   .gw-head,.gw-row{grid-template-columns:1.5fr .9fr .9fr .9fr;gap:6px}
-  .gw-head>*:nth-child(2),.gw-row>*:nth-child(2){display:none}
+  .gw-head>*:nth-child(2),.gw-row>*:nth-child(2),
+  .gw-head>*:nth-child(4),.gw-row>*:nth-child(4){display:none}
   .gw-head{font-size:9.5px;letter-spacing:.06em}
   .gw-name{font-size:13.5px}
   .gw-num{font-size:12px}
@@ -6661,6 +6701,8 @@ function renderHist(){
   const HSORT={
     most:    (a,b)=> (b.sales||0)-(a.sales||0),
     least:   (a,b)=> (a.sales||0)-(b.sales||0),
+    world:   (a,b)=> (b.world_supply||0)-(a.world_supply||0),
+    rare:    (a,b)=> (a.world_supply==null?Infinity:a.world_supply)-(b.world_supply==null?Infinity:b.world_supply),
     newest:  (a,b)=> byDate(a,b,-1),     // latest first_sale first (nulls last)
     oldest:  (a,b)=> byDate(a,b,1),
     cheapest:(a,b)=> (a.floor_kins==null?Infinity:a.floor_kins)-(b.floor_kins==null?Infinity:b.floor_kins),
@@ -6673,6 +6715,7 @@ function renderHist(){
       <div class="gw-item"><span class="gw-chev">▸</span>${iconImg(r)}
         <span class="gw-name" title="${r.item_type}">${r.label}</span></div>
       <div class="gw-num r">${r.sales?fmtK(r.sales):"—"}</div>
+      <div class="gw-num mut r" data-tip="total units of this item across every player's inventory, bank &amp; bag (kintara.gg world index)">${r.world_supply!=null?abbr(r.world_supply):"—"}</div>
       <div class="gw-num mut r" data-tip="cheapest live gold listing (items per gold when under 1g each)">${fGold(r.floor_gold)}</div>
       <div class="gw-num r">${fUsd(r.floor_usd,r.category)}</div>
       <div class="gw-num gw-kins r">${fKins(r.floor_kins,r.category)}</div>
@@ -6691,15 +6734,15 @@ function renderHist(){
         <button class="gw-pill ${state.histWindow==30?'on':''}" data-win="30">Last 30 days</button>
         <span style="width:14px"></span>
         <select id="histSortSel" class="gw-sortsel">
-          ${[['most','Most sold'],['least','Least sold'],['cheapest','Cheapest ($KINS)'],
-             ['expensive','Most expensive ($KINS)'],['newest','Newest added'],['oldest','Oldest added']]
+          ${[['most','Most sold'],['least','Least sold'],['world','Most in world'],['rare','Rarest in world'],
+             ['cheapest','Cheapest ($KINS)'],['expensive','Most expensive ($KINS)'],['newest','Newest added'],['oldest','Oldest added']]
             .map(([v,l])=>`<option value="${v}" ${(state.histSort||'most')===v?'selected':''}>${l}</option>`).join('')}
         </select>
         <span style="width:14px"></span>
         <button class="gw-pill" id="histRefresh" data-tip="Refresh now">↻</button>
       </div>
-      <div class="gw-note">${state.histWindow==1?"Most recent trading day":("Last "+state.histWindow+" days")} · through ${d.ref_day||"—"} · live $KINS price ${kp} per token</div>
-      <div class="gw-head"><span>Item</span><span class="r">Sales</span><span class="r">Floor Gold</span><span class="r">Floor USD</span><span class="r">Floor $KINS</span></div>
+      <div class="gw-note">${state.histWindow==1?"Most recent trading day":("Last "+state.histWindow+" days")} · through ${d.ref_day||"—"} · live $KINS price ${kp} per token${d.world_players?` · in-world supply across ${(+d.world_players).toLocaleString()} players`:''}</div>
+      <div class="gw-head"><span>Item</span><span class="r">Sales</span><span class="r">In world</span><span class="r">Floor Gold</span><span class="r">Floor USD</span><span class="r">Floor $KINS</span></div>
       <div id="gwrows">${body||`<div class="gw-empty">No items in this category.</div>`}</div>
     </div></div>`;
   document.querySelectorAll(".gw-cat").forEach(b=>b.onclick=()=>{state.histCat=b.dataset.cat;state.histOpen=null;renderHist();});
