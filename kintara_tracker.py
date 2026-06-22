@@ -3739,6 +3739,38 @@ def make_app():
             "top_trades": top,
         })
 
+    @app.route("/api/market-caps")
+    def market_caps():
+        """Every item ranked by **market cap** = total world units × per-unit USD floor (the
+        lesser of the USD floor and the gold floor converted to USD, i.e. `item_floors()`'s
+        `usd_equiv`). Drives the Market Watch market-cap leaderboard. Items missing either a
+        live floor or a world-supply number can't be valued and are omitted."""
+        con = connect(readonly=True)
+        try:
+            rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
+            floors = item_floors(con, rate)
+        finally:
+            con.close()
+        sup = world_item_supply()
+        smap = sup["map"]
+        items = []
+        for it in set(list(floors.keys()) + list(smap.keys())):
+            feq = floors.get(it, {}).get("usd_equiv")
+            s = smap.get(it)
+            if feq is None or s is None:
+                continue
+            items.append({
+                "item_type": it, "label": item_label(it), "category": categorize(it),
+                "supply": s, "floor_usd": feq, "market_cap": feq * s,
+            })
+        items.sort(key=lambda x: x["market_cap"], reverse=True)
+        return jsonify({
+            "ok": True, "items": items,
+            "total_market_cap": sum(x["market_cap"] for x in items),
+            "players": sup["players"], "generated": sup["generated"],
+            "kins_price": current_kins_usd(),
+        })
+
     @app.route("/api/settings", methods=["GET", "POST"])
     def settings():
         con = connect()
@@ -4507,14 +4539,18 @@ def make_app():
             kins = (ta / kins_px) if (ta and kins_px) else None
             ff = floors.get(it, {})
             f_usd = ff.get("usd")            # raw cheapest USD listing
-            f_equiv = ff.get("usd_equiv")    # cheaper of USD / gold→USD, for the KINS floor
+            f_equiv = ff.get("usd_equiv")    # cheaper of USD / gold→USD — the per-unit USD floor
+            supply = supply_map.get(it)
+            # market cap = total world units × the per-unit USD floor (lesser of USD/gold→USD)
+            mcap = (f_equiv * supply) if (f_equiv is not None and supply is not None) else None
             out.append({
                 "item_type": it, "label": item_label(it), "category": categorize(it),
                 "sales": gs + ts, "avg_gold": ga, "avg_usd": ta, "kins": kins,
                 "floor_gold": ff.get("gold"), "floor_usd": f_usd,
                 "floor_kins": (f_equiv / kins_px) if (f_equiv and kins_px) else None,
                 "first_sale": firsts.get(it),
-                "world_supply": supply_map.get(it),   # total units of this item across all players
+                "world_supply": supply,   # total units of this item across all players
+                "market_cap": mcap,       # world_supply × USD floor
             })
         return jsonify({"ok": True, "ref_day": ref, "window": window,
                         "kins_price": kins_px, "gold_rate": rate, "items": out,
@@ -5481,7 +5517,7 @@ td.isd{cursor:help}
 .gw-sortsel{padding:7px 12px;border-radius:999px;border:1px solid #2c3c56;background:rgba(255,255,255,.03);
   color:var(--gold2);font:500 13px 'Fredoka';cursor:pointer}
 .gw-note{color:#6f86a6;font:400 12px 'Fredoka';margin:10px 0 6px}
-.gw-head,.gw-row{display:grid;grid-template-columns:1.6fr .8fr .9fr .9fr .9fr .9fr;align-items:center;gap:8px}
+.gw-head,.gw-row{display:grid;grid-template-columns:1.5fr .7fr .9fr .8fr .8fr .8fr 1fr;align-items:center;gap:8px}
 .gw-head{padding:6px 12px;color:#6f86a6;font:600 11px 'Fredoka';letter-spacing:.14em;text-transform:uppercase;
   border-bottom:1px solid rgba(255,255,255,.07)}
 .gw-head .r,.gw-row .r{text-align:right}
@@ -5653,10 +5689,11 @@ a{color:var(--gold2)}
   .gw-sub{font-size:12.5px}
   .gw-pills{flex-wrap:wrap}
 
-  /* index rows: drop Sales + Floor Gold on phones, keep In world + USD/$KINS floors */
-  .gw-head,.gw-row{grid-template-columns:1.5fr .9fr .9fr .9fr;gap:6px}
+  /* index rows on phones: keep Item · In world · $KINS · Mkt cap; hide Sales, both gold/USD floors */
+  .gw-head,.gw-row{grid-template-columns:1.4fr .9fr .8fr 1fr;gap:6px}
   .gw-head>*:nth-child(2),.gw-row>*:nth-child(2),
-  .gw-head>*:nth-child(4),.gw-row>*:nth-child(4){display:none}
+  .gw-head>*:nth-child(4),.gw-row>*:nth-child(4),
+  .gw-head>*:nth-child(5),.gw-row>*:nth-child(5){display:none}
   .gw-head{font-size:9.5px;letter-spacing:.06em}
   .gw-name{font-size:13.5px}
   .gw-num{font-size:12px}
@@ -5842,6 +5879,21 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
 .mw-spin-split .seg.burn{background:linear-gradient(90deg,#b5562f,#f0945e)}
 .mw-spin-split .seg.treas{background:linear-gradient(90deg,#2c6f9f,#5aa9e6)}
 .mw-spin-note{margin-top:12px;font:12px/1.5 var(--ui);color:var(--mut)}
+
+/* market-cap leaderboard */
+.mw-lb{display:flex;flex-direction:column;gap:6px}
+.mw-lb-row{display:grid;grid-template-columns:30px 26px minmax(96px,190px) 1fr auto;align-items:center;gap:10px}
+.mw-lb-row .rk{font:600 12px var(--mono);color:var(--mut);text-align:right}
+.mw-lb-row .ico{width:24px;height:24px;display:flex;align-items:center;justify-content:center;font-size:16px}
+.mw-lb-row .ico img{width:24px;height:24px;object-fit:contain;image-rendering:-webkit-optimize-contrast}
+.mw-lb-row .nm{font:600 13px var(--ui);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--ink)}
+.mw-lb-row .track{height:15px;background:var(--panel2);border-radius:8px;overflow:hidden}
+.mw-lb-row .track i{display:block;height:100%;border-radius:8px;min-width:2px;
+  background:linear-gradient(90deg,var(--gold),var(--gold2))}
+.mw-lb-row .val{font:700 13px var(--ui);color:var(--gold2);text-align:right;white-space:nowrap;min-width:62px}
+.mw-lb-row:nth-child(-n+3) .track i{box-shadow:0 0 12px rgba(246,214,138,.55)}
+.mw-lb-row:nth-child(1) .rk{color:var(--gold2);font-size:14px}
+@media(max-width:640px){.mw-lb-row{grid-template-columns:24px 22px minmax(70px,1fr) 2fr auto;gap:7px}}
 
 /* biggest trades */
 .mw-tr{width:100%;border-collapse:collapse;font:13px var(--ui)}
@@ -6703,6 +6755,7 @@ function renderHist(){
     least:   (a,b)=> (a.sales||0)-(b.sales||0),
     world:   (a,b)=> (b.world_supply||0)-(a.world_supply||0),
     rare:    (a,b)=> (a.world_supply==null?Infinity:a.world_supply)-(b.world_supply==null?Infinity:b.world_supply),
+    mcap:    (a,b)=> (b.market_cap||0)-(a.market_cap||0),
     newest:  (a,b)=> byDate(a,b,-1),     // latest first_sale first (nulls last)
     oldest:  (a,b)=> byDate(a,b,1),
     cheapest:(a,b)=> (a.floor_kins==null?Infinity:a.floor_kins)-(b.floor_kins==null?Infinity:b.floor_kins),
@@ -6719,6 +6772,7 @@ function renderHist(){
       <div class="gw-num mut r" data-tip="cheapest live gold listing (items per gold when under 1g each)">${fGold(r.floor_gold)}</div>
       <div class="gw-num r">${fUsd(r.floor_usd,r.category)}</div>
       <div class="gw-num gw-kins r">${fKins(r.floor_kins,r.category)}</div>
+      <div class="gw-num r" data-tip="market cap = in-world supply × USD floor (lesser of USD / gold→USD)" style="color:var(--gold2);font-weight:600">${r.market_cap!=null?mwUsd(r.market_cap):"—"}</div>
     </div>`+(open?`<div class="gw-exp" id="gwexp"></div>`:"");
   }).join("");
   const kp=d.kins_price?("$"+(+d.kins_price.toFixed(4))):"—";
@@ -6734,7 +6788,7 @@ function renderHist(){
         <button class="gw-pill ${state.histWindow==30?'on':''}" data-win="30">Last 30 days</button>
         <span style="width:14px"></span>
         <select id="histSortSel" class="gw-sortsel">
-          ${[['most','Most sold'],['least','Least sold'],['world','Most in world'],['rare','Rarest in world'],
+          ${[['most','Most sold'],['least','Least sold'],['mcap','Market cap'],['world','Most in world'],['rare','Rarest in world'],
              ['cheapest','Cheapest ($KINS)'],['expensive','Most expensive ($KINS)'],['newest','Newest added'],['oldest','Oldest added']]
             .map(([v,l])=>`<option value="${v}" ${(state.histSort||'most')===v?'selected':''}>${l}</option>`).join('')}
         </select>
@@ -6742,7 +6796,7 @@ function renderHist(){
         <button class="gw-pill" id="histRefresh" data-tip="Refresh now">↻</button>
       </div>
       <div class="gw-note">${state.histWindow==1?"Most recent trading day":("Last "+state.histWindow+" days")} · through ${d.ref_day||"—"} · live $KINS price ${kp} per token${d.world_players?` · in-world supply across ${(+d.world_players).toLocaleString()} players`:''}</div>
-      <div class="gw-head"><span>Item</span><span class="r">Sales</span><span class="r">In world</span><span class="r">Floor Gold</span><span class="r">Floor USD</span><span class="r">Floor $KINS</span></div>
+      <div class="gw-head"><span>Item</span><span class="r">Sales</span><span class="r">In world</span><span class="r">Floor Gold</span><span class="r">Floor USD</span><span class="r">Floor $KINS</span><span class="r">Mkt cap</span></div>
       <div id="gwrows">${body||`<div class="gw-empty">No items in this category.</div>`}</div>
     </div></div>`;
   document.querySelectorAll(".gw-cat").forEach(b=>b.onclick=()=>{state.histCat=b.dataset.cat;state.histOpen=null;renderHist();});
@@ -8008,8 +8062,9 @@ function mwCountUp(el,to,fmt){ if(!el)return; if(RM){el.textContent=fmt(to);retu
 
 let MW=null;
 async function loadMarket(){
-  let d, neterr=false;
-  try{ const r=await fetch("/api/market-watch"); d=await r.json(); }
+  let d, caps=null, neterr=false;
+  try{ const [r1,r2]=await Promise.all([fetch("/api/market-watch"), fetch("/api/market-caps")]);
+       d=await r1.json(); caps=await r2.json(); }
   catch(e){ neterr=true; }       // fetch/parse failed — server blip, NOT a missing dataset
   if(TAB!=="market") return;
   const v=$("#view");
@@ -8063,9 +8118,33 @@ async function loadMarket(){
         <div class="mw-panel-b" style="padding:6px 12px">${mwTop(d.top_trades||[])}</div>
       </section>
     </div>
+
+    ${mwLeaderboard(caps)}
   </div>`;
   mwCountUp($("#mwHeroVol"), m.volume_usd||0, mwUsd0);
   mwDrawChart(d.daily||[]);
+}
+
+/* Market-cap leaderboard — every item ranked by (in-world supply × USD floor), as a
+   horizontal bar chart with icon + name and the $ value on the right. */
+function mwLeaderboard(caps){
+  if(!caps||!caps.ok||!(caps.items||[]).length) return '';
+  const items=caps.items, max=items[0].market_cap||1;   // server sorts desc → [0] is the max
+  return `<section class="mw-panel">
+    <div class="mw-panel-h"><span class="t">🏆 Market cap leaderboard</span>
+      <span class="s">${items.length} items · supply × USD floor · total ${mwUsd(caps.total_market_cap)}</span></div>
+    <div class="mw-panel-b mw-lb">`+items.map((r,i)=>{
+      const w=Math.max(0.4, r.market_cap/max*100);
+      const fb=(CAT_EMO[r.category]||'📦').replace(/'/g,'');
+      return `<div class="mw-lb-row">
+        <span class="rk">${i+1}</span>
+        <span class="ico"><img src="/icon/${r.item_type}" alt="" loading="lazy" onerror="this.parentElement.textContent='${fb}'"></span>
+        <span class="nm" title="${r.item_type} · ${abbr(r.supply)} in world @ ${fmtU(r.floor_usd)}">${esc(r.label)}</span>
+        <span class="track"><i style="width:${w.toFixed(2)}%"></i></span>
+        <span class="val">${mwUsd(r.market_cap)}</span>
+      </div>`;
+    }).join('')+`</div>
+  </section>`;
 }
 
 /* Spin Wheel infographic — the paid wheel is the only thing that burns ~50% of the stake,

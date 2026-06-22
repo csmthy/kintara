@@ -346,6 +346,11 @@ distills it into a small, indexed **`market.db`** that the website actually serv
   payout:{n, kins, usd}, daily:[{date, market_txns, market_kins, market_usd, spins, spin_kins,
   spin_usd}], top_trades:[…marketplace only]}`. Returns `503 {ok:false}` if `market.db` isn't present
   (page shows a "dataset not loaded" placeholder). Reads are read-only and fast (~ms), so no caching.
+- `GET /api/market-caps` — every item ranked by **market cap** = in-world supply × per-unit USD floor
+  (`item_floors()`'s `usd_equiv` = lesser of USD / gold→USD). `{ok, items:[{item_type, label, category,
+  supply, floor_usd, market_cap}] (desc), total_market_cap, players, kins_price}`. Items missing a live
+  floor or a world-supply number are omitted (can't be valued). Drives the Market Watch market-cap
+  leaderboard.
 - `GET /api/items` — distinct item types, categories, **labels** map, gold_item.
 - `GET/POST /api/settings` — get/set `gold_item`.
 - `GET /api/arbitrage?direction=&min_qty=&gold_item=` — the arbitrage table. Returns `gold_rate`,
@@ -428,8 +433,9 @@ distills it into a small, indexed **`market.db`** that the website actually serv
   availability window + supply status from `sales_daily` (`item_index_meta()`).
 - `GET /api/sales-summary?window=1|7|30` — per-item totals over the window: sales,
   sales-weighted avg gold/USD, `$KINS`, `ref_day`. Each item also carries **`world_supply`** (total
-  units across all players, from `world_item_supply()` — the Index "In world" column), and the payload
-  adds `world_players` + `world_generated`. Also returns the **current floor** per item
+  units across all players, from `world_item_supply()` — the Index "In world" column) and
+  **`market_cap`** (= `world_supply` × the per-unit USD floor `usd_equiv`); the payload adds
+  `world_players` + `world_generated`. Also returns the **current floor** per item
   (`floor_gold` = actual cheapest gold ask, `floor_usd` = cheapest USD-equivalent, `floor_kins`) via
   `item_floors()` — drives the Index tab's floor columns. `item_floors()` applies the **bulk-material
   rule**: for `material` items it ignores listings smaller than `MIN_BULK_QTY` (1000), so a "100 wood for
@@ -531,9 +537,12 @@ second. The tabs below are numbered by topic, not bar order.
    marketplace trades + avg trade size, treasury fees, unique traders); an interactive **daily
    trading-volume SVG chart** (marketplace only, hover tooltip per day); a **🎡 Spin wheel
    infographic** (`mwSpinwheel()`: spins, $KINS/USD wagered, unique spinners, and a split bar showing
-   ~50% burned / ~50% to treasury); and a **biggest-trades** table (Solscan links). Game-styled, all
-   in `.mw-*` CSS. Refreshes gently (60s); historical so it rarely changes. Placeholder if `market.db`
-   is absent; quiet auto-retry on a transient feed blip.
+   ~50% burned / ~50% to treasury); a **biggest-trades** table (Solscan links); and a **🏆 market-cap
+   leaderboard** at the bottom (`mwLeaderboard()` ← `/api/market-caps`) — every valued item as a
+   horizontal bar (icon + name, gold bar ∝ market cap, $ value on the right, top-3 glow). Game-styled,
+   all in `.mw-*` CSS. Fetches `/api/market-watch` + `/api/market-caps` in parallel. Refreshes gently
+   (60s); historical so it rarely changes. Placeholder if `market.db` is absent; quiet auto-retry on a
+   transient feed blip.
 
 1. **Arbitrage** (landing) — per-item table: `items/$` (green; shows `$X.XX` per item for
    items >$1 each), `per gold` (gold), **kins/gold** ($KINS to assemble 1 gold's worth, green when
@@ -571,11 +580,12 @@ second. The tabs below are numbered by topic, not bar order.
 3. **Index** (was "Sales history") — game "index" layout: category **sidebar**, **Today / 7d / 30d**
    window selector, a **sort dropdown** (Most/Least sold · **Most in world / Rarest in world** by total
    world supply · Cheapest/Most expensive by the $KINS floor · Newest/Oldest added by first-sale date —
-   `first_sale` from `/api/sales-summary`; cheapest/newest are sort-only, no extra column), columns
-   ITEM · SALES · **IN WORLD** · **FLOOR GOLD · FLOOR USD · FLOOR $KINS**. **IN WORLD** = total units of
-   that item across every player (kintara.gg world index, `world_supply`; the note shows "across N
-   players"). Floors are the live cheapest price per item, from `item_floors()`. (On phones the Sales +
-   Floor-Gold columns are hidden to keep In-world + USD/$KINS legible.) Cheap commodities show **items-per-gold** (e.g. `24k/g`) instead of a tiny gold fraction, and
+   `first_sale` from `/api/sales-summary`; **Market cap** by `market_cap`; cheapest/newest are sort-only),
+   columns ITEM · SALES · **IN WORLD** · **FLOOR GOLD · FLOOR USD · FLOOR $KINS · MKT CAP**. **IN WORLD**
+   = total units of that item across every player (kintara.gg world index, `world_supply`; note shows
+   "across N players"). **MKT CAP** = in-world supply × USD floor (lesser of USD / gold→USD), gold-tinted.
+   Floors are the live cheapest price per item, from `item_floors()`. (On phones Sales + both gold/USD
+   floor columns are hidden to keep In-world + $KINS + Mkt-cap legible.) Cheap commodities show **items-per-gold** (e.g. `24k/g`) instead of a tiny gold fraction, and
    **material/food/potion** show **USD/$KINS per 1,000**. Click a row → expands to a full **Item
    Scorecard** (stock-page) view:
    - **Scorecard header** (`/api/scorecard`, `loadScorecard`/`scorecardHTML`): the floor in
@@ -775,6 +785,13 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Market cap: Index column + Market Watch leaderboard.** Market cap = **in-world supply × USD floor**
+  (the lesser of the USD floor and the gold floor converted to USD = `item_floors()`'s `usd_equiv`).
+  Added a **MKT CAP** column + "Market cap" sort to the Index (`market_cap` on `/api/sales-summary`),
+  and a new **`GET /api/market-caps`** (every valued item ranked desc + `total_market_cap`) powering a
+  **🏆 market-cap leaderboard** at the bottom of Market Watch — a horizontal bar chart, every item with
+  icon + name, gold bar ∝ cap, $ value on the right (`mwLeaderboard()`, `.mw-lb` CSS). Capture sample:
+  121 valued items, total ~$835k; top = gold $98k, marble gate $79k, mansion key #1 $68k.
 - **Index: "In world" total-supply column.** Each item now shows its **total world supply** (units
   across every player's inventory/bank/bag) — the number from kintara.gg's own `/#index`. Source:
   `GET /api/world-item-index` on the **public `fanout.kintara.gg` mirror** (no auth needed after all —
