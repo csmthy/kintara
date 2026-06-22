@@ -374,8 +374,13 @@ GOLD_RANGES = {
     "14D": (14 * 86400, 3600),    # 1-hour
     "ALL": (60 * 86400, 14400),   # 4-hour
 }
-PAGE = 40
-MAX_PAGES = 200
+# kintara.gg caps the listings page size at 100 (larger `limit` is ignored), so PAGE=100 is the
+# max. At ~8.3k active listings that's ~84 pages — well under MAX_PAGES, so the full poll reaches
+# the natural end-of-book and returns complete=True (which is what lets reconcile() mark removals
+# → attribute sales). PAGE=40 needed ~208 pages and collided with the 200-page cap right at the
+# end of the book, so the full poll never completed (complete=False) and sales detection stalled.
+PAGE = 100
+MAX_PAGES = 400          # headroom: 40k-listing ceiling so a growing book can't hit the cap again
 HTTP_TIMEOUT = 20
 
 
@@ -1134,21 +1139,28 @@ def icon_candidates(item_type):
 # ---------------------------------------------------------------------------
 
 def fetch_all_active(max_pages=MAX_PAGES):
-    """Page through the live listings. kintara.gg is flaky on deep pages, so each
-    page is retried a couple times; if a page still fails we return what we already
-    have with complete=False (never raise). reconcile() only marks listings gone on a
-    complete fetch, so a partial poll just keeps the last-good data instead of erroring
-    — a transient timeout self-heals on the next cycle without surfacing anything.
+    """Page through the live listings. Returns (listings, complete). reconcile() only marks
+    listings gone on a COMPLETE fetch, so completeness must be trustworthy.
 
-    max_pages caps how deep we page. The full poll uses MAX_PAGES (whole book, for
-    removal detection); the fast first-page poller passes max_pages=1 to grab only the
-    newest listings (1 request) so a listing created+sold between full polls is still
-    captured. Returns (listings, complete). complete is True only if we reached the end
-    of the book — a capped fetch that still hasMore returns complete=False so reconcile
-    won't mistake the unseen pages for removed listings."""
+    **Completeness is validated against the book's `total`.** kintara.gg soft-rate-limits rapid
+    deep pagination by returning an *empty* page — `{ok:true, listings:[], hasMore:false,
+    total:null}` — instead of a 429. Naively that empty page looks like "end of book", and if we
+    trusted it we'd conclude the book is e.g. 500 listings and reconcile() would mark the other
+    ~8,000 still-live listings as removed → a flood of false sales. So we capture `total` from the
+    first page and only report complete=True once we've actually collected ~all of `total`. A
+    short/empty read before reaching `total` (rate-limit or deep-page failure) ⇒ complete=False:
+    keep last-good, mark nothing gone, retry next cycle.
+
+    max_pages caps depth: the full poll uses MAX_PAGES (whole book); the fast first-page poller
+    passes max_pages=1 (newest page only, capture-only)."""
     import requests
-    out, offset = [], 0
+    out, offset, total = [], 0, None
     headers = {"User-Agent": "kintara-tracker/1.0 (personal market tracker)"}
+
+    def _complete():
+        # only "complete" if we actually pulled ~the whole book (allow 3% slack for churn while paging)
+        return total is not None and len(out) >= total * 0.97
+
     for _ in range(max_pages):
         params = {"sort": "latest", "currency": "all", "category": "all",
                   "limit": PAGE, "offset": offset, "q": ""}
@@ -1168,13 +1180,17 @@ def fetch_all_active(max_pages=MAX_PAGES):
                 time.sleep(1.5 * (attempt + 1))
         if not data.get("ok"):
             return out, False
+        if total is None and data.get("total") is not None:
+            total = data.get("total")
         batch = data.get("listings", [])
         out.extend(batch)
         if not data.get("hasMore") or not batch:
-            return out, True
+            # reached an end / empty page — only a TRUE end if we got ~the whole book; an
+            # early empty page is a rate-limit/short read and must NOT be treated as complete.
+            return out, _complete()
         offset += PAGE
-    # hit the page cap with more book remaining → not a complete view of the book
-    return out, False
+    # hit the page cap
+    return out, _complete()
 
 
 def fetch_kins_ohlcv(timeframe="day", aggregate=1, limit=1000, before=None):

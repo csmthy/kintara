@@ -770,6 +770,12 @@ A site-wide quality-of-life pass that sits under every tab:
   anything gone. The poller tracks `last_success`/`fail_streak`, and the header only shows a quiet
   "reconnecting to kintara…" note once it's **persistently** failing (≥3 misses AND no successful update
   in >4 min) — transient blips self-heal silently and are not surfaced.
+  **Deep-pagination rate limit (important):** kintara soft-rate-limits rapid deep paging by returning an
+  *empty* page (`{ok:true, listings:[], hasMore:false, total:null}`) rather than a 429. An empty page
+  therefore does **not** by itself mean end-of-book — `fetch_all_active()` only reports `complete=True`
+  once it has collected ≥97% of the page-1 `total`, so a throttled read can't trick `reconcile()` into
+  marking the unseen listings as removed. Page size is capped at 100 by the API (`PAGE=100`); keep the
+  poll gentle (the shared `KINTARA_MIN_GAP` pace) so deep pages keep serving.
 - **Live World** shows players in the spectator's *area of interest* (near the world hub),
   not all `onlineTotal` players — the game only streams nearby avatars to a spectator. The
   count is global; the radar/roster is the visible crowd. Switching shards opens a fresh
@@ -790,6 +796,17 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Fix: sales feed stalled (full-book poll couldn't complete → no removals).** The marketplace book
+  grew to ~8,300 listings — past the `MAX_PAGES`(200)×`PAGE`(40)=8,000 pager ceiling — so the full poll
+  returned `complete=False` every cycle and `reconcile()` never marked removals, so no sales could be
+  attributed (counts stayed correct via synthetic rows, but the attributed feed went empty ~14:11).
+  Two fixes: (1) **`PAGE` 40→100** (kintara caps page size at 100) + **`MAX_PAGES` 200→400** so the
+  whole book is paged in ~84 shallow requests, well under the cap. (2) **`fetch_all_active()` now
+  validates completeness against the book's `total`** — kintara soft-rate-limits rapid deep paging by
+  returning an empty page (`hasMore:false, total:null`) instead of a 429, which previously looked like
+  "end of book"; we now only report `complete=True` once we've collected ≥97% of `total`, so a
+  throttled/short read can never make `reconcile()` mark thousands of live listings as removed (false
+  sales). Safe by construction: if a poll can't complete, it marks nothing gone and retries.
 - **Server-side incremental treasury sync (market.db self-updates).** The market dataset is no longer
   a static one-time ship: a new `market_sync_loop` (every `MARKET_SYNC_INTERVAL`≈5min) pulls only the
   **new** treasury txns from chain and appends the compact, USD-priced rows straight into `market.db`,
