@@ -7952,11 +7952,20 @@ function mwCountUp(el,to,fmt){ if(!el)return; if(RM){el.textContent=fmt(to);retu
 
 let MW=null;
 async function loadMarket(){
-  let d; try{ d=await (await fetch("/api/market-watch")).json(); }
-  catch(e){ d={ok:false,error:"network"}; }
+  let d, neterr=false;
+  try{ const r=await fetch("/api/market-watch"); d=await r.json(); }
+  catch(e){ neterr=true; }       // fetch/parse failed — server blip, NOT a missing dataset
   if(TAB!=="market") return;
-  MW=d;
   const v=$("#view");
+  if(neterr){
+    // transient (e.g. server restarting / dataset being rebuilt): show a quiet
+    // reconnect state and retry shortly instead of the scary "ship it" message.
+    if(!MW) v.innerHTML=`<div class="mw"><div class="mw-panel"><div class="mw-miss">
+      <span class="mw-dot"></span> Connecting to the market feed…</div></div></div>`;
+    setTimeout(()=>{ if(TAB==="market") loadMarket(); }, 2500);
+    return;
+  }
+  MW=d;
   if(!d.ok){
     v.innerHTML=`<div class="mw"><div class="mw-panel"><div class="mw-miss">
       Market dataset isn't loaded yet.<br><span style="font:12px var(--mono)">${esc(d.error||'unavailable')} — run <b>build_market_dataset.py</b> and ship <b>market.db</b> to the data volume.</span>
