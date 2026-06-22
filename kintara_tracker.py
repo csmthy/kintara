@@ -6047,10 +6047,10 @@ async function showSold(it,cur,x,y){
   if(el.__tok!==key || el.style.display==='none') return;   // moved on while loading
   const days=lastNDays((d&&d.samples)||[],3), hasPx=days.some(p=>p.price!=null);
   const unit=v=> v==null?'—':(goldOn?(+Number(v).toPrecision(3))+'g':'$'+Number(v).toFixed(v>=1?2:4));
-  const fmtDay=ms=>new Date(ms).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'});
+  const fmtDay=p=>new Date(p.date+'T00:00:00').toLocaleDateString('en-US',{month:'short',day:'numeric'});
   const rows=days.slice().reverse().map(p=> p.price!=null
-    ? `<div class="row"><span class="d">${fmtDay(p.t)}</span><span><b>${(p.sales||0).toLocaleString()}</b> sold · <span class="${goldOn?'gold':'usd'}">${unit(p.price)}</span></span></div>`
-    : `<div class="row"><span class="d">${fmtDay(p.t)}</span><span class="none">no sales</span></div>`).join('');
+    ? `<div class="row"><span class="d">${fmtDay(p)}</span><span><b>${(p.sales||0).toLocaleString()}</b> sold · <span class="${goldOn?'gold':'usd'}">${unit(p.price)}</span></span></div>`
+    : `<div class="row"><span class="d">${fmtDay(p)}</span><span class="none">no sales</span></div>`).join('');
   el.innerHTML=`<div class="sh">${esc(lbl(it))} · last 3 days</div>`+
     (hasPx?rows:`<div class="none">no recorded sales in this window</div>`);
   positionSold(x,y);
@@ -6932,7 +6932,7 @@ function floorChartHTML(d,unit,it,cat){
       `<text x="${PL-7}" y="${yy+3}" text-anchor="end" fill="#6f86a6" font-size="10" font-family="monospace">${fmtAxis(v)}</text>`;});
   const line=series.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)} ${Y(proj(p)).toFixed(1)}`).join(' ');
   const area=`M${X(series[0].t).toFixed(1)} ${(PT+plotH).toFixed(1)} `+series.map(p=>`L${X(p.t).toFixed(1)} ${Y(proj(p)).toFixed(1)}`).join(' ')+` L${X(series[series.length-1].t).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
-  const dt=t=>new Date(t).toLocaleDateString(undefined,{month:'short',day:'numeric',timeZone:'UTC'});
+  const dt=t=>new Date(t).toLocaleDateString(undefined,{month:'short',day:'numeric'});
   const clr=unit==='gold'?'#e8b54a':unit==='kins'?'#7aa2ff':'#34d39a';
   window.__floor={W,H,plotTop:PT,plotBot:PT+plotH,unit,clr,cat,goldInvert,
     t0:x0,t1:x1,PL,plotW,
@@ -6956,7 +6956,7 @@ function attachFloorHover(){
     cross.innerHTML=`<line x1="${best.x.toFixed(1)}" y1="${fx.plotTop}" x2="${best.x.toFixed(1)}" y2="${fx.plotBot}" stroke="rgba(180,200,220,.35)" stroke-dasharray="5 4"/>`+
       `<circle cx="${best.x.toFixed(1)}" cy="${best.y.toFixed(1)}" r="4" fill="${fx.clr}" stroke="#0c0f13" stroke-width="2"/>`;
     const goldExtra = best.gold!=null ? `${fGold(best.gold)}${com?' · '+_sig(best.gold*1000)+'g/1k':''}` : '—';
-    card.innerHTML=`<div class="gd">${new Date(best.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZone:'UTC'})} UTC</div>`+
+    card.innerHTML=`<div class="gd">${new Date(best.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</div>`+
       `<div class="gv" style="color:${fx.clr}">Floor : ${mainFor(best)}</div>`+
       `<div class="gd">gold ${goldExtra} · ${fUsd(best.usd,cat)} · ${fKins(best.kins,cat)}</div>`;
     card.style.display="block";
@@ -7129,7 +7129,7 @@ async function drawSalesChart(it,cur){
     `<div class="gw-stat"><span>Low</span><b>${unit(low)}</b></div>`+
     `<div class="gw-stat"><span>Days traded</span><b>${traded.length}</b></div>`;
   // line chart over time, only days with sales (real prices)
-  const pts=traded.map(p=>({t:Date.parse(p.date+"T00:00:00Z"),v:p.avgUnitPrice||0,sales:p.sales,date:p.date}));
+  const pts=traded.map(p=>({t:Date.parse(p.date+"T00:00:00"),v:p.avgUnitPrice||0,sales:p.sales,date:p.date}));
   if(pts.length<2){ note("Not enough sales to chart."); return; }
   x.clearRect(0,0,W,H);
   const PL=60,PR=12,top=12,bot=H-22;
@@ -7145,7 +7145,7 @@ async function drawSalesChart(it,cur){
   x.textAlign="center";x.textBaseline="alphabetic";x.fillStyle="#6f86a6";
   const tk=Math.min(6,pts.length);
   for(let j=0;j<tk;j++){const p=pts[Math.round(j*(pts.length-1)/(tk-1))];
-    x.fillText(new Date(p.t).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'}),X(p.t),H-7);}
+    x.fillText(new Date(p.t).toLocaleDateString('en-US',{month:'short',day:'numeric'}),X(p.t),H-7);}
   const g=x.createLinearGradient(0,top,0,bot);
   g.addColorStop(0,"rgba(232,181,74,.30)"); g.addColorStop(1,"rgba(232,181,74,0)");
   x.beginPath(); pts.forEach((p,i)=>{const xx=X(p.t),yy=Y(p.v);i?x.lineTo(xx,yy):x.moveTo(xx,yy);});
@@ -7166,11 +7166,11 @@ async function drawSalesChart(it,cur){
     // redraw grid+area first
     yt.forEach(tv=>{const yy=Y(tv);if(yy<top-2||yy>bot+2)return;x.strokeStyle="rgba(120,140,165,.10)";x.setLineDash([4,4]);x.beginPath();x.moveTo(PL,yy);x.lineTo(W-PR,yy);x.stroke();x.setLineDash([]);x.fillStyle="#6f86a6";x.textAlign="right";x.textBaseline="middle";x.fillText(unit(tv),PL-8,yy);});
     x.textAlign="center";x.textBaseline="alphabetic";x.fillStyle="#6f86a6";
-    for(let j=0;j<tk;j++){const p=pts[Math.round(j*(pts.length-1)/(tk-1))];x.fillText(new Date(p.t).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'}),X(p.t),H-7);}
+    for(let j=0;j<tk;j++){const p=pts[Math.round(j*(pts.length-1)/(tk-1))];x.fillText(new Date(p.t).toLocaleDateString('en-US',{month:'short',day:'numeric'}),X(p.t),H-7);}
     x.beginPath();pts.forEach((p,i)=>{const xx=X(p.t),yy=Y(p.v);i?x.lineTo(xx,yy):x.moveTo(xx,yy);});x.lineTo(X(t1),bot);x.lineTo(X(t0),bot);x.closePath();x.fillStyle=g;x.fill();
     paint(bi);
     const p=pts[bi], card=gcardNode();
-    card.innerHTML=`<div class="gd">${new Date(p.t).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric',timeZone:'UTC'})}</div>`+
+    card.innerHTML=`<div class="gd">${new Date(p.t).toLocaleDateString('en-US',{month:'short',day:'numeric',year:'numeric'})}</div>`+
       `<div class="gv" style="color:#e8b54a">avg ${unit(p.v)}</div>`+
       `<div class="gd">${p.sales.toLocaleString()} sale${p.sales===1?'':'s'}</div>`;
     card.style.display="block";
@@ -7180,7 +7180,7 @@ async function drawSalesChart(it,cur){
   };
   c.onmouseleave=()=>{x.clearRect(0,0,W,H);
     yt.forEach(tv=>{const yy=Y(tv);if(yy<top-2||yy>bot+2)return;x.strokeStyle="rgba(120,140,165,.10)";x.setLineDash([4,4]);x.beginPath();x.moveTo(PL,yy);x.lineTo(W-PR,yy);x.stroke();x.setLineDash([]);x.fillStyle="#6f86a6";x.textAlign="right";x.textBaseline="middle";x.fillText(unit(tv),PL-8,yy);});
-    x.textAlign="center";x.textBaseline="alphabetic";x.fillStyle="#6f86a6";for(let j=0;j<tk;j++){const p=pts[Math.round(j*(pts.length-1)/(tk-1))];x.fillText(new Date(p.t).toLocaleDateString('en-US',{month:'short',day:'numeric',timeZone:'UTC'}),X(p.t),H-7);}
+    x.textAlign="center";x.textBaseline="alphabetic";x.fillStyle="#6f86a6";for(let j=0;j<tk;j++){const p=pts[Math.round(j*(pts.length-1)/(tk-1))];x.fillText(new Date(p.t).toLocaleDateString('en-US',{month:'short',day:'numeric'}),X(p.t),H-7);}
     x.beginPath();pts.forEach((p,i)=>{const xx=X(p.t),yy=Y(p.v);i?x.lineTo(xx,yy):x.moveTo(xx,yy);});x.lineTo(X(t1),bot);x.lineTo(X(t0),bot);x.closePath();x.fillStyle=g;x.fill();
     paint(null); if(gcardEl)gcardEl.style.display="none"; };
 }
@@ -7470,7 +7470,7 @@ function renderMerchant(){
   if(state.merchResOpen) drawMerchResChart(state.merchResOpen);
   const fs=window.__fcspark;
   if(fs) svgHover("fcsvg","fccross",fs.W,fs.plotTop,fs.plotBot,fs.pix,fs.clr,
-    p=>`<div class="gd">${new Date(p.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZone:'UTC'})} UTC</div>`+
+    p=>`<div class="gd">${new Date(p.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</div>`+
        `<div class="gv" style="color:${p.profit>=0?'#34d39a':'#f06a6a'}">Profit : ${(p.profit>=0?'+':'')+'$'+(+p.profit).toFixed(3)}/gold</div>`+
        `<div class="gd">gold $${(+(p.gold_rate||0)).toFixed(3)} · mint $${(+(p.mint_usd||0)).toFixed(3)}</div>`);
 }
@@ -7491,7 +7491,7 @@ async function drawMerchResChart(key){
       `<text x="${PL-6}" y="${yy+3}" text-anchor="end" fill="#6f86a6" font-size="9" font-family="monospace">${v}%</text>`;});
   const line=pts.map((p,i)=>`${i?'L':'M'}${X(p.t).toFixed(1)} ${Y(p.pct).toFixed(1)}`).join(' ');
   const area=`M${X(pts[0].t).toFixed(1)} ${(PT+plotH).toFixed(1)} `+pts.map(p=>`L${X(p.t).toFixed(1)} ${Y(p.pct).toFixed(1)}`).join(' ')+` L${X(pts[pts.length-1].t).toFixed(1)} ${(PT+plotH).toFixed(1)} Z`;
-  const dt=t=>new Date(t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',timeZone:'UTC'});
+  const dt=t=>new Date(t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric'});
   $("#mresChart").innerHTML=`<div class="gw-meta-h" style="margin:2px 0 4px">${esc(rec.label)} — donation progress over time</div>
     <svg id="mrsvg" viewBox="0 0 ${W} ${H}" style="width:100%;height:${H}px" preserveAspectRatio="none">
       <defs><linearGradient id="mrg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#e8b54a" stop-opacity=".25"/><stop offset="1" stop-color="#e8b54a" stop-opacity="0"/></linearGradient></defs>
@@ -7502,7 +7502,7 @@ async function drawMerchResChart(key){
   // crosshair + hover card (same feel as the gold-price chart)
   svgHover("mrsvg","mrcross",W,PT,PT+plotH,
     pts.map(p=>({x:X(p.t),y:Y(p.pct),t:p.t,pct:p.pct,current:p.current})),"#e8b54a",
-    p=>`<div class="gd">${new Date(p.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit',timeZone:'UTC'})} UTC</div>`+
+    p=>`<div class="gd">${new Date(p.t).toLocaleString(undefined,{month:'short',day:'numeric',hour:'numeric',minute:'2-digit'})}</div>`+
         `<div class="gv" style="color:#e8b54a">${esc(rec.label)} : ${p.pct.toFixed(1)}%</div>`+
         (p.current!=null?`<div class="gd">${p.current.toLocaleString()} donated</div>`:''));
 }
@@ -8192,7 +8192,7 @@ function mwDrawChart(daily){
     const bh=Math.max(1,(H-padT-padB)*((x.market_usd||0)/max));
     const bx=padL+i*bw+gap/2;
     bars+=`<rect class="bar" x="${bx.toFixed(1)}" y="${(H-padB-bh).toFixed(1)}" width="${(bw-gap).toFixed(1)}" height="${bh.toFixed(1)}" rx="2" data-i="${i}"></rect>`;
-    if(i%Math.ceil(n/8)===0||i===n-1){ const d=new Date(x.date); ticks+=`<text class="axt" x="${(bx+(bw-gap)/2).toFixed(1)}" y="${H-7}" text-anchor="middle">${d.getMonth()+1}/${d.getDate()}</text>`; }
+    if(i%Math.ceil(n/8)===0||i===n-1){ const d=new Date(x.date+'T00:00:00'); ticks+=`<text class="axt" x="${(bx+(bw-gap)/2).toFixed(1)}" y="${H-7}" text-anchor="middle">${d.getMonth()+1}/${d.getDate()}</text>`; }
   });
   // area line over the bars
   let pts=daily.map((x,i)=>`${(padL+i*bw+bw/2).toFixed(1)},${y(x.market_usd||0).toFixed(1)}`).join(' ');
@@ -8208,7 +8208,7 @@ function mwDrawChart(daily){
   const svg=host.querySelector('svg'), tip=$("#mwTip");
   svg.querySelectorAll('.bar').forEach(b=>{
     b.addEventListener('mousemove',e=>{ const x=daily[+b.dataset.i];
-      tip.innerHTML=`<b style="color:var(--gold2)">${mwUsd0(x.market_usd)}</b> · ${(x.market_txns||0).toLocaleString()} trades<br><span style="color:var(--mut)">${new Date(x.date).toLocaleDateString()} · ${abbr(x.market_kins)} $KINS</span>`;
+      tip.innerHTML=`<b style="color:var(--gold2)">${mwUsd0(x.market_usd)}</b> · ${(x.market_txns||0).toLocaleString()} trades<br><span style="color:var(--mut)">${new Date(x.date+'T00:00:00').toLocaleDateString()} · ${abbr(x.market_kins)} $KINS</span>`;
       tip.style.left=e.clientX+'px'; tip.style.top=e.clientY+'px'; tip.style.opacity='1'; });
     b.addEventListener('mouseleave',()=>{ tip.style.opacity='0'; });
   });

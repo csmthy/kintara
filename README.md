@@ -785,6 +785,14 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **All charts now render in the browser's local timezone.** Previously mixed: the gold chart was
+  local while the floor-history, sales, merchant-forecast and merchant-resource charts forced
+  `timeZone:'UTC'` (with " UTC" labels), and the Market Watch daily chart had an off-by-one (parsed the
+  UTC date string but read local getters). Now all **intraday** time displays drop the UTC override →
+  local; all **daily** series (sales chart, "last 7 days sold" card, Market Watch daily volume) parse
+  their `YYYY-MM-DD` bucket as **local midnight** so the calendar date is shown consistently with no
+  shift. (Daily buckets are still UTC calendar days in the source data — only the label rendering is
+  unified to local.)
 - **Market cap: Index column + Market Watch leaderboard.** Market cap = **in-world supply × USD floor**
   (the lesser of the USD floor and the gold floor converted to USD = `item_floors()`'s `usd_equiv`).
   Added a **MKT CAP** column + "Market cap" sort to the Index (`market_cap` on `/api/sales-summary`),
