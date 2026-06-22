@@ -335,12 +335,15 @@ distills it into a small, indexed **`market.db`** that the website actually serv
 - `GET /api/status` — poller state, tracking-since, row count.
 - `GET /api/market-watch` — whole-market on-chain stats for the **Market Watch** home page,
   aggregated live from the compact `market.db` (~95k treasury-derived txns, each priced in USD at
-  the KINS/USD of the trade's own minute). Returns `{ok, generated_at, ts_min, ts_max, kins_price, totals:{txns,
-  volume_kins, volume_usd, treasury_kins, burned_kins, unique_buyers/sellers/traders},
-  categories:{marketplace|sink|payout|other → {n, kins, usd, treasury, burned, to_player}},
-  daily:[{date, txns, kins, usd, market_usd, sink_usd}], top_trades:[…]}`. Returns `503
-  {ok:false}` if `market.db` isn't present (page shows a "dataset not loaded" placeholder). Reads
-  are read-only and fast (~ms on 95k rows), so no caching.
+  the KINS/USD of the trade's own minute). **Trading volume = the `marketplace` category ONLY;** the
+  **spin wheel** (the `sink` category — the only txns that burn ~50% of the stake) is gambling, not
+  trading, so it's reported separately and excluded from every market total. Returns `{ok,
+  generated_at, ts_min, ts_max, kins_price, treasury_owner,
+  market:{txns, volume_kins, volume_usd, fees_kins, unique_buyers/sellers/traders},
+  spinwheel:{spins, wagered_kins, wagered_usd, burned_kins, treasury_kins, unique_spinners},
+  payout:{n, kins, usd}, daily:[{date, market_txns, market_kins, market_usd, spins, spin_kins,
+  spin_usd}], top_trades:[…marketplace only]}`. Returns `503 {ok:false}` if `market.db` isn't present
+  (page shows a "dataset not loaded" placeholder). Reads are read-only and fast (~ms), so no caching.
 - `GET /api/items` — distinct item types, categories, **labels** map, gold_item.
 - `GET/POST /api/settings` — get/set `gold_item`.
 - `GET /api/arbitrage?direction=&min_qty=&gold_item=` — the arbitrage table. Returns `gold_rate`,
@@ -517,13 +520,16 @@ page (see below). The Index (per-item scorecards) is the flagship intelligence p
 second. The tabs below are numbered by topic, not bar order.
 
 0. **Market Watch** (home / splash) — `loadMarket()` → `/api/market-watch`. Whole-market on-chain
-   overview built from the distilled treasury dataset: a glowing hero with the **total USD volume**
-   (animated count-up) over `$KINS` traded + transaction count; a row of stat cards (total volume,
-   transactions, marketplace volume, treasury revenue, **$KINS burned**, unique wallets); an
-   interactive **daily-volume SVG bar/area chart** (hover tooltip per day); a **category breakdown**
-   (marketplace / burn-sink / payouts as proportional bars); and a **biggest-trades** table (Solscan
-   links). Game-styled (gold glow, Fredoka, dark panels), all in `.mw-*` CSS. Refreshes gently (60s);
-   the dataset is historical so it rarely changes. If `market.db` is absent it shows a placeholder.
+   overview built from the distilled treasury dataset. **Trading volume is marketplace-only** —
+   the paid **spin wheel** (the 50%-burn sink) is gambling, not trading, so it's pulled out into its
+   own infographic and excluded from the headline numbers. Sections: a glowing hero with **trading
+   volume** (animated count-up) over marketplace `$KINS` + trade count; stat cards (trading volume,
+   marketplace trades + avg trade size, treasury fees, unique traders); an interactive **daily
+   trading-volume SVG chart** (marketplace only, hover tooltip per day); a **🎡 Spin wheel
+   infographic** (`mwSpinwheel()`: spins, $KINS/USD wagered, unique spinners, and a split bar showing
+   ~50% burned / ~50% to treasury); and a **biggest-trades** table (Solscan links). Game-styled, all
+   in `.mw-*` CSS. Refreshes gently (60s); historical so it rarely changes. Placeholder if `market.db`
+   is absent; quiet auto-retry on a transient feed blip.
 
 1. **Arbitrage** (landing) — per-item table: `items/$` (green; shows `$X.XX` per item for
    items >$1 each), `per gold` (gold), **kins/gold** ($KINS to assemble 1 gold's worth, green when
@@ -763,6 +769,14 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Market Watch: spin wheel split out of trading volume.** The paid spin wheel is the `sink`
+  category (the only txns that burn ~50% of the stake — confirmed nothing else does), so it's
+  gambling, not trading. `/api/market-watch` now returns separate `market` (marketplace-only trading)
+  and `spinwheel` blocks; the headline **trading volume is marketplace-only** ($527.7k, was $581.6k
+  when the wheel was lumped in). Added a **🎡 Spin wheel infographic** (`mwSpinwheel()`: spins,
+  wagered $KINS/USD, unique spinners, 50%-burn/50%-treasury split bar) replacing the old category
+  bars; the daily chart and biggest-trades are marketplace-only. Captured month: 6,633 spins, $32.8k
+  wagered, 5.97M $KINS burned, 775 spinners.
 - **Market Watch home page + on-chain market dataset.** New flagship **splash/home tab** (now the
   default landing tab, `TAB="market"`) showing whole-market on-chain stats: animated total USD volume,
   stat cards (volume / transactions / marketplace / treasury revenue / $KINS burned / unique wallets),

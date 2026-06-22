@@ -3624,55 +3624,58 @@ def make_app():
 
     @app.route("/api/market-watch")
     def market_watch():
-        """Whole-market on-chain stats for the Market Watch home page, aggregated live from
-        the compact market.db (95k treasury-derived txns, each priced in USD at its day's
-        KINS close). Headline totals + per-category breakdown + a daily volume series +
-        the biggest trades. ~ms on 95k rows, so no caching needed."""
+        """Stats for the Market Watch home page, aggregated live from market.db (95k
+        treasury-derived txns, each priced in USD at the trade's own minute).
+
+        Trading volume = the **marketplace** category ONLY (player↔player item trades). The
+        **spin wheel** (the `sink` category — the only txns that burn ~50% of what the player
+        pays) is gambling, NOT trading, so it's reported in its own `spinwheel` block and kept
+        out of every market total. ~ms on 95k rows, so no caching."""
         mcon = market_connect()
         if mcon is None:
             return jsonify({"ok": False, "error": "market dataset not loaded"}), 503
         try:
             meta = {r["k"]: r["v"] for r in mcon.execute("SELECT k, v FROM meta")}
-            # one pass for the category breakdown + grand totals
             cats = {}
             for r in mcon.execute(
                 """SELECT category, COUNT(*) n,
                           SUM(gross_kins) kins, SUM(usd_value) usd,
-                          SUM(to_treasury) treasury, SUM(burned_kins) burned,
-                          SUM(to_player) to_player
+                          SUM(to_treasury) treasury, SUM(burned_kins) burned
                    FROM market_txns GROUP BY category"""):
                 cats[r["category"]] = {
                     "n": r["n"], "kins": r["kins"] or 0, "usd": r["usd"] or 0,
-                    "treasury": r["treasury"] or 0, "burned": r["burned"] or 0,
-                    "to_player": r["to_player"] or 0}
-            tot = mcon.execute(
-                """SELECT COUNT(*) n, SUM(gross_kins) kins, SUM(usd_value) usd,
-                          SUM(to_treasury) treasury, SUM(burned_kins) burned
-                   FROM market_txns""").fetchone()
-            uniq = mcon.execute(
+                    "treasury": r["treasury"] or 0, "burned": r["burned"] or 0}
+            mk = cats.get("marketplace", {})
+            sk = cats.get("sink", {})
+            po = cats.get("payout", {})
+            # marketplace-only unique wallets
+            mu = mcon.execute(
                 """SELECT COUNT(DISTINCT buyer) buyers, COUNT(DISTINCT seller) sellers
-                   FROM market_txns""").fetchone()
-            traders = mcon.execute(
+                   FROM market_txns WHERE category='marketplace'""").fetchone()
+            mk_traders = mcon.execute(
                 """SELECT COUNT(*) c FROM (
-                     SELECT buyer w FROM market_txns WHERE buyer IS NOT NULL
-                     UNION SELECT seller FROM market_txns WHERE seller IS NOT NULL)""").fetchone()["c"]
-            # daily volume series (drives the chart)
+                     SELECT buyer w FROM market_txns WHERE category='marketplace' AND buyer IS NOT NULL
+                     UNION SELECT seller FROM market_txns WHERE category='marketplace' AND seller IS NOT NULL)"""
+            ).fetchone()["c"]
+            spinners = mcon.execute(
+                "SELECT COUNT(DISTINCT buyer) c FROM market_txns WHERE category='sink'").fetchone()["c"]
+            # daily series split into trading vs spin (one row per day)
             daily = [dict(r) for r in mcon.execute(
                 """SELECT date,
-                          COUNT(*) txns,
-                          SUM(gross_kins) kins,
-                          SUM(usd_value) usd,
-                          SUM(CASE WHEN category='marketplace' THEN usd_value ELSE 0 END) market_usd,
-                          SUM(CASE WHEN category='sink' THEN usd_value ELSE 0 END) sink_usd
+                     SUM(CASE WHEN category='marketplace' THEN 1 ELSE 0 END) market_txns,
+                     SUM(CASE WHEN category='marketplace' THEN gross_kins ELSE 0 END) market_kins,
+                     SUM(CASE WHEN category='marketplace' THEN usd_value ELSE 0 END) market_usd,
+                     SUM(CASE WHEN category='sink' THEN 1 ELSE 0 END) spins,
+                     SUM(CASE WHEN category='sink' THEN gross_kins ELSE 0 END) spin_kins,
+                     SUM(CASE WHEN category='sink' THEN usd_value ELSE 0 END) spin_usd
                    FROM market_txns WHERE date IS NOT NULL GROUP BY date ORDER BY date""")]
             # biggest marketplace trades all-time (by USD at the time)
             top = [dict(r) for r in mcon.execute(
-                """SELECT ts, buyer, seller, gross_kins, usd_value, category
+                """SELECT ts, buyer, seller, gross_kins, usd_value
                    FROM market_txns WHERE category='marketplace'
                    ORDER BY usd_value DESC LIMIT 12""")]
         finally:
             mcon.close()
-        treasury_total = sum(c["treasury"] for c in cats.values())
         return jsonify({
             "ok": True,
             "generated_at": int(meta.get("generated_at", 0) or 0),
@@ -3680,13 +3683,23 @@ def make_app():
             "ts_max": int(meta.get("ts_max", 0) or 0),
             "treasury_owner": meta.get("treasury_owner", ""),
             "kins_price": current_kins_usd(),
-            "totals": {
-                "txns": tot["n"], "volume_kins": tot["kins"] or 0, "volume_usd": tot["usd"] or 0,
-                "treasury_kins": treasury_total, "burned_kins": tot["burned"] or 0,
-                "unique_buyers": uniq["buyers"], "unique_sellers": uniq["sellers"],
-                "unique_traders": traders,
+            # trading volume — MARKETPLACE ONLY (spin wheel excluded by design)
+            "market": {
+                "txns": mk.get("n", 0),
+                "volume_kins": mk.get("kins", 0), "volume_usd": mk.get("usd", 0),
+                "fees_kins": mk.get("treasury", 0),
+                "unique_buyers": mu["buyers"], "unique_sellers": mu["sellers"],
+                "unique_traders": mk_traders,
             },
-            "categories": cats,
+            # paid spin wheel (the 50%-burn sink) — its own stats, not part of trading volume
+            "spinwheel": {
+                "spins": sk.get("n", 0),
+                "wagered_kins": sk.get("kins", 0), "wagered_usd": sk.get("usd", 0),
+                "burned_kins": sk.get("burned", 0),
+                "treasury_kins": sk.get("treasury", 0),
+                "unique_spinners": spinners,
+            },
+            "payout": {"n": po.get("n", 0), "kins": po.get("kins", 0), "usd": po.get("usd", 0)},
             "daily": daily,
             "top_trades": top,
         })
@@ -5778,17 +5791,17 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
   border-radius:8px;padding:8px 10px;font:12px var(--mono);color:var(--ink);box-shadow:var(--sh2);
   transform:translate(-50%,-115%);white-space:nowrap;opacity:0;transition:opacity .1s}
 
-/* category bars */
-.mw-cat{display:flex;flex-direction:column;gap:14px}
-.mw-cat-row .top{display:flex;justify-content:space-between;font:13px var(--ui);margin-bottom:6px}
-.mw-cat-row .top .nm{font-weight:600}
-.mw-cat-row .top .vv{color:var(--mut);font:12px var(--mono)}
-.mw-bar{height:12px;border-radius:6px;background:var(--panel2);overflow:hidden}
-.mw-bar i{display:block;height:100%;border-radius:6px}
-.mw-bar.market i{background:linear-gradient(90deg,var(--gold),var(--gold2))}
-.mw-bar.sink i{background:linear-gradient(90deg,#b5562f,#f0945e)}
-.mw-bar.payout i{background:linear-gradient(90deg,#2c6f9f,#5aa9e6)}
-.mw-bar.other i{background:linear-gradient(90deg,#46587a,#7e93b8)}
+/* spin wheel infographic */
+.mw-spin{background:linear-gradient(180deg,#1c1410,var(--panel))}
+.mw-spin .mw-panel-h{border-bottom-color:rgba(240,148,94,.25)}
+.mw-spin-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px 18px;margin-bottom:18px}
+.mw-spin-stat .v{font:800 26px/1.1 var(--ui);color:#f0945e}
+.mw-spin-stat .l{margin-top:3px;font:11px var(--mono);letter-spacing:.1em;text-transform:uppercase;color:var(--mut)}
+.mw-spin-split{display:flex;height:30px;border-radius:8px;overflow:hidden;font:11px var(--mono)}
+.mw-spin-split .seg{display:flex;align-items:center;justify-content:center;color:#fff;white-space:nowrap;overflow:hidden}
+.mw-spin-split .seg.burn{background:linear-gradient(90deg,#b5562f,#f0945e)}
+.mw-spin-split .seg.treas{background:linear-gradient(90deg,#2c6f9f,#5aa9e6)}
+.mw-spin-note{margin-top:12px;font:12px/1.5 var(--ui);color:var(--mut)}
 
 /* biggest trades */
 .mw-tr{width:100%;border-collapse:collapse;font:13px var(--ui)}
@@ -7972,62 +7985,67 @@ async function loadMarket(){
     </div></div></div>`;
     return;
   }
-  const t=d.totals, c=d.categories||{};
-  const mk=c.marketplace||{n:0,kins:0,usd:0,treasury:0}, sk=c.sink||{n:0,kins:0,usd:0,burned:0}, po=c.payout||{n:0,kins:0,usd:0};
+  const m=d.market||{}, sw=d.spinwheel||{};
   const span=(d.ts_min&&d.ts_max)?`${new Date(d.ts_min).toLocaleDateString()} – ${new Date(d.ts_max).toLocaleDateString()}`:'';
   const kpx=d.kins_price?('$'+(+d.kins_price).toPrecision(3)):'—';
+  const avg=(m.txns?m.volume_usd/m.txns:0);
   v.innerHTML=`<div class="mw">
     <section class="mw-hero">
       <div class="mw-eyebrow">Kintara Marketplace · On-chain $KINS</div>
       <div class="mw-hero-vol" id="mwHeroVol">$0</div>
-      <div class="mw-hero-sub"><b>${abbr(t.volume_kins)}</b> $KINS traded across <b>${(t.txns||0).toLocaleString()}</b> transactions</div>
+      <div class="mw-hero-sub"><b>${abbr(m.volume_kins)}</b> $KINS traded across <b>${(m.txns||0).toLocaleString()}</b> marketplace trades</div>
       <div class="mw-hero-meta">
         <span><span class="mw-dot"></span>live $KINS ${kpx}</span>
         ${span?`<span>${span}</span>`:''}
-        <span>${(t.unique_traders||0).toLocaleString()} unique wallets</span>
+        <span>${(m.unique_traders||0).toLocaleString()} unique traders</span>
       </div>
     </section>
 
     <div class="mw-cards">
-      <div class="mw-card gold"><div class="lab">Total volume</div><div class="val">${mwUsd(t.volume_usd)}</div><div class="sub">${abbr(t.volume_kins)} $KINS</div></div>
-      <div class="mw-card"><div class="lab">Transactions</div><div class="val">${(t.txns||0).toLocaleString()}</div><div class="sub">${mk.n.toLocaleString()} marketplace trades</div></div>
-      <div class="mw-card"><div class="lab">Marketplace volume</div><div class="val">${mwUsd(mk.usd)}</div><div class="sub">${abbr(mk.kins)} $KINS</div></div>
-      <div class="mw-card buy"><div class="lab">Treasury revenue</div><div class="val">${abbr(t.treasury_kins)}</div><div class="sub">$KINS in fees + take</div></div>
-      <div class="mw-card sell"><div class="lab">$KINS burned</div><div class="val">${abbr(t.burned_kins)}</div><div class="sub">${sk.n.toLocaleString()} burn-sinks</div></div>
-      <div class="mw-card"><div class="lab">Unique wallets</div><div class="val">${(t.unique_traders||0).toLocaleString()}</div><div class="sub">${(t.unique_buyers||0).toLocaleString()} buyers · ${(t.unique_sellers||0).toLocaleString()} sellers</div></div>
+      <div class="mw-card gold"><div class="lab">Trading volume</div><div class="val">${mwUsd(m.volume_usd)}</div><div class="sub">${abbr(m.volume_kins)} $KINS</div></div>
+      <div class="mw-card"><div class="lab">Marketplace trades</div><div class="val">${(m.txns||0).toLocaleString()}</div><div class="sub">avg ${mwUsd(avg)} / trade</div></div>
+      <div class="mw-card buy"><div class="lab">Treasury fees</div><div class="val">${abbr(m.fees_kins)}</div><div class="sub">$KINS · 5% of trades</div></div>
+      <div class="mw-card"><div class="lab">Unique traders</div><div class="val">${(m.unique_traders||0).toLocaleString()}</div><div class="sub">${(m.unique_buyers||0).toLocaleString()} buyers · ${(m.unique_sellers||0).toLocaleString()} sellers</div></div>
     </div>
 
     <section class="mw-panel">
-      <div class="mw-panel-h"><span class="t">Daily trading volume</span><span class="s">USD priced at each trade's $KINS minute</span></div>
+      <div class="mw-panel-h"><span class="t">Daily trading volume</span><span class="s">marketplace only · USD at each trade's $KINS minute</span></div>
       <div class="mw-panel-b"><div id="mwChart"></div></div>
     </section>
 
     <div class="mw-grid2">
-      <section class="mw-panel">
-        <div class="mw-panel-h"><span class="t">Where the volume goes</span><span class="s">by category</span></div>
-        <div class="mw-panel-b">${mwCats(c,t)}</div>
-      </section>
+      ${mwSpinwheel(sw)}
       <section class="mw-panel">
         <div class="mw-panel-h"><span class="t">Biggest trades</span><span class="s">all-time, USD at the time</span></div>
         <div class="mw-panel-b" style="padding:6px 12px">${mwTop(d.top_trades||[])}</div>
       </section>
     </div>
   </div>`;
-  mwCountUp($("#mwHeroVol"), t.volume_usd||0, mwUsd0);
+  mwCountUp($("#mwHeroVol"), m.volume_usd||0, mwUsd0);
   mwDrawChart(d.daily||[]);
 }
 
-function mwCats(c,t){
-  const order=['marketplace','sink','payout','other'];
-  const names={marketplace:'Marketplace',sink:'Burn / sink (casino · wheel)',payout:'Treasury payouts',other:'Other'};
-  const max=Math.max(1,...order.map(k=>(c[k]&&c[k].usd)||0));
-  return `<div class="mw-cat">`+order.filter(k=>c[k]).map(k=>{
-    const v=c[k]; const w=Math.max(2,((v.usd||0)/max*100));
-    return `<div class="mw-cat-row">
-      <div class="top"><span class="nm">${names[k]}</span><span class="vv">${mwUsd(v.usd)} · ${abbr(v.kins)} $KINS · ${v.n.toLocaleString()} tx</span></div>
-      <div class="mw-bar ${k}"><i style="width:${w}%"></i></div>
-    </div>`;
-  }).join('')+`</div>`;
+/* Spin Wheel infographic — the paid wheel is the only thing that burns ~50% of the stake,
+   so the burn-sink category IS the wheel. Reported separately; NOT part of trading volume. */
+function mwSpinwheel(sw){
+  const w=sw.wagered_kins||0, burn=sw.burned_kins||0, treas=sw.treasury_kins||0;
+  const burnPct=w?Math.round(burn/w*100):50, treasPct=w?Math.round(treas/w*100):50;
+  return `<section class="mw-panel mw-spin">
+    <div class="mw-panel-h"><span class="t">🎡 Spin wheel</span><span class="s">paid wheel · separate from trading</span></div>
+    <div class="mw-panel-b">
+      <div class="mw-spin-grid">
+        <div class="mw-spin-stat"><div class="v">${(sw.spins||0).toLocaleString()}</div><div class="l">spins</div></div>
+        <div class="mw-spin-stat"><div class="v">${mwUsd(sw.wagered_usd)}</div><div class="l">wagered (USD)</div></div>
+        <div class="mw-spin-stat"><div class="v">${abbr(sw.wagered_kins)}</div><div class="l">$KINS wagered</div></div>
+        <div class="mw-spin-stat"><div class="v">${(sw.unique_spinners||0).toLocaleString()}</div><div class="l">unique spinners</div></div>
+      </div>
+      <div class="mw-spin-split" title="every spin: ~50% of the stake is burned, ~50% goes to the treasury">
+        <div class="seg burn" style="width:${burnPct}%"><span>🔥 ${abbr(burn)} burned</span></div>
+        <div class="seg treas" style="width:${treasPct}%"><span>${abbr(treas)} treasury</span></div>
+      </div>
+      <div class="mw-spin-note">Each spin burns ~half the $KINS staked and sends the rest to the treasury — a pure sink, so it's kept out of marketplace volume.</div>
+    </div>
+  </section>`;
 }
 
 function mwTop(rows){
@@ -8044,18 +8062,18 @@ function mwDrawChart(daily){
   const host=$("#mwChart"); if(!host) return;
   if(!daily.length){ host.innerHTML=`<div class="mw-miss">No daily data.</div>`; return; }
   const W=1000,H=240,padB=22,padT=10,padL=4,padR=4;
-  const n=daily.length, max=Math.max(1,...daily.map(x=>x.usd||0));
+  const n=daily.length, max=Math.max(1,...daily.map(x=>x.market_usd||0));
   const bw=(W-padL-padR)/n, gap=Math.min(6,bw*0.18);
   const y=v=>padT+(H-padT-padB)*(1-(v/max));
   let bars='',ticks='';
   daily.forEach((x,i)=>{
-    const bh=Math.max(1,(H-padT-padB)*((x.usd||0)/max));
+    const bh=Math.max(1,(H-padT-padB)*((x.market_usd||0)/max));
     const bx=padL+i*bw+gap/2;
     bars+=`<rect class="bar" x="${bx.toFixed(1)}" y="${(H-padB-bh).toFixed(1)}" width="${(bw-gap).toFixed(1)}" height="${bh.toFixed(1)}" rx="2" data-i="${i}"></rect>`;
     if(i%Math.ceil(n/8)===0||i===n-1){ const d=new Date(x.date); ticks+=`<text class="axt" x="${(bx+(bw-gap)/2).toFixed(1)}" y="${H-7}" text-anchor="middle">${d.getMonth()+1}/${d.getDate()}</text>`; }
   });
   // area line over the bars
-  let pts=daily.map((x,i)=>`${(padL+i*bw+bw/2).toFixed(1)},${y(x.usd||0).toFixed(1)}`).join(' ');
+  let pts=daily.map((x,i)=>`${(padL+i*bw+bw/2).toFixed(1)},${y(x.market_usd||0).toFixed(1)}`).join(' ');
   host.innerHTML=`<svg class="mw-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
     <defs><linearGradient id="mwgrad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0" stop-color="rgba(246,214,138,.28)"/><stop offset="1" stop-color="rgba(246,214,138,0)"/>
@@ -8068,7 +8086,7 @@ function mwDrawChart(daily){
   const svg=host.querySelector('svg'), tip=$("#mwTip");
   svg.querySelectorAll('.bar').forEach(b=>{
     b.addEventListener('mousemove',e=>{ const x=daily[+b.dataset.i];
-      tip.innerHTML=`<b style="color:var(--gold2)">${mwUsd0(x.usd)}</b> · ${x.txns.toLocaleString()} tx<br><span style="color:var(--mut)">${new Date(x.date).toLocaleDateString()} · ${abbr(x.kins)} $KINS</span>`;
+      tip.innerHTML=`<b style="color:var(--gold2)">${mwUsd0(x.market_usd)}</b> · ${(x.market_txns||0).toLocaleString()} trades<br><span style="color:var(--mut)">${new Date(x.date).toLocaleDateString()} · ${abbr(x.market_kins)} $KINS</span>`;
       tip.style.left=e.clientX+'px'; tip.style.top=e.clientY+'px'; tip.style.opacity='1'; });
     b.addEventListener('mouseleave',()=>{ tip.style.opacity='0'; });
   });
