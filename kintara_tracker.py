@@ -2410,33 +2410,74 @@ def merchant_watch_loop(interval):
         time.sleep(interval)
 
 
-_world_supply_cache = {"at": 0, "map": {}, "players": 0, "generated": 0}
+_world_supply_cache = {"at": 0, "map": {}, "players": 0, "generated": 0, "loaded": False}
 
 
-def world_item_supply():
-    """Total world units per item across all player inventories/banks/bags, from the public
-    read-fanout mirror of kintara.gg's /#index. Returns the cache dict
-    {map:{item_type:count}, players, generated, at}. Cached ~10min, last-good on failure —
-    this is global data that updates slowly, so we never hammer it. Powers the Index
-    'in world' supply column."""
-    import requests
-    now = time.time()
+def _load_world_supply_from_db():
+    """Seed the in-memory cache from the last persisted snapshot (settings `world_supply_json`)
+    so the 'in world' / market-cap data is available the instant the site loads — even right
+    after a restart, before the first live refresh completes."""
     c = _world_supply_cache
-    if c["map"] and now - c["at"] < WORLD_INDEX_CACHE_SEC:
-        return c
+    try:
+        con = connect(readonly=True)
+        raw = get_setting(con, "world_supply_json")
+        con.close()
+        if raw:
+            d = json.loads(raw)
+            if d.get("map"):
+                c.update(map=d["map"], players=d.get("players", 0),
+                         generated=d.get("generated", 0), at=d.get("at", 0))
+    except Exception:
+        pass
+    c["loaded"] = True
+
+
+def refresh_world_supply():
+    """Fetch the world index from the public read-fanout mirror; on success update the cache
+    AND persist it to the DB (so it survives restarts). Returns True on a good fetch. The
+    fanout occasionally returns fanout_unavailable transiently — on failure we keep last-good."""
+    import requests
     try:
         r = requests.get(WORLD_INDEX_URL, params={"category": "all", "sort": "desc"},
                          headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
         r.raise_for_status()
         d = r.json() or {}
         if d.get("ok"):
-            c["map"] = {row["id"]: row.get("count") for row in d.get("rows", []) if row.get("id")}
-            c["players"] = d.get("playerCount") or 0
-            c["generated"] = d.get("generatedAt") or 0
-            c["at"] = now
+            m = {row["id"]: row.get("count") for row in d.get("rows", []) if row.get("id")}
+            if m:
+                c = _world_supply_cache
+                c.update(map=m, players=d.get("playerCount") or 0,
+                         generated=d.get("generatedAt") or 0, at=time.time(), loaded=True)
+                try:
+                    con = connect()
+                    set_setting(con, "world_supply_json", json.dumps(
+                        {"map": m, "players": c["players"], "generated": c["generated"], "at": c["at"]}))
+                    con.close()
+                except Exception as e:
+                    print(f"[{now_iso()}] world supply persist failed: {e}")
+                return True
     except Exception:
-        pass   # keep last-good (map stays as-is); the column just shows '—' until it loads
-    return c
+        pass   # keep last-good
+    return False
+
+
+def world_item_supply():
+    """Return the cached world-supply snapshot INSTANTLY — no network on the request path.
+    The background world_supply_loop keeps it fresh and persists it; the request just reads
+    the in-memory cache (lazily seeded from the persisted snapshot on first use). Returns
+    {map:{item_type:count}, players, generated, at}. Powers the Index 'in world' column + mkt cap."""
+    if not _world_supply_cache["loaded"]:
+        _load_world_supply_from_db()
+    return _world_supply_cache
+
+
+def world_supply_loop(interval):
+    """Keep the world-supply snapshot fresh in the background (off the request path) and
+    persisted. Refreshes every `interval`s; if we still have no data at all, retries sooner."""
+    _load_world_supply_from_db()
+    while True:
+        ok = refresh_world_supply()
+        time.sleep(interval if (ok or _world_supply_cache["map"]) else 30)
 
 
 def order_book_usd(con, item_type, gold_rate):
@@ -8394,6 +8435,7 @@ def main():
     threading.Thread(target=rollup_loop, daemon=True).start()           # daily metrics + prune (Substrate B)
     threading.Thread(target=merchant_snapshot_loop, daemon=True).start()  # merchant campaign history
     threading.Thread(target=merchant_watch_loop, args=(MERCHANT_WATCH_INTERVAL,), daemon=True).start()  # donation-drive phone alert
+    threading.Thread(target=world_supply_loop, args=(WORLD_INDEX_CACHE_SEC,), daemon=True).start()  # keep in-world supply fresh + persisted
     threading.Thread(target=sales_audit_loop, daemon=True).start()  # reconcile sales to in-game count
     _spectate_hub.start()   # live-world spectator hub (connects per shard on demand)
     _boss_census.start()    # boss-area census for the server bubble (resolves the region key)
