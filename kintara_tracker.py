@@ -3771,13 +3771,22 @@ def make_app():
     def current():
         clauses, params = _filters()
         where = "WHERE active=1" + ("" if not clauses else " AND " + " AND ".join(clauses))
+        # item_supply = total units of that item_type listed across the WHOLE active book
+        # (summed quantity, like kintara.gg's index count) — computed globally so it's the
+        # real market supply regardless of how the table is filtered. The CTE column is
+        # renamed (sup_item_type) so the unqualified filter clauses stay unambiguous.
         sort = {"latest": "created_at DESC", "cheapest": "unit_price ASC",
-                "expensive": "unit_price DESC"}.get(request.args.get("sort", "latest"),
-                                                    "created_at DESC")
+                "expensive": "unit_price DESC", "supply": "item_supply DESC",
+                }.get(request.args.get("sort", "latest"), "created_at DESC")
         limit = min(int(request.args.get("limit", 300)), 1000)
         con = connect(readonly=True)
-        rows = con.execute(f"SELECT * FROM listings {where} ORDER BY {sort} LIMIT ?",
-                           params + [limit]).fetchall()
+        rows = con.execute(
+            f"""WITH sup AS (SELECT item_type AS sup_item_type, SUM(quantity) AS item_supply
+                             FROM listings WHERE active=1 GROUP BY item_type)
+                SELECT listings.*, sup.item_supply
+                FROM listings LEFT JOIN sup ON sup.sup_item_type = listings.item_type
+                {where} ORDER BY {sort} LIMIT ?""",
+            params + [limit]).fetchall()
         con.close()
         return jsonify([dict(r) for r in rows])
 
@@ -6345,6 +6354,7 @@ function listingControls(){
       <option value="latest">newest</option>
       <option value="cheapest" ${fstate.sort==='cheapest'?'selected':''}>cheapest</option>
       <option value="expensive" ${fstate.sort==='expensive'?'selected':''}>most expensive</option>
+      <option value="supply" ${fstate.sort==='supply'?'selected':''}>most supply</option>
     </select>
     <button class="go" id="lref">Refresh</button>
     <label class="meta"><input type="checkbox" id="auto" ${fstate.auto?'checked':''}> auto</label>
@@ -6386,11 +6396,13 @@ async function loadLive(){
   $("#ltable").innerHTML = !rows.length
     ? `<div class="empty">No live listings match.</div>`
     : `<table><thead><tr><th>item</th><th>seller</th><th class="num">qty</th>
+        <th class="num" title="total units of this item listed across the whole market (kintara.gg index count)">on market</th>
         <th class="num">price</th><th class="num">listed</th>
         </tr></thead><tbody>`+rows.map(r=>`<tr>
         <td title="${r.item_type}"><span class="cellitem">${rowIcon(r)}${lbl(r.item_type)}</span></td>
         <td class="mut">${r.seller_name||""}</td>
-        <td class="num">${abbr(r.quantity||0)}</td><td class="num">${fmtPrice(r)}</td>
+        <td class="num">${abbr(r.quantity||0)}</td>
+        <td class="num mut">${abbr(r.item_supply||0)}</td><td class="num">${fmtPrice(r)}</td>
         <td class="num mut">${relAbs(r.created_at)}${freshness(r.created_at)}</td></tr>`).join("")+`</tbody></table>`;
 }
 /* total PAID in a sale (what changed hands), in its own currency. Falls back to a

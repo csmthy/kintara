@@ -323,7 +323,11 @@ Separate optional DB:
   shown items (used by the Arbitrage tab's auto-refresh + "Refresh shown").
 - `GET /api/current` / `GET /api/removed` — live listings / removed-listings (filters: `q`,
   `currency`, `item_type`, `category`, `sort`, `limit`). `q` matches itemType, seller, OR
-  in-game label. (`/api/removed` is retained for internal/debug use; the **Sales feed** tab no longer
+  in-game label. `/api/current` also returns **`item_supply`** per row = total units of that
+  item_type listed across the **whole active book** (summed quantity, like kintara.gg's index
+  count) — computed globally so it's the real market supply regardless of the row filters, via a
+  `sup` CTE join. `sort` accepts `latest`/`cheapest`/`expensive`/**`supply`** (most-listed first).
+  (`/api/removed` is retained for internal/debug use; the **Sales feed** tab no longer
   uses it — see below.)
 - `GET /api/sales-feed?limit=&item_type=&currency=&category=&q=` — **actual completed sales** from
   `sales_events`, newest first (cancellations excluded). Each row now carries the **real stack `qty`,
@@ -495,8 +499,10 @@ numbered by topic, not bar order.
      (`mpRenderExpand()`); auto-refresh freezes while a dropdown is open. Because the flicker-free morph
      reuses DOM nodes, the render **clears stale per-cell mouse handlers** (`td.onmouse*`) so an arbitrage
      deal/sold hover card can't bleed into the Collectables table.
-2. **Live listings** — current active listings (item **icon** + name · seller · qty · price · listed; the
-   per-item column was removed). **Sales feed** — **actual completed sales** (`/api/sales-feed`): item
+2. **Live listings** — current active listings (item **icon** + name · seller · qty · **on market** ·
+   price · listed; the per-item column was removed). **on market** = total units of that item listed
+   across the whole book (kintara.gg index count, `item_supply`); the **sort** dropdown adds
+   **most supply** to sort by it. **Sales feed** — **actual completed sales** (`/api/sales-feed`): item
    **icon** + name · **qty sold**
    (real stack size) · **total paid** · **seller** · **time listed** (how long it sat before selling) ·
    when. Each sale is matched to the listing that vanished, so "13,251 stone for 1g" reads correctly
@@ -706,6 +712,11 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Live listings: "on market" supply column + sort.** Each row in the Live listings index now shows
+  **`item_supply`** — total units of that item_type listed across the whole active book (summed quantity,
+  the same count kintara.gg's index shows). `/api/current` computes it globally via a `sup` CTE join (so
+  it's the true market supply regardless of the row filters) and accepts `sort=supply`; the sort dropdown
+  gained a **most supply** option.
 - **Fast first-page poller (kill the create-and-sell blind spot).** The listing poll was a single
   full-book sweep every 90s (~143 requests), so a listing created *and* sold inside one sweep was never
   captured and its sale degraded to a detail-less synthetic row. Added a second loop, `firstpage_loop`
