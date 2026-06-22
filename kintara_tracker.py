@@ -83,7 +83,7 @@ STATS_STALE_COLD = _envi("STATS_STALE_COLD", 420) # re-check quiet items this of
 # public mode and push a phone notification the moment it flips INTO `donation` (the drive
 # reopening). Notification goes to ntfy.sh (free, no account): set NOTIFY_NTFY_TOPIC to your
 # subscribed topic to enable; unset = feature dormant (nothing is sent).
-MERCHANT_WATCH_INTERVAL = _envi("MERCHANT_WATCH_INTERVAL", 30)   # how often to check the mode (sec)
+MERCHANT_WATCH_INTERVAL = _envi("MERCHANT_WATCH_INTERVAL", 20)   # how often to check the mode (sec) — ASAP alert
 NTFY_TOPIC = os.environ.get("NOTIFY_NTFY_TOPIC") or ""
 NTFY_SERVER = (os.environ.get("NOTIFY_NTFY_SERVER", "https://ntfy.sh") or "").rstrip("/")
 PUBLIC_URL = os.environ.get("KINTARA_PUBLIC_URL", "")   # optional: tap-through link in the push
@@ -2330,9 +2330,14 @@ def send_ntfy(title, body, tags="moneybag", priority="high", click=None):
     if not NTFY_TOPIC:
         return False
     import requests
-    headers = {"Title": title, "Tags": tags, "Priority": priority}
+    # HTTP headers are latin-1 only, so a raw emoji in Title/Tags crashes the request.
+    # Keep header values ASCII (ntfy renders emoji from `Tags` shortcodes like "moneybag");
+    # the message body is sent as the UTF-8 request data, where emoji are fine.
+    def _h(v):
+        return str(v).encode("ascii", "ignore").decode("ascii")
+    headers = {"Title": _h(title), "Tags": _h(tags), "Priority": _h(priority)}
     if click:
-        headers["Click"] = click
+        headers["Click"] = _h(click)
     try:
         r = requests.post(f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body.encode("utf-8"),
                           headers=headers, timeout=HTTP_TIMEOUT)
@@ -2342,39 +2347,63 @@ def send_ntfy(title, body, tags="moneybag", priority="high", click=None):
         return False
 
 
-def merchant_watch_loop(interval):
-    """Watch the traveling merchant's mode and push a one-time phone notification the moment
-    it flips INTO `donation` (the donation drive reopening — admin-triggered, unpredictable).
-    Rotation: gold_trade → resting → donation → gold_trade. We notify ONLY on entering
-    `donation`, never on `gold_trade` (actual gold selling) per the requirement.
+MERCHANT_RES_KEYS = ("wood", "stone", "coal", "cooked_fish_meat", "metal")
 
-    The last-seen mode is persisted (settings `merchant_last_mode`) so a redeploy/restart
-    neither false-fires nor re-fires: we only alert when the stored mode was something else
-    and the new one is `donation`. First-ever boot seeds silently."""
+
+def merchant_watch_loop(interval):
+    """Push a phone alert when the traveling merchant's DONATION drive opens. Rotation:
+    gold_trade → resting → donation → gold_trade. We alert on the `donation` phase only,
+    never on `gold_trade` (actual gold selling).
+
+    Designed so a notification is NEVER missed for a drive. Rather than edge-detecting the
+    resting→donation flip (which a restart or a poll gap could skip), it's LEVEL-triggered
+    with a once-per-drive latch (`merchant_donation_notified`):
+      • Fire the first time we OBSERVE the drive collecting — `mode=='donation'` OR any
+        donation resource counter > 0 (the chart filling) — and we haven't fired this drive.
+        So even if we miss the exact opening, the moment the first donation shows up (or we
+        simply see donation mode on the next poll / after a restart) the alert goes out.
+      • The latch resets only when the merchant returns to `resting` (the gap between cycles),
+        guaranteeing exactly one alert per drive and none on `gold_trade`'s leftover totals.
+    Persisted in settings, so it survives restarts/redeploys without re-firing or false-firing."""
     import requests
     while True:
         try:
-            mode = None
+            mode, res_sum = None, 0
             try:
-                r = requests.get(MERCHANT_URL, headers={"User-Agent": BROWSER_UA},
-                                 timeout=HTTP_TIMEOUT)
-                mode = (r.json() or {}).get("mode")
+                d = (requests.get(MERCHANT_URL, headers={"User-Agent": BROWSER_UA},
+                                  timeout=HTTP_TIMEOUT).json()) or {}
+                mode = d.get("mode")
+                res_sum = sum(int(d.get(k) or 0) for k in MERCHANT_RES_KEYS)
             except Exception:
-                mode = None
+                d = None
             if mode:
                 con = connect()
-                last = get_setting(con, "merchant_last_mode")
-                if mode != last:
-                    if mode == "donation" and last not in (None, "donation"):
+                notified = get_setting(con, "merchant_donation_notified")
+                if mode == "resting":
+                    # merchant is closed/away — arm the latch for the next drive
+                    if notified != "0":
+                        set_setting(con, "merchant_donation_notified", "0")
+                elif mode == "donation" or (res_sum > 0 and mode != "gold_trade"):
+                    # drive is collecting (open, or donations already landing) — alert once
+                    if notified != "1":
                         sent = send_ntfy(
-                            "🪙 Merchant donation drive is OPEN",
-                            "The Traveling Merchant just reopened donations — go contribute "
-                            "wood/stone/coal/fish/metal before gold trading returns.",
-                            tags="moneybag,bell",
-                            click=(PUBLIC_URL or None))
-                        print(f"[{now_iso()}] merchant: donation drive OPENED "
-                              f"({'notified' if sent else 'no notifier configured'})")
-                    set_setting(con, "merchant_last_mode", mode)
+                            "Merchant donation drive is OPEN",
+                            "The Traveling Merchant is collecting donations again — "
+                            "wood/stone/coal/fish/metal — before gold trading returns.",
+                            tags="moneybag,bell", click=(PUBLIC_URL or None))
+                        # Only latch when the push actually went out (or no notifier is
+                        # configured, so we don't loop-log). If a notifier IS set but the
+                        # send failed, leave the latch open so the next poll RETRIES — a
+                        # transient ntfy/network blip must never cost us the alert.
+                        if sent or not NTFY_TOPIC:
+                            set_setting(con, "merchant_donation_notified", "1")
+                            print(f"[{now_iso()}] merchant: donation drive OPEN — "
+                                  f"{'notified' if sent else 'dormant (no NOTIFY_NTFY_TOPIC)'} "
+                                  f"(mode={mode}, donated={res_sum})")
+                        else:
+                            print(f"[{now_iso()}] merchant: donation drive OPEN but ntfy send "
+                                  f"FAILED — will retry next poll (mode={mode}, donated={res_sum})")
+                set_setting(con, "merchant_last_mode", mode)
                 con.close()
         except Exception as e:
             print(f"[{now_iso()}] merchant_watch error: {e}")
@@ -8206,7 +8235,7 @@ function mwLeaderboard(caps){
       return `<div class="mw-lb-row">
         <span class="rk">${i+1}</span>
         <span class="ico"><img src="/icon/${r.item_type}" alt="" loading="lazy" onerror="this.parentElement.textContent='${fb}'"></span>
-        <span class="nm" title="${r.item_type} · ${abbr(r.supply)} in world @ ${fmtU(r.floor_usd)}">${esc(r.label)}</span>
+        <span class="nm" title="${esc(r.item_type)} · ${(r.supply||0).toLocaleString()} in world @ ${fmtU(r.floor_usd)}">${esc(r.label)}</span>
         <span class="track"><i style="width:${w.toFixed(2)}%"></i></span>
         <span class="val">${mwUsd(r.market_cap)}</span>
       </div>`;

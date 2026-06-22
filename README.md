@@ -785,14 +785,19 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
-- **Merchant donation-drive phone alert (personal, opt-in).** New `merchant_watch_loop` polls the
-  traveling-merchant `mode` every ~30s (`MERCHANT_WATCH_INTERVAL`) and pushes a one-time phone
-  notification the moment it flips into **`donation`** — the drive reopening — never on `gold_trade`
-  (actual gold selling). Rotation: `gold_trade → resting → donation → gold_trade`. Push goes via
-  **ntfy.sh** (`send_ntfy()`, set `NOTIFY_NTFY_TOPIC` to enable — dormant/no-op otherwise). Last mode
-  is persisted (`merchant_last_mode` setting) so restarts/deploys neither false-fire nor re-fire; the
-  secret topic lives in `/opt/kintara-data/kinscan.env` (off git, via an optional systemd
-  `EnvironmentFile`). See DEPLOY.md.
+- **Merchant donation-drive phone alert (personal, opt-in) — never-miss design.** New
+  `merchant_watch_loop` polls the traveling-merchant `mode` every ~20s (`MERCHANT_WATCH_INTERVAL`) and
+  pushes a phone notification when the **`donation`** drive is open — never on `gold_trade` (actual
+  gold selling). Rotation: `gold_trade → resting → donation → gold_trade`. **Level-triggered, not
+  edge-triggered:** a once-per-drive latch (`merchant_donation_notified`) fires the first time we
+  *observe* the drive collecting — `mode=='donation'` **OR any donation resource counter > 0** (the
+  chart filling) — so even if the exact opening is missed (restart, poll gap) the alert still goes out
+  the moment donations appear. Latch resets only on `resting` (exactly one alert per drive, none on
+  `gold_trade` leftovers). If the ntfy POST fails it does **not** latch → retries next poll, so a
+  transient blip can't eat the alert. Push via **ntfy.sh** (`send_ntfy()`; header values forced ASCII
+  since HTTP headers are latin-1 — emoji come from `Tags` shortcodes, not the title). Set
+  `NOTIFY_NTFY_TOPIC` to enable (dormant/no-op otherwise); secret topic lives in
+  `/opt/kintara-data/kinscan.env` (off git, optional systemd `EnvironmentFile`). See DEPLOY.md.
 - **All charts now render in the browser's local timezone.** Previously mixed: the gold chart was
   local while the floor-history, sales, merchant-forecast and merchant-resource charts forced
   `timeZone:'UTC'` (with " UTC" labels), and the Market Watch daily chart had an off-by-one (parsed the
