@@ -35,6 +35,20 @@ land on the volume. If you skip the volume, the DB is wiped on every deploy/rest
 | `KINTARA_BACKOFF` | `45` | pause after a 429/403 rate-limit |
 | `STATS_STALE_HOT` | `120` | re-check actively-traded items this often (sales feed granularity) |
 | `STATS_STALE_COLD` | `900` | re-check quiet items this often |
+| `NOTIFY_NTFY_TOPIC` | _(unset)_ | ntfy.sh topic for the **merchant donation-drive phone alert**. Unset ⇒ feature dormant (nothing sent). Put it in `/opt/kintara-data/kinscan.env` (off git). |
+| `MERCHANT_WATCH_INTERVAL` | `30` | how often (sec) to check the merchant mode for the donation-drive alert |
+| `KINTARA_PUBLIC_URL` | _(unset)_ | optional tap-through link embedded in the push notification |
+
+**Merchant donation-drive alert (personal, opt-in):** install the **ntfy** app, subscribe to an
+unguessable topic, then on the droplet:
+```bash
+echo 'NOTIFY_NTFY_TOPIC=your-secret-topic' >> /opt/kintara-data/kinscan.env
+# optional: echo 'KINTARA_PUBLIC_URL=https://your-domain' >> /opt/kintara-data/kinscan.env
+systemctl restart kintara
+```
+The watcher polls the merchant mode every ~30s and pushes the moment it flips into the
+`donation` drive (not gold trading). The topic is a shared secret — keep it in `kinscan.env`
+(on the data volume, never committed). Test anytime: `curl -d "test" ntfy.sh/your-secret-topic`.
 
 Politeness is enforced globally by `KINTARA_MIN_GAP` (a shared pacer across all loops)
 plus 429/403 backoff, so 24/7 operation can't burst the marketplace. Raise the gaps if

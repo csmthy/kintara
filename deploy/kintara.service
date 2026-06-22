@@ -18,6 +18,12 @@ Environment=PORT=8765
 # 24/7 politeness (tweak if you ever see 403/429 in the logs)
 Environment=POLL_INTERVAL=90
 Environment=KINTARA_MIN_GAP=0.5
+# Optional personal config / secrets, kept OFF git on the data volume (survives deploys).
+# Put your ntfy topic here for the merchant donation-drive phone alert, e.g.:
+#   NOTIFY_NTFY_TOPIC=your-secret-topic
+#   KINTARA_PUBLIC_URL=https://your-domain   (optional tap-through link in the push)
+# The leading '-' makes the file optional, so the service still starts if it's absent.
+EnvironmentFile=-/opt/kintara-data/kinscan.env
 ExecStart=/opt/kintara/venv/bin/python /opt/kintara/kintara_tracker.py --no-browser
 Restart=always
 RestartSec=5

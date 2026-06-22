@@ -78,6 +78,15 @@ FIRSTPAGE_INTERVAL = _envi("FIRSTPAGE_INTERVAL", 3)  # fast page-1 poll seconds:
 STATS_GAP = _envf("STATS_GAP", 0.5)               # spacing between stats requests
 STATS_STALE_HOT = _envi("STATS_STALE_HOT", 120)   # re-check actively-traded items this often
 STATS_STALE_COLD = _envi("STATS_STALE_COLD", 420) # re-check quiet items this often (was 900 — tightened so cold items' sales aren't missed)
+# --- Merchant donation-drive watcher + phone push (personal alert) ---
+# The traveling merchant rotates gold_trade → resting → donation → gold_trade. We watch the
+# public mode and push a phone notification the moment it flips INTO `donation` (the drive
+# reopening). Notification goes to ntfy.sh (free, no account): set NOTIFY_NTFY_TOPIC to your
+# subscribed topic to enable; unset = feature dormant (nothing is sent).
+MERCHANT_WATCH_INTERVAL = _envi("MERCHANT_WATCH_INTERVAL", 30)   # how often to check the mode (sec)
+NTFY_TOPIC = os.environ.get("NOTIFY_NTFY_TOPIC") or ""
+NTFY_SERVER = (os.environ.get("NOTIFY_NTFY_SERVER", "https://ntfy.sh") or "").rstrip("/")
+PUBLIC_URL = os.environ.get("KINTARA_PUBLIC_URL", "")   # optional: tap-through link in the push
 # Sale detection: short startup window during which the FIRST sighting of an item-day is
 # treated as pre-existing backlog (so a restart doesn't replay the whole day as "now").
 # After it, a first-sighting with sales is logged as real (e.g. day-rollover / new item).
@@ -2312,6 +2321,64 @@ def fetch_merchant():
         if _merchant_cache["data"]:
             return _merchant_cache["data"]
         raise
+
+
+def send_ntfy(title, body, tags="moneybag", priority="high", click=None):
+    """Push a phone notification via ntfy.sh (or a self-hosted server). No-op (returns False)
+    unless NOTIFY_NTFY_TOPIC is set, so the feature is dormant until the user opts in. The
+    topic is a shared secret — anyone who knows it can read/publish, so pick an unguessable one."""
+    if not NTFY_TOPIC:
+        return False
+    import requests
+    headers = {"Title": title, "Tags": tags, "Priority": priority}
+    if click:
+        headers["Click"] = click
+    try:
+        r = requests.post(f"{NTFY_SERVER}/{NTFY_TOPIC}", data=body.encode("utf-8"),
+                          headers=headers, timeout=HTTP_TIMEOUT)
+        return r.ok
+    except Exception as e:
+        print(f"[{now_iso()}] ntfy send failed: {e}")
+        return False
+
+
+def merchant_watch_loop(interval):
+    """Watch the traveling merchant's mode and push a one-time phone notification the moment
+    it flips INTO `donation` (the donation drive reopening — admin-triggered, unpredictable).
+    Rotation: gold_trade → resting → donation → gold_trade. We notify ONLY on entering
+    `donation`, never on `gold_trade` (actual gold selling) per the requirement.
+
+    The last-seen mode is persisted (settings `merchant_last_mode`) so a redeploy/restart
+    neither false-fires nor re-fires: we only alert when the stored mode was something else
+    and the new one is `donation`. First-ever boot seeds silently."""
+    import requests
+    while True:
+        try:
+            mode = None
+            try:
+                r = requests.get(MERCHANT_URL, headers={"User-Agent": BROWSER_UA},
+                                 timeout=HTTP_TIMEOUT)
+                mode = (r.json() or {}).get("mode")
+            except Exception:
+                mode = None
+            if mode:
+                con = connect()
+                last = get_setting(con, "merchant_last_mode")
+                if mode != last:
+                    if mode == "donation" and last not in (None, "donation"):
+                        sent = send_ntfy(
+                            "🪙 Merchant donation drive is OPEN",
+                            "The Traveling Merchant just reopened donations — go contribute "
+                            "wood/stone/coal/fish/metal before gold trading returns.",
+                            tags="moneybag,bell",
+                            click=(PUBLIC_URL or None))
+                        print(f"[{now_iso()}] merchant: donation drive OPENED "
+                              f"({'notified' if sent else 'no notifier configured'})")
+                    set_setting(con, "merchant_last_mode", mode)
+                con.close()
+        except Exception as e:
+            print(f"[{now_iso()}] merchant_watch error: {e}")
+        time.sleep(interval)
 
 
 _world_supply_cache = {"at": 0, "map": {}, "players": 0, "generated": 0}
@@ -8297,6 +8364,7 @@ def main():
     threading.Thread(target=snapshot_loop, daemon=True).start()         # order-book history (Substrate A)
     threading.Thread(target=rollup_loop, daemon=True).start()           # daily metrics + prune (Substrate B)
     threading.Thread(target=merchant_snapshot_loop, daemon=True).start()  # merchant campaign history
+    threading.Thread(target=merchant_watch_loop, args=(MERCHANT_WATCH_INTERVAL,), daemon=True).start()  # donation-drive phone alert
     threading.Thread(target=sales_audit_loop, daemon=True).start()  # reconcile sales to in-game count
     _spectate_hub.start()   # live-world spectator hub (connects per shard on demand)
     _boss_census.start()    # boss-area census for the server bubble (resolves the region key)
