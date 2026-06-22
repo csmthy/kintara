@@ -27,6 +27,7 @@ land on the volume. If you skip the volume, the DB is wiped on every deploy/rest
 | Var | Default | What |
 |---|---|---|
 | `KINTARA_DB` | `/data/kintara.db` | DB path — put on the volume |
+| `KINTARA_MARKET_DB` | `/opt/kintara-data/market.db` | compact on-chain dataset for the **Market Watch** home page (read-only; ship it to the volume — see below). Absent ⇒ the home page shows a placeholder, nothing crashes. |
 | `PORT` | `8765` | listen port (most hosts inject this) |
 | `KINTARA_HOST` | `0.0.0.0` (in Docker) | bind address |
 | `POLL_INTERVAL` | `90` | listing poll seconds |
@@ -77,6 +78,19 @@ This commits local changes, pushes `main` to GitHub, SSHes into the Droplet, run
 server deploy script, and returns you to your Mac. It defaults to
 `root@159.203.132.20`; override with `KINSCAN_DEPLOY_HOST=root@<ip>` if the Droplet
 changes.
+
+### Shipping the Market Watch dataset (`market.db`)
+The on-chain market data powering the **Market Watch** home page is **not** code and **not** in git
+(DBs are gitignored, and the data volume is never touched by `deploy.sh`). Build it on your Mac from
+the big treasury download, then copy it straight to the volume — no redeploy needed:
+```bash
+python3 build_market_dataset.py                                   # market_index.db -> market.db
+scp market.db root@159.203.132.20:/opt/kintara-data/market.db    # land it on the data volume
+ssh root@159.203.132.20 'chown kintara:kintara /opt/kintara-data/market.db'
+```
+The app opens it read-only on each request; replacing the file is picked up live. Re-run whenever you
+refresh the treasury download. (Until the file exists, the home page just shows a "dataset not loaded"
+placeholder — everything else works.)
 
 ### Updating later on the Droplet
 If you're already SSH'd into the Droplet, run:

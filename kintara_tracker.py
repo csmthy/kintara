@@ -63,6 +63,15 @@ def _envi(name, default):
 # the database survives redeploys instead of being wiped with the container.
 DB_PATH = os.environ.get("KINTARA_DB", "kintara.db")
 
+# Compact on-chain market dataset (the Market Watch home page reads it, read-only).
+# Built off-box by build_market_dataset.py from the big treasury download and scp'd to the
+# data volume; defaults to ./market.db locally, /opt/kintara-data/market.db when hosted.
+# Optional: if the file is absent the Market Watch endpoint reports unavailable rather than
+# crashing. Never written to by the app.
+MARKET_DB = os.environ.get("KINTARA_MARKET_DB",
+                           "/opt/kintara-data/market.db" if os.path.exists("/opt/kintara-data")
+                           else "market.db")
+
 # --- 24/7 cadence + politeness (all tunable via env, with hosting-friendly defaults) ---
 POLL_INTERVAL = _envi("POLL_INTERVAL", 90)        # FULL-book poll seconds (paging the whole book for removal detection; was 45)
 FIRSTPAGE_INTERVAL = _envi("FIRSTPAGE_INTERVAL", 3)  # fast page-1 poll seconds: 1 request, captures newest listings before they can be created+sold between full polls
@@ -382,6 +391,19 @@ def connect(readonly: bool = False) -> sqlite3.Connection:
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL;")
     return con
+
+
+def market_connect():
+    """Open the compact on-chain market dataset read-only, or None if it isn't present.
+    Read-only + uri so a missing/locked file degrades gracefully instead of crashing."""
+    if not os.path.exists(MARKET_DB):
+        return None
+    try:
+        con = sqlite3.connect(f"file:{MARKET_DB}?mode=ro", uri=True, timeout=10)
+        con.row_factory = sqlite3.Row
+        return con
+    except Exception:
+        return None
 
 
 def init_db() -> None:
@@ -3600,6 +3622,75 @@ def make_app():
         return jsonify({"items": rows, "categories": cats,
                         "labels": labels, "gold_item": gold_item})
 
+    @app.route("/api/market-watch")
+    def market_watch():
+        """Whole-market on-chain stats for the Market Watch home page, aggregated live from
+        the compact market.db (95k treasury-derived txns, each priced in USD at its day's
+        KINS close). Headline totals + per-category breakdown + a daily volume series +
+        the biggest trades. ~ms on 95k rows, so no caching needed."""
+        mcon = market_connect()
+        if mcon is None:
+            return jsonify({"ok": False, "error": "market dataset not loaded"}), 503
+        try:
+            meta = {r["k"]: r["v"] for r in mcon.execute("SELECT k, v FROM meta")}
+            # one pass for the category breakdown + grand totals
+            cats = {}
+            for r in mcon.execute(
+                """SELECT category, COUNT(*) n,
+                          SUM(gross_kins) kins, SUM(usd_value) usd,
+                          SUM(to_treasury) treasury, SUM(burned_kins) burned,
+                          SUM(to_player) to_player
+                   FROM market_txns GROUP BY category"""):
+                cats[r["category"]] = {
+                    "n": r["n"], "kins": r["kins"] or 0, "usd": r["usd"] or 0,
+                    "treasury": r["treasury"] or 0, "burned": r["burned"] or 0,
+                    "to_player": r["to_player"] or 0}
+            tot = mcon.execute(
+                """SELECT COUNT(*) n, SUM(gross_kins) kins, SUM(usd_value) usd,
+                          SUM(to_treasury) treasury, SUM(burned_kins) burned
+                   FROM market_txns""").fetchone()
+            uniq = mcon.execute(
+                """SELECT COUNT(DISTINCT buyer) buyers, COUNT(DISTINCT seller) sellers
+                   FROM market_txns""").fetchone()
+            traders = mcon.execute(
+                """SELECT COUNT(*) c FROM (
+                     SELECT buyer w FROM market_txns WHERE buyer IS NOT NULL
+                     UNION SELECT seller FROM market_txns WHERE seller IS NOT NULL)""").fetchone()["c"]
+            # daily volume series (drives the chart)
+            daily = [dict(r) for r in mcon.execute(
+                """SELECT date,
+                          COUNT(*) txns,
+                          SUM(gross_kins) kins,
+                          SUM(usd_value) usd,
+                          SUM(CASE WHEN category='marketplace' THEN usd_value ELSE 0 END) market_usd,
+                          SUM(CASE WHEN category='sink' THEN usd_value ELSE 0 END) sink_usd
+                   FROM market_txns WHERE date IS NOT NULL GROUP BY date ORDER BY date""")]
+            # biggest marketplace trades all-time (by USD at the time)
+            top = [dict(r) for r in mcon.execute(
+                """SELECT ts, buyer, seller, gross_kins, usd_value, category
+                   FROM market_txns WHERE category='marketplace'
+                   ORDER BY usd_value DESC LIMIT 12""")]
+        finally:
+            mcon.close()
+        treasury_total = sum(c["treasury"] for c in cats.values())
+        return jsonify({
+            "ok": True,
+            "generated_at": int(meta.get("generated_at", 0) or 0),
+            "ts_min": int(meta.get("ts_min", 0) or 0),
+            "ts_max": int(meta.get("ts_max", 0) or 0),
+            "treasury_owner": meta.get("treasury_owner", ""),
+            "kins_price": current_kins_usd(),
+            "totals": {
+                "txns": tot["n"], "volume_kins": tot["kins"] or 0, "volume_usd": tot["usd"] or 0,
+                "treasury_kins": treasury_total, "burned_kins": tot["burned"] or 0,
+                "unique_buyers": uniq["buyers"], "unique_sellers": uniq["sellers"],
+                "unique_traders": traders,
+            },
+            "categories": cats,
+            "daily": daily,
+            "top_trades": top,
+        })
+
     @app.route("/api/settings", methods=["GET", "POST"])
     def settings():
         con = connect()
@@ -3771,22 +3862,13 @@ def make_app():
     def current():
         clauses, params = _filters()
         where = "WHERE active=1" + ("" if not clauses else " AND " + " AND ".join(clauses))
-        # item_supply = total units of that item_type listed across the WHOLE active book
-        # (summed quantity, like kintara.gg's index count) — computed globally so it's the
-        # real market supply regardless of how the table is filtered. The CTE column is
-        # renamed (sup_item_type) so the unqualified filter clauses stay unambiguous.
         sort = {"latest": "created_at DESC", "cheapest": "unit_price ASC",
-                "expensive": "unit_price DESC", "supply": "item_supply DESC",
-                }.get(request.args.get("sort", "latest"), "created_at DESC")
+                "expensive": "unit_price DESC"}.get(request.args.get("sort", "latest"),
+                                                    "created_at DESC")
         limit = min(int(request.args.get("limit", 300)), 1000)
         con = connect(readonly=True)
-        rows = con.execute(
-            f"""WITH sup AS (SELECT item_type AS sup_item_type, SUM(quantity) AS item_supply
-                             FROM listings WHERE active=1 GROUP BY item_type)
-                SELECT listings.*, sup.item_supply
-                FROM listings LEFT JOIN sup ON sup.sup_item_type = listings.item_type
-                {where} ORDER BY {sort} LIMIT ?""",
-            params + [limit]).fetchall()
+        rows = con.execute(f"SELECT * FROM listings {where} ORDER BY {sort} LIMIT ?",
+                           params + [limit]).fetchall()
         con.close()
         return jsonify([dict(r) for r in rows])
 
@@ -5637,6 +5719,87 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
 .cmdk-empty{padding:24px;text-align:center;color:var(--mut)}
 .cmdk-hint{display:flex;justify-content:space-between;padding:9px 14px;border-top:1px solid var(--line);
   color:var(--mut);font:11px var(--mono)}
+
+/* ===== Market Watch (home / splash) ===== */
+.mw{display:flex;flex-direction:column;gap:var(--s5);padding:4px 2px 40px}
+.mw-hero{position:relative;overflow:hidden;border:1px solid var(--line);border-radius:var(--r2);
+  padding:48px 36px 42px;text-align:center;
+  background:
+    radial-gradient(120% 140% at 50% -20%, rgba(232,181,74,.16), transparent 60%),
+    radial-gradient(80% 120% at 80% 120%, rgba(52,211,154,.10), transparent 60%),
+    linear-gradient(180deg,var(--panel2),var(--panel));
+  box-shadow:var(--sh2)}
+.mw-hero::after{content:"";position:absolute;inset:0;pointer-events:none;
+  background:radial-gradient(60% 60% at 50% 0%, rgba(246,214,138,.10), transparent 70%)}
+.mw-eyebrow{font:600 12px/1.4 var(--mono);letter-spacing:.22em;color:var(--gold);
+  text-transform:uppercase;opacity:.9}
+.mw-hero-vol{font:800 clamp(44px,8vw,86px)/1 var(--ui);margin:14px 0 6px;
+  color:var(--gold2);text-shadow:0 0 32px rgba(232,181,74,.35);letter-spacing:-.01em}
+.mw-hero-sub{font:500 16px/1.5 var(--ui);color:var(--ink);opacity:.92}
+.mw-hero-sub b{color:var(--gold2)}
+.mw-hero-meta{margin-top:12px;font:12px var(--mono);color:var(--mut);
+  display:flex;gap:14px;justify-content:center;flex-wrap:wrap}
+.mw-dot{width:7px;height:7px;border-radius:50%;background:var(--buy);display:inline-block;
+  margin-right:6px;box-shadow:0 0 8px var(--buy);animation:mwpulse 2s infinite}
+@keyframes mwpulse{0%,100%{opacity:1}50%{opacity:.35}}
+
+.mw-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:var(--s3)}
+.mw-card{position:relative;border:1px solid var(--line);border-radius:var(--r1);padding:18px 18px 16px;
+  background:linear-gradient(180deg,var(--panel2),var(--panel));box-shadow:var(--sh1);
+  transition:transform .14s ease,border-color .14s ease,box-shadow .14s ease}
+.mw-card:hover{transform:translateY(-3px);border-color:rgba(232,181,74,.45);box-shadow:var(--sh2)}
+.mw-card .lab{font:600 11px/1.3 var(--mono);letter-spacing:.12em;text-transform:uppercase;color:var(--mut)}
+.mw-card .val{font:800 30px/1.1 var(--ui);margin-top:8px;color:var(--ink)}
+.mw-card .sub{margin-top:4px;font:12px var(--mono);color:var(--mut)}
+.mw-card.gold .val{color:var(--gold2)}
+.mw-card.buy .val{color:var(--buy)}
+.mw-card.sell .val{color:var(--sell)}
+.mw-card .spark{margin-top:10px;height:30px;width:100%;display:block}
+
+.mw-panel{border:1px solid var(--line);border-radius:var(--r2);background:var(--panel);
+  box-shadow:var(--sh1);overflow:hidden}
+.mw-panel-h{display:flex;align-items:baseline;justify-content:space-between;gap:10px;
+  padding:16px 20px;border-bottom:1px solid var(--line)}
+.mw-panel-h .t{font:700 16px var(--ui);color:var(--ink)}
+.mw-panel-h .s{font:12px var(--mono);color:var(--mut)}
+.mw-panel-b{padding:18px 20px}
+.mw-grid2{display:grid;grid-template-columns:1fr 1fr;gap:var(--s4)}
+@media(max-width:860px){.mw-grid2{grid-template-columns:1fr}}
+
+/* chart */
+.mw-chart{width:100%;height:240px;display:block;overflow:visible}
+.mw-chart .area{fill:url(#mwgrad)}
+.mw-chart .line{fill:none;stroke:var(--gold2);stroke-width:2}
+.mw-chart .bar{fill:rgba(232,181,74,.16);transition:fill .1s}
+.mw-chart .bar:hover{fill:rgba(246,214,138,.42)}
+.mw-chart .ax{stroke:var(--line)}
+.mw-chart .axt{fill:var(--mut);font:10px var(--mono)}
+.mw-tip{position:fixed;z-index:60;pointer-events:none;background:#0c1424ee;border:1px solid var(--line);
+  border-radius:8px;padding:8px 10px;font:12px var(--mono);color:var(--ink);box-shadow:var(--sh2);
+  transform:translate(-50%,-115%);white-space:nowrap;opacity:0;transition:opacity .1s}
+
+/* category bars */
+.mw-cat{display:flex;flex-direction:column;gap:14px}
+.mw-cat-row .top{display:flex;justify-content:space-between;font:13px var(--ui);margin-bottom:6px}
+.mw-cat-row .top .nm{font-weight:600}
+.mw-cat-row .top .vv{color:var(--mut);font:12px var(--mono)}
+.mw-bar{height:12px;border-radius:6px;background:var(--panel2);overflow:hidden}
+.mw-bar i{display:block;height:100%;border-radius:6px}
+.mw-bar.market i{background:linear-gradient(90deg,var(--gold),var(--gold2))}
+.mw-bar.sink i{background:linear-gradient(90deg,#b5562f,#f0945e)}
+.mw-bar.payout i{background:linear-gradient(90deg,#2c6f9f,#5aa9e6)}
+.mw-bar.other i{background:linear-gradient(90deg,#46587a,#7e93b8)}
+
+/* biggest trades */
+.mw-tr{width:100%;border-collapse:collapse;font:13px var(--ui)}
+.mw-tr td{padding:9px 8px;border-bottom:1px solid var(--line)}
+.mw-tr tr:last-child td{border-bottom:0}
+.mw-tr .addr{font:12px var(--mono);color:var(--mut)}
+.mw-tr .usd{text-align:right;color:var(--gold2);font-weight:600;white-space:nowrap}
+.mw-tr .kins{text-align:right;color:var(--mut);font:12px var(--mono);white-space:nowrap}
+.mw-tr a{color:var(--mut);text-decoration:none;border-bottom:1px dotted rgba(255,255,255,.2)}
+.mw-tr a:hover{color:var(--gold2)}
+.mw-miss{padding:40px;text-align:center;color:var(--mut);font:14px var(--ui)}
 </style></head>
 <body>
 <header><div class="hdr">
@@ -5660,7 +5823,8 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
 </div></div>
 <main>
   <div class="tabs">
-    <div class="tab on" data-t="hist">Index</div>
+    <div class="tab on" data-t="market">Market Watch</div>
+    <div class="tab" data-t="hist">Index</div>
     <div class="tab" data-t="arb">Arbitrage</div>
     <div class="tab" data-t="live">Live listings</div>
     <div class="tab" data-t="removed">Sales feed</div>
@@ -5676,7 +5840,7 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
 <script>
 const $=s=>document.querySelector(s);
 const lbl=it=>(state.labels&&state.labels[it])||it;   // itemType -> in-game name
-let TAB="hist", timer=null;
+let TAB="market", timer=null;
 const state={dir:"gold_to_kins", fee:0, goldItem:null, items:[], cats:[], labels:{},
   mpCur:"kins", mpOpen:null, mpRowMap:{}, mpCatOff:new Set(), mpCatInit:false,
   catOff:new Set(), profitableOnly:false, soldOnly:false, search:"", minQty:0, viewSet:[],
@@ -5945,7 +6109,7 @@ function shortAgo(ms){ const s=(Date.now()-ms)/1000;
 setInterval(()=>{ const u=$('#upd'); if(u) u.textContent = window.__upd?shortAgo(window.__upd):'live'; },1000);
 
 /* (#7) command palette — ⌘K to search items / sellers / tabs */
-const CMD_TABS=[['arb','Arbitrage'],['live','Live listings'],['removed','Sales feed'],
+const CMD_TABS=[['market','Market Watch'],['arb','Arbitrage'],['live','Live listings'],['removed','Sales feed'],
   ['hist','Index'],['gold','Gold price'],['merchant','Merchant'],
   ['world','Live World'],['props','Property Map']];
 let cmdkList=[], cmdkSel=0;
@@ -6354,7 +6518,6 @@ function listingControls(){
       <option value="latest">newest</option>
       <option value="cheapest" ${fstate.sort==='cheapest'?'selected':''}>cheapest</option>
       <option value="expensive" ${fstate.sort==='expensive'?'selected':''}>most expensive</option>
-      <option value="supply" ${fstate.sort==='supply'?'selected':''}>most supply</option>
     </select>
     <button class="go" id="lref">Refresh</button>
     <label class="meta"><input type="checkbox" id="auto" ${fstate.auto?'checked':''}> auto</label>
@@ -6396,13 +6559,11 @@ async function loadLive(){
   $("#ltable").innerHTML = !rows.length
     ? `<div class="empty">No live listings match.</div>`
     : `<table><thead><tr><th>item</th><th>seller</th><th class="num">qty</th>
-        <th class="num" title="total units of this item listed across the whole market (kintara.gg index count)">on market</th>
         <th class="num">price</th><th class="num">listed</th>
         </tr></thead><tbody>`+rows.map(r=>`<tr>
         <td title="${r.item_type}"><span class="cellitem">${rowIcon(r)}${lbl(r.item_type)}</span></td>
         <td class="mut">${r.seller_name||""}</td>
-        <td class="num">${abbr(r.quantity||0)}</td>
-        <td class="num mut">${abbr(r.item_supply||0)}</td><td class="num">${fmtPrice(r)}</td>
+        <td class="num">${abbr(r.quantity||0)}</td><td class="num">${fmtPrice(r)}</td>
         <td class="num mut">${relAbs(r.created_at)}${freshness(r.created_at)}</td></tr>`).join("")+`</tbody></table>`;
 }
 /* total PAID in a sale (what changed hands), in its own currency. Falls back to a
@@ -7778,9 +7939,136 @@ function jumpToSeller(name){ fstate.q=name; fstate.currency='all'; fstate.catego
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x.dataset.t==='live'));
   render(); schedule(); }
 
+/* ================= Market Watch (home / splash) ================= */
+function mwUsd0(v){ return '$'+Math.round(v||0).toLocaleString(); }
+function mwUsd(v){ v=+v||0; if(v>=1e6)return '$'+(v/1e6).toFixed(2)+'M'; if(v>=1e3)return '$'+(v/1e3).toFixed(1)+'k'; return '$'+v.toFixed(v>=1?0:2); }
+function mwAddr(a){ return a?a.slice(0,4)+'…'+a.slice(-4):'—'; }
+function mwScan(a){ return a?`<a href="https://solscan.io/account/${a}" target="_blank" rel="noopener" data-tip="${a}">${mwAddr(a)}</a>`:'—'; }
+/* count-up animation on the hero number */
+function mwCountUp(el,to,fmt){ if(!el)return; if(RM){el.textContent=fmt(to);return;}
+  const t0=performance.now(),dur=900;
+  (function step(t){ const k=Math.min(1,(t-t0)/dur); const e=1-Math.pow(1-k,3);
+    el.textContent=fmt(to*e); if(k<1)requestAnimationFrame(step); })(t0); }
+
+let MW=null;
+async function loadMarket(){
+  let d; try{ d=await (await fetch("/api/market-watch")).json(); }
+  catch(e){ d={ok:false,error:"network"}; }
+  if(TAB!=="market") return;
+  MW=d;
+  const v=$("#view");
+  if(!d.ok){
+    v.innerHTML=`<div class="mw"><div class="mw-panel"><div class="mw-miss">
+      Market dataset isn't loaded yet.<br><span style="font:12px var(--mono)">${esc(d.error||'unavailable')} — run <b>build_market_dataset.py</b> and ship <b>market.db</b> to the data volume.</span>
+    </div></div></div>`;
+    return;
+  }
+  const t=d.totals, c=d.categories||{};
+  const mk=c.marketplace||{n:0,kins:0,usd:0,treasury:0}, sk=c.sink||{n:0,kins:0,usd:0,burned:0}, po=c.payout||{n:0,kins:0,usd:0};
+  const span=(d.ts_min&&d.ts_max)?`${new Date(d.ts_min).toLocaleDateString()} – ${new Date(d.ts_max).toLocaleDateString()}`:'';
+  const kpx=d.kins_price?('$'+(+d.kins_price).toPrecision(3)):'—';
+  v.innerHTML=`<div class="mw">
+    <section class="mw-hero">
+      <div class="mw-eyebrow">Kintara Marketplace · On-chain $KINS</div>
+      <div class="mw-hero-vol" id="mwHeroVol">$0</div>
+      <div class="mw-hero-sub"><b>${abbr(t.volume_kins)}</b> $KINS traded across <b>${(t.txns||0).toLocaleString()}</b> transactions</div>
+      <div class="mw-hero-meta">
+        <span><span class="mw-dot"></span>live $KINS ${kpx}</span>
+        ${span?`<span>${span}</span>`:''}
+        <span>${(t.unique_traders||0).toLocaleString()} unique wallets</span>
+      </div>
+    </section>
+
+    <div class="mw-cards">
+      <div class="mw-card gold"><div class="lab">Total volume</div><div class="val">${mwUsd(t.volume_usd)}</div><div class="sub">${abbr(t.volume_kins)} $KINS</div></div>
+      <div class="mw-card"><div class="lab">Transactions</div><div class="val">${(t.txns||0).toLocaleString()}</div><div class="sub">${mk.n.toLocaleString()} marketplace trades</div></div>
+      <div class="mw-card"><div class="lab">Marketplace volume</div><div class="val">${mwUsd(mk.usd)}</div><div class="sub">${abbr(mk.kins)} $KINS</div></div>
+      <div class="mw-card buy"><div class="lab">Treasury revenue</div><div class="val">${abbr(t.treasury_kins)}</div><div class="sub">$KINS in fees + take</div></div>
+      <div class="mw-card sell"><div class="lab">$KINS burned</div><div class="val">${abbr(t.burned_kins)}</div><div class="sub">${sk.n.toLocaleString()} burn-sinks</div></div>
+      <div class="mw-card"><div class="lab">Unique wallets</div><div class="val">${(t.unique_traders||0).toLocaleString()}</div><div class="sub">${(t.unique_buyers||0).toLocaleString()} buyers · ${(t.unique_sellers||0).toLocaleString()} sellers</div></div>
+    </div>
+
+    <section class="mw-panel">
+      <div class="mw-panel-h"><span class="t">Daily trading volume</span><span class="s">USD priced at each day's $KINS close</span></div>
+      <div class="mw-panel-b"><div id="mwChart"></div></div>
+    </section>
+
+    <div class="mw-grid2">
+      <section class="mw-panel">
+        <div class="mw-panel-h"><span class="t">Where the volume goes</span><span class="s">by category</span></div>
+        <div class="mw-panel-b">${mwCats(c,t)}</div>
+      </section>
+      <section class="mw-panel">
+        <div class="mw-panel-h"><span class="t">Biggest trades</span><span class="s">all-time, USD at the time</span></div>
+        <div class="mw-panel-b" style="padding:6px 12px">${mwTop(d.top_trades||[])}</div>
+      </section>
+    </div>
+  </div>`;
+  mwCountUp($("#mwHeroVol"), t.volume_usd||0, mwUsd0);
+  mwDrawChart(d.daily||[]);
+}
+
+function mwCats(c,t){
+  const order=['marketplace','sink','payout','other'];
+  const names={marketplace:'Marketplace',sink:'Burn / sink (casino · wheel)',payout:'Treasury payouts',other:'Other'};
+  const max=Math.max(1,...order.map(k=>(c[k]&&c[k].usd)||0));
+  return `<div class="mw-cat">`+order.filter(k=>c[k]).map(k=>{
+    const v=c[k]; const w=Math.max(2,((v.usd||0)/max*100));
+    return `<div class="mw-cat-row">
+      <div class="top"><span class="nm">${names[k]}</span><span class="vv">${mwUsd(v.usd)} · ${abbr(v.kins)} $KINS · ${v.n.toLocaleString()} tx</span></div>
+      <div class="mw-bar ${k}"><i style="width:${w}%"></i></div>
+    </div>`;
+  }).join('')+`</div>`;
+}
+
+function mwTop(rows){
+  if(!rows.length) return `<div class="mw-miss">No trades.</div>`;
+  return `<table class="mw-tr"><tbody>`+rows.map(r=>`<tr>
+    <td><span class="addr">${mwScan(r.buyer)} → ${mwScan(r.seller)}</span></td>
+    <td class="kins">${abbr(r.gross_kins)} $KINS</td>
+    <td class="usd">${mwUsd(r.usd_value)}</td>
+  </tr>`).join('')+`</tbody></table>`;
+}
+
+/* interactive SVG daily-volume chart (bars, hover tooltip) */
+function mwDrawChart(daily){
+  const host=$("#mwChart"); if(!host) return;
+  if(!daily.length){ host.innerHTML=`<div class="mw-miss">No daily data.</div>`; return; }
+  const W=1000,H=240,padB=22,padT=10,padL=4,padR=4;
+  const n=daily.length, max=Math.max(1,...daily.map(x=>x.usd||0));
+  const bw=(W-padL-padR)/n, gap=Math.min(6,bw*0.18);
+  const y=v=>padT+(H-padT-padB)*(1-(v/max));
+  let bars='',ticks='';
+  daily.forEach((x,i)=>{
+    const bh=Math.max(1,(H-padT-padB)*((x.usd||0)/max));
+    const bx=padL+i*bw+gap/2;
+    bars+=`<rect class="bar" x="${bx.toFixed(1)}" y="${(H-padB-bh).toFixed(1)}" width="${(bw-gap).toFixed(1)}" height="${bh.toFixed(1)}" rx="2" data-i="${i}"></rect>`;
+    if(i%Math.ceil(n/8)===0||i===n-1){ const d=new Date(x.date); ticks+=`<text class="axt" x="${(bx+(bw-gap)/2).toFixed(1)}" y="${H-7}" text-anchor="middle">${d.getMonth()+1}/${d.getDate()}</text>`; }
+  });
+  // area line over the bars
+  let pts=daily.map((x,i)=>`${(padL+i*bw+bw/2).toFixed(1)},${y(x.usd||0).toFixed(1)}`).join(' ');
+  host.innerHTML=`<svg class="mw-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <defs><linearGradient id="mwgrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0" stop-color="rgba(246,214,138,.28)"/><stop offset="1" stop-color="rgba(246,214,138,0)"/>
+    </linearGradient></defs>
+    <line class="ax" x1="${padL}" y1="${H-padB}" x2="${W-padR}" y2="${H-padB}"/>
+    ${bars}
+    <polyline class="line" points="${pts}"/>
+    ${ticks}
+  </svg><div class="mw-tip" id="mwTip"></div>`;
+  const svg=host.querySelector('svg'), tip=$("#mwTip");
+  svg.querySelectorAll('.bar').forEach(b=>{
+    b.addEventListener('mousemove',e=>{ const x=daily[+b.dataset.i];
+      tip.innerHTML=`<b style="color:var(--gold2)">${mwUsd0(x.usd)}</b> · ${x.txns.toLocaleString()} tx<br><span style="color:var(--mut)">${new Date(x.date).toLocaleDateString()} · ${abbr(x.kins)} $KINS</span>`;
+      tip.style.left=e.clientX+'px'; tip.style.top=e.clientY+'px'; tip.style.opacity='1'; });
+    b.addEventListener('mouseleave',()=>{ tip.style.opacity='0'; });
+  });
+}
+
 /* ---------------- routing ---------------- */
 function render(){
-  if(TAB==="arb")loadArb();
+  if(TAB==="market")loadMarket();
+  else if(TAB==="arb")loadArb();
   else if(TAB==="live")loadLive();
   else if(TAB==="removed")loadRemoved();
   else if(TAB==="hist")loadHist();
@@ -7795,7 +8083,9 @@ function schedule(){
   // Auto-refresh cadences are deliberately gentle (this can run 24/7); every page
   // also has a manual refresh. The backend loops keep the DB current regardless —
   // these just decide how often the open tab re-reads it.
-  if(TAB==="arb"){
+  if(TAB==="market"){
+    timer=setInterval(loadMarket,60000);   // historical dataset; refresh gently
+  } else if(TAB==="arb"){
     arbTimer=setInterval(arbTick,60000);   // ~1 min (manual "↻ Refresh shown" for now)
   } else if(TAB==="hist"){
     // Index ~1 min, but don't disrupt an expanded row's chart while you're reading it

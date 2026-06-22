@@ -28,7 +28,10 @@ CLI flags: `--interval <s>` (listing poll seconds, default **90**), `--port <n>`
 <itemType>` (override the gold item), `--no-browser`.
 
 **Env-tunable cadence + politeness** (defaults are 24/7-friendly; flags override env):
-`KINTARA_DB` (DB path — point at a volume when hosted), `PORT`, `KINTARA_HOST`,
+`KINTARA_DB` (DB path — point at a volume when hosted),
+`KINTARA_MARKET_DB` (compact on-chain market dataset the Market Watch home page reads, read-only;
+defaults to `./market.db` locally, `/opt/kintara-data/market.db` when hosted — see "Market Watch" +
+"On-chain market dataset"), `PORT`, `KINTARA_HOST`,
 `POLL_INTERVAL` (90 — FULL-book poll, pages the whole book for removal detection),
 `FIRSTPAGE_INTERVAL` (3 — fast page-1 capture poll; 1 request, records newest listings
 before they can be created+sold inside a full-poll window — see "Two-tier polling"),
@@ -124,8 +127,18 @@ denominates in — the nominal-gold listing lag is the exploitable edge); KINS i
 economically but, being the most volatile denominator, is the *worst* unit to carry a stale price
 forward in. **Farmable/grindable mounts** (wolf/dragon/whale — high volume, cheap) are the exception:
 they're USD/utility-anchored commodities, not collectibles, and should be bucketed with the
-commodity (gold↔KINS) logic, not the CMP mispricing scan. Total world supply per item is **not
-publicly exposed** (no kintara.gg supply/index API; game.js has no edition/supply concept).
+commodity (gold↔KINS) logic, not the CMP mispricing scan. Total world supply per item **does exist
+but is login-gated** (we can't use it anonymously). It's served by `GET /api/world-item-index?category=
+<cat>&sort=<dir>` (and the sibling `world-marketplace-index`), which powers kintara.gg's own `/#index`
+page (rendered by `site/js/components/itemIndex.js` → `createItemIndex`). Response: `{ok, rows:[{id,
+label, icon, count}], playerCount, generatedAt}` where **`count` = total units of that item across every
+player inventory, bank, and bag** (the homepage labels it "Totals across N players"). Both endpoints
+require a **wallet-authenticated session** — the authoritative origin returns `{"ok":false,"error":
+"unauthorized"}` without cookies, and the public `fanout.kintara.gg` mirror returns `fanout_unavailable`
+for them (it *does* mirror `merchant-campaign`/`servers`/`blimp-stats`, so they deliberately keep
+inventory totals behind login). No guest cookie is issued on page load, so there's no anonymous path;
+adding a "world supply" column would need the user's kintara.gg session cookie. (`game.js` itself has no
+edition/supply concept — the totals are computed server-side.)
 
 ---
 
@@ -284,6 +297,28 @@ Separate optional DB:
   `oldest_sig`, `done`). This DB is not yet required by `kintara_tracker.py`; it is the intended
   replacement for slow per-wallet marketplace RPC scans after validation.
 
+### On-chain market dataset (the Market Watch source)
+
+The big `market_index.db` (~200MB: raw tx JSON, per-account deltas, program lists) stays on the
+laptop — it is **never** committed and **never** put on the server. `build_market_dataset.py`
+distills it into a small, indexed **`market.db`** that the website actually serves:
+
+- One lean table **`market_txns`**: `sig` PK, `ts` (ms), `date` (UTC), **`category`**, `buyer`,
+  `seller`, `gross_kins`, `to_player`, `to_treasury`, `burned_kins`, `kins_usd`, `usd_value`, plus
+  indexes on ts/date/category/buyer/seller and a `meta` snapshot.
+- **Category** maps the downloader's shape-based `kind` → user-facing buckets: `marketplace_trade`
+  → **marketplace** (player↔player, ~5% treasury fee); `treasury_income`(`_with_receivers`) →
+  **sink** (player pays, ~50% burned + ~50% to treasury, no seller — casino/wheel/spinner wagers +
+  other KINS burn-sinks); `treasury_payout` → **payout** (treasury → player); else **other**.
+- **USD valuation:** each txn is priced at its own day's **KINS/USD close** (GeckoTerminal daily
+  candles via `kintara_tracker.fetch_kins_ohlcv`, nearest-prior carry-forward for gaps). This matters
+  enormously — KINS pumped ~300× over the captured month, so pricing everything at today's rate would
+  overstate early volume by orders of magnitude.
+- Run `python3 build_market_dataset.py` (`--src`/`--out` to override). Captured month 2026-05-22 →
+  06-22: 95,716 txns → marketplace **118.9M KINS / ~$542k**, sinks **5.97M KINS burned**, totals
+  **$598k volume / 4,089 buyers**. Ship it out of band (DBs are gitignored; the hosted data volume
+  is never touched by git deploys): `scp market.db root@<host>:/opt/kintara-data/market.db`.
+
 ---
 
 ## API routes
@@ -293,6 +328,14 @@ Separate optional DB:
   identity assets for the hosted KinScan brand. The favicon/apple icon use the real
   Kintara gold HUD icon through the same disk cache as `/icon/gold`.
 - `GET /api/status` — poller state, tracking-since, row count.
+- `GET /api/market-watch` — whole-market on-chain stats for the **Market Watch** home page,
+  aggregated live from the compact `market.db` (~95k treasury-derived txns, each priced in USD at
+  its day's KINS close). Returns `{ok, generated_at, ts_min, ts_max, kins_price, totals:{txns,
+  volume_kins, volume_usd, treasury_kins, burned_kins, unique_buyers/sellers/traders},
+  categories:{marketplace|sink|payout|other → {n, kins, usd, treasury, burned, to_player}},
+  daily:[{date, txns, kins, usd, market_usd, sink_usd}], top_trades:[…]}`. Returns `503
+  {ok:false}` if `market.db` isn't present (page shows a "dataset not loaded" placeholder). Reads
+  are read-only and fast (~ms on 95k rows), so no caching.
 - `GET /api/items` — distinct item types, categories, **labels** map, gold_item.
 - `GET/POST /api/settings` — get/set `gold_item`.
 - `GET /api/arbitrage?direction=&min_qty=&gold_item=` — the arbitrage table. Returns `gold_rate`,
@@ -323,11 +366,7 @@ Separate optional DB:
   shown items (used by the Arbitrage tab's auto-refresh + "Refresh shown").
 - `GET /api/current` / `GET /api/removed` — live listings / removed-listings (filters: `q`,
   `currency`, `item_type`, `category`, `sort`, `limit`). `q` matches itemType, seller, OR
-  in-game label. `/api/current` also returns **`item_supply`** per row = total units of that
-  item_type listed across the **whole active book** (summed quantity, like kintara.gg's index
-  count) — computed globally so it's the real market supply regardless of the row filters, via a
-  `sup` CTE join. `sort` accepts `latest`/`cheapest`/`expensive`/**`supply`** (most-listed first).
-  (`/api/removed` is retained for internal/debug use; the **Sales feed** tab no longer
+  in-game label. (`/api/removed` is retained for internal/debug use; the **Sales feed** tab no longer
   uses it — see below.)
 - `GET /api/sales-feed?limit=&item_type=&currency=&category=&q=` — **actual completed sales** from
   `sales_events`, newest first (cancellations excluded). Each row now carries the **real stack `qty`,
@@ -468,9 +507,18 @@ body, gold pill tabs, rounded panels). Public branding is **KinScan** with a Kin
 gold-icon brand mark, browser title/description metadata, favicon/apple icon, and web
 manifest for a more polished hosted-site shell.
 
-**The Index is the first tab and the default landing tab** (`TAB="hist"`) — it's the
-flagship intelligence product (per-item scorecards), so it opens first. The tabs below are
-numbered by topic, not bar order.
+**Market Watch is the first tab and the default landing tab** (`TAB="market"`) — the splash/home
+page (see below). The Index (per-item scorecards) is the flagship intelligence product and sits
+second. The tabs below are numbered by topic, not bar order.
+
+0. **Market Watch** (home / splash) — `loadMarket()` → `/api/market-watch`. Whole-market on-chain
+   overview built from the distilled treasury dataset: a glowing hero with the **total USD volume**
+   (animated count-up) over `$KINS` traded + transaction count; a row of stat cards (total volume,
+   transactions, marketplace volume, treasury revenue, **$KINS burned**, unique wallets); an
+   interactive **daily-volume SVG bar/area chart** (hover tooltip per day); a **category breakdown**
+   (marketplace / burn-sink / payouts as proportional bars); and a **biggest-trades** table (Solscan
+   links). Game-styled (gold glow, Fredoka, dark panels), all in `.mw-*` CSS. Refreshes gently (60s);
+   the dataset is historical so it rarely changes. If `market.db` is absent it shows a placeholder.
 
 1. **Arbitrage** (landing) — per-item table: `items/$` (green; shows `$X.XX` per item for
    items >$1 each), `per gold` (gold), **kins/gold** ($KINS to assemble 1 gold's worth, green when
@@ -499,10 +547,8 @@ numbered by topic, not bar order.
      (`mpRenderExpand()`); auto-refresh freezes while a dropdown is open. Because the flicker-free morph
      reuses DOM nodes, the render **clears stale per-cell mouse handlers** (`td.onmouse*`) so an arbitrage
      deal/sold hover card can't bleed into the Collectables table.
-2. **Live listings** — current active listings (item **icon** + name · seller · qty · **on market** ·
-   price · listed; the per-item column was removed). **on market** = total units of that item listed
-   across the whole book (kintara.gg index count, `item_supply`); the **sort** dropdown adds
-   **most supply** to sort by it. **Sales feed** — **actual completed sales** (`/api/sales-feed`): item
+2. **Live listings** — current active listings (item **icon** + name · seller · qty · price · listed; the
+   per-item column was removed). **Sales feed** — **actual completed sales** (`/api/sales-feed`): item
    **icon** + name · **qty sold**
    (real stack size) · **total paid** · **seller** · **time listed** (how long it sat before selling) ·
    when. Each sale is matched to the listing that vanished, so "13,251 stone for 1g" reads correctly
@@ -712,11 +758,18 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
-- **Live listings: "on market" supply column + sort.** Each row in the Live listings index now shows
-  **`item_supply`** — total units of that item_type listed across the whole active book (summed quantity,
-  the same count kintara.gg's index shows). `/api/current` computes it globally via a `sup` CTE join (so
-  it's the true market supply regardless of the row filters) and accepts `sort=supply`; the sort dropdown
-  gained a **most supply** option.
+- **Market Watch home page + on-chain market dataset.** New flagship **splash/home tab** (now the
+  default landing tab, `TAB="market"`) showing whole-market on-chain stats: animated total USD volume,
+  stat cards (volume / transactions / marketplace / treasury revenue / $KINS burned / unique wallets),
+  an interactive daily-volume SVG chart, a category breakdown, and biggest-trades. Backed by a new
+  pipeline: `build_market_dataset.py` distills the ~200MB laptop treasury download (`market_index.db`)
+  into a small indexed **`market.db`** (`market_txns`: buyer/seller/ts/category/gross/to_player/
+  to_treasury/burned + **USD priced at each txn's own-day KINS close**), served read-only by the new
+  `GET /api/market-watch` (env `KINTARA_MARKET_DB`, default `/opt/kintara-data/market.db` hosted).
+  Categories: marketplace / sink (casino-wheel burn) / payout / other. Captured month totals: 95,716
+  txns, $598k volume, 4,089 buyers, 5.97M KINS burned. Ship the dataset out of band via `scp` (it's
+  gitignored; the data volume isn't touched by git deploys). See "On-chain market dataset" + "Market
+  Watch" tab.
 - **Fast first-page poller (kill the create-and-sell blind spot).** The listing poll was a single
   full-book sweep every 90s (~143 requests), so a listing created *and* sold inside one sweep was never
   captured and its sale degraded to a detail-less synthetic row. Added a second loop, `firstpage_loop`
