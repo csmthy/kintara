@@ -686,13 +686,16 @@ second. The tabs below are numbered by topic, not bar order.
    The overworld dot is isometric-projected and **approximately** placed (eyeballed calibration
    in `worldToMap()`); exact x/z is shown.
 7. **Property Map** — a **tilted 2.5D estate**, drawn client-side as SVG (`renderProperty()`):
-   pitched-down, axis-aligned (a rectangular box, **not** an iso diamond — same slant as in-game,
-   rotated so the pond entrance is toward the bottom). Every mansion/house/trailer is an extruded,
-   gabled-roof building at its real grid footprint (`PROPERTY_PLOTS`), drawn back-to-front so nearer
-   ones overlap; **hover glows white**, locked = red outline, selected = gold glow. Click a building
-   for an owner card (name + id, owned/for-sale,
-   locked/open, how many properties they hold, their live marketplace listing count + value,
-   and a "view their listings" jump). Polled ~30s.
+   pitched-down, axis-aligned (a rectangular box, **not** an iso diamond — same slant as in-game).
+   Sky→grass scene with scattered trees. Every mansion/house/trailer is an extruded, gabled-roof
+   building at its real grid footprint (`PROPERTY_PLOTS`) with **lit windows** (rows scaled per type,
+   flanking the door), a door, and a **chimney** on mansions; drawn back-to-front so nearer ones
+   overlap. Each carries an **always-visible owner-name tag** + kind/num, a **🔒 lock badge** if
+   locked, and a **pulsing green dot** if the owner is online (matched against the live-world roster).
+   **Hover** shows a floating tooltip (owner · status · listings · market value · online); **click**
+   selects (gold glow) and opens the owner side-card (name + id, owned/for-sale, locked/open, how many
+   properties they hold, live marketplace listing count + value, "view their listings" jump). Header
+   stats include mansion/house/trailer/locked counts + **owners online**. Polled ~30s.
 8. **Player** — a per-player profile (`/api/player`, `loadPlayer`/`renderPlayer`). Type a player **name**
    (+ optional **wallet**) → header (name, seller id, first seen), stat cards (**marketplace earned** in
    USD/$KINS, items sold, avg sale, gold earned, **active listings + ask value**; a *spent (buy side)* card
@@ -803,6 +806,15 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Property Map: fixed the 500 + visual/interaction overhaul.** `/api/property` was throwing
+  `IndexError: No item with that key` (the owner-listings cross-ref `SELECT` was missing `item_type`
+  while the loop read `r["item_type"]`) → the page showed "Couldn't load properties." Fixed the query.
+  Then upgraded the 2.5D estate map: sky-to-grass scene gradient, **lit windows** on every building
+  (rows scaled per type, flanking the door), **chimneys** on mansions, scattered **trees**,
+  **always-visible owner name tags** + kind/num labels, a **pulsing green dot** on properties whose
+  owner is currently online (cross-referenced against the live-world roster), **🔒 lock badges**, a
+  **floating hover tooltip** (owner · status · listings · market value · online), a richer legend
+  (by building type + online) and an "Owner online" header stat. Click still opens the side card.
 - **Event-driven sales + tiered listing refresh (kill the full-book sweep).** Removal detection no
   longer brute-force scans all ~150 items every cycle. **`stats_loop`** already knows the per-item
   completed-sale count; on a count tick it now calls **`refresh_item_listings(it)`** — a targeted

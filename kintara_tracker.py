@@ -5279,7 +5279,7 @@ def make_app():
                 gold_rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
                 qmarks = ",".join("?" * len(names))
                 for r in con.execute(
-                        f"""SELECT seller_name, currency, per_unit, quantity FROM listings
+                        f"""SELECT seller_name, item_type, currency, per_unit, quantity FROM listings
                             WHERE active=1 AND per_unit IS NOT NULL
                               AND seller_name IN ({qmarks})""", names):
                     ask_unit = listing_unit_usd(r["per_unit"], r["currency"], gold_rate)
@@ -5859,16 +5859,30 @@ td.isd{cursor:help}
 .pl-charinfo .pl-row span:last-child{color:#dbe5f0;text-align:right;margin-left:auto}
 .pl-online{color:var(--buy);font-weight:700}
 .pm-map{position:relative;border:1px solid var(--line);border-radius:16px;overflow:hidden;
-  background:#15331c}
+  background:linear-gradient(180deg,#1b3a55 0%,#274e63 38%,#3f6f28 38%,#5d8a39 100%);box-shadow:var(--sh1)}
 .pm-map svg{display:block;width:100%;height:auto}
 .plot{cursor:pointer;transition:filter .12s}
 .plot:hover{filter:brightness(1.25)}
 .plot.sel{filter:brightness(1.35) drop-shadow(0 0 6px var(--gold))}
 .pm-bld{cursor:pointer;transition:filter .1s}
-.pm-bld:hover{filter:drop-shadow(0 0 4px #fff) drop-shadow(0 0 9px rgba(255,255,255,.85)) brightness(1.08)}
-.pm-bld.sel{filter:drop-shadow(0 0 5px var(--gold)) drop-shadow(0 0 11px rgba(232,181,74,.7)) brightness(1.12)}
-.pm-bld .lab{font:800 8.5px var(--mono);paint-order:stroke;stroke:#0a1019;stroke-width:2.4px;stroke-linejoin:round;fill:#fff;pointer-events:none;opacity:0;transition:opacity .1s}
-.pm-bld:hover .lab,.pm-bld.sel .lab{opacity:1}
+.pm-bld:hover{filter:drop-shadow(0 0 4px #fff) drop-shadow(0 0 9px rgba(255,255,255,.85)) brightness(1.1)}
+.pm-bld.sel{filter:drop-shadow(0 0 6px var(--gold)) drop-shadow(0 0 13px rgba(232,181,74,.8)) brightness(1.14)}
+/* always-on owner name tag above each building */
+.pm-tag{font:800 8px var(--ui);paint-order:stroke;stroke:#0a1019;stroke-width:2.4px;stroke-linejoin:round;
+  fill:#eef4fb;pointer-events:none;transition:fill .1s}
+.pm-bld:hover .pm-tag,.pm-bld.sel .pm-tag{fill:var(--gold2)}
+.pm-num{font:800 7px var(--mono);fill:rgba(255,255,255,.55);paint-order:stroke;stroke:#0a1019;stroke-width:2px;pointer-events:none}
+.pm-win{fill:#ffe6a3;opacity:.92}
+.pm-online{fill:#34d39a}
+@keyframes pmpulse{0%,100%{opacity:.9;r:3}50%{opacity:.35;r:4.5}}
+.pm-online-dot{fill:#34d39a;animation:pmpulse 1.8s infinite}
+.pm-lock{font-size:9px;pointer-events:none}
+/* floating hover tooltip */
+.pm-tip{position:fixed;z-index:60;pointer-events:none;background:#0c1424f2;border:1px solid var(--line);
+  border-radius:9px;padding:8px 11px;font:12px var(--ui);color:var(--ink);box-shadow:var(--sh2);
+  transform:translate(-50%,-118%);white-space:nowrap;opacity:0;transition:opacity .08s}
+.pm-tip .tt{font:700 13px var(--ui)}.pm-tip .ts{font:11px var(--mono);color:var(--mut)}
+.pm-tip .on{color:var(--buy);font-weight:700}.pm-tip .lk{color:var(--sell);font-weight:700}
 .pm-side{border:1px solid var(--line);border-radius:14px;padding:18px;min-height:200px;
   background:linear-gradient(160deg,#16223a,#0e1626)}
 .pm-card .ttl{font-family:'Cinzel',serif;font-weight:800;font-size:22px;color:var(--gold2);text-transform:capitalize}
@@ -8408,6 +8422,8 @@ function renderProperty(){
   let grid='';
   for(let c=0;c<=cols;c++) grid+=`<line x1="${c*TW}" y1="${maxH}" x2="${c*TW}" y2="${maxH+rows*TH}" stroke="rgba(20,45,12,.16)"/>`;
   for(let r=0;r<=rows;r++) grid+=`<line x1="0" y1="${maxH+r*TH}" x2="${W}" y2="${maxH+r*TH}" stroke="rgba(20,45,12,.16)"/>`;
+  const onlineNames=new Set((WORLD&&WORLD.players||[]).map(q=>q.name));
+  let onlineCount=0;
   const order=[...plots].sort((a,b)=>(a.row0-b.row0)||(a.col0-b.col0));   // far (north) first
   const blds=order.map(p=>{
     const gx0=p.col0-minc,gx1=p.col1+1-minc,gy0=p.row0-minr,gy1=p.row1+1-minr,mid=(gy0+gy1)/2;
@@ -8415,33 +8431,78 @@ function renderProperty(){
     const st=p.locked?'#f06a6a':'rgba(0,0,0,.4)',sw=p.locked?1.6:0.8;
     const FL=P(gx0,gy1,0),FR=P(gx1,gy1,0),FLt=P(gx0,gy1,wh),FRt=P(gx1,gy1,wh);
     const BLt=P(gx0,gy0,wh),BRt=P(gx1,gy0,wh),ML=P(gx0,mid,wh+rh),MR=P(gx1,mid,wh+rh);
-    const lab=P((gx0+gx1)/2,mid,wh+rh+2).split(',');
+    const lab=P((gx0+gx1)/2,mid,wh+rh+3).split(',').map(Number);
     const dl=gx0*0.62+gx1*0.38,dr=gx0*0.38+gx1*0.62;
     const door=`${P(dl,gy1,0)} ${P(dr,gy1,0)} ${P(dr,gy1,wh*0.6)} ${P(dl,gy1,wh*0.6)}`;
-    return `<g class="pm-bld ${sel?'sel':''}" data-key="${p.kind}${p.num}">
-      <polygon points="${P(gx0+0.16,gy1+0.34,0)} ${P(gx1+0.16,gy1+0.34,0)} ${P(gx1+0.16,gy0+0.34,0)} ${P(gx0+0.16,gy0+0.34,0)}" fill="rgba(0,0,0,.22)"/>
-      <polygon points="${FL} ${FR} ${FRt} ${FLt}" fill="${k.wall}" stroke="${st}" stroke-width="${sw}"/>
-      <polygon points="${door}" fill="${k.ws}"/>
+    // windows on the south face (axis-aligned there: x=gx*TW, y=maxH+gy1*TH-h)
+    const fx0=gx0*TW,fx1=gx1*TW,fb=maxH+gy1*TH,wtop=fb-wh;
+    const doorXl=dl*TW,doorXr=dr*TW, nWin=Math.max(2,Math.round((fx1-fx0)/15));
+    const wW=Math.max(3.5,Math.min(8,(fx1-fx0)/(nWin+1)*0.55)), wH=p.kind==='trailer'?3:5;
+    // window rows as a fraction of wall height up from the base; lowest row flanks the door.
+    const rowFr = p.kind==='mansion'?[0.6,0.82]:[0.62];
+    let wins='';
+    rowFr.forEach(fr=>{ const wy=fb-wh*fr-wH/2; if(wy<wtop+1) return;
+      for(let c=1;c<=nWin;c++){ const cx=fx0+(fx1-fx0)*c/(nWin+1);
+        if(fr<0.7 && cx>doorXl-2 && cx<doorXr+2) continue;     // lowest row skips the door column
+        wins+=`<rect class="pm-win" x="${(cx-wW/2).toFixed(1)}" y="${wy.toFixed(1)}" width="${wW.toFixed(1)}" height="${wH}" rx="1"/>`; }
+    });
+    // chimney on mansions
+    let chim='';
+    if(p.kind==='mansion'){ const cp=P(gx0+(gx1-gx0)*0.72,mid,wh+rh).split(',').map(Number);
+      chim=`<rect x="${(cp[0]-2).toFixed(1)}" y="${(cp[1]-9).toFixed(1)}" width="4" height="10" fill="${k.rb}"/>`; }
+    const online=p.owner && onlineNames.has(p.owner); if(online) onlineCount++;
+    const onm=p.owner?(p.owner.length>11?p.owner.slice(0,10)+'…':p.owner):'For sale';
+    const tagY=lab[1];
+    const ovl=`<text class="pm-num" x="${((fx0+fx1)/2).toFixed(1)}" y="${(fb+11).toFixed(1)}" text-anchor="middle">${p.kind[0].toUpperCase()}${p.num}</text>
+      <text class="pm-tag" x="${lab[0].toFixed(1)}" y="${tagY.toFixed(1)}" text-anchor="middle">${esc(onm)}</text>`
+      +(online?`<circle class="pm-online-dot" cx="${(lab[0]+0).toFixed(1)}" cy="${(tagY-9).toFixed(1)}" r="3"/>`:'')
+      +(p.locked?`<text class="pm-lock" x="${(fx1-3).toFixed(1)}" y="${(wtop+9).toFixed(1)}" text-anchor="end">🔒</text>`:'');
+    return `<g class="pm-bld ${sel?'sel':''}" data-key="${p.kind}${p.num}"
+        data-pt="${esc((p.kind[0].toUpperCase()+p.kind.slice(1))+' '+p.num)}" data-owner="${esc(p.owner||'')}"
+        data-sold="${p.sold?1:0}" data-locked="${p.locked?1:0}" data-online="${online?1:0}"
+        data-val="${p.market_value||0}" data-listings="${p.listings||0}">
+      <polygon points="${P(gx0+0.16,gy1+0.34,0)} ${P(gx1+0.16,gy1+0.34,0)} ${P(gx1+0.16,gy0+0.34,0)} ${P(gx0+0.16,gy0+0.34,0)}" fill="rgba(0,0,0,.25)"/>
       <polygon points="${ML} ${MR} ${BRt} ${BLt}" fill="${k.rb}" stroke="${st}" stroke-width="${sw}"/>
+      <polygon points="${FL} ${FR} ${FRt} ${FLt}" fill="${k.wall}" stroke="${st}" stroke-width="${sw}"/>
+      ${wins}
+      <polygon points="${door}" fill="${k.ws}"/>
       <polygon points="${FLt} ${FRt} ${MR} ${ML}" fill="${k.rf}" stroke="${st}" stroke-width="${sw}"/>
-      <text class="lab" x="${lab[0]}" y="${lab[1]}" text-anchor="middle">${p.kind[0].toUpperCase()}${p.num}</text>
+      ${chim}${ovl}
     </g>`;}).join("");
+  // a few decorative trees scattered on the lawn margins (deterministic positions)
+  let trees='';
+  for(let i=0;i<8;i++){ const tx=((i*53)%W), tr=maxH+((i*37)%(rows*TH));
+    if(tr<maxH+8) continue;
+    trees+=`<g opacity=".85"><ellipse cx="${tx}" cy="${tr}" rx="5" ry="6" fill="#2f5a22"/><rect x="${tx-1}" y="${tr}" width="2" height="5" fill="#3a2a18"/></g>`; }
   $("#view").innerHTML=`<div class="pm-head">
       <div class="pm-stat" style="margin:0">
         <div class="box"><div class="n">${d.counts.mansion}</div><div class="l">Mansions</div></div>
         <div class="box"><div class="n">${d.counts.house}</div><div class="l">Houses</div></div>
         <div class="box"><div class="n">${d.counts.trailer}</div><div class="l">Trailers</div></div>
-        <div class="box"><div class="n">${locked}</div><div class="l">Locked</div></div></div>
+        <div class="box"><div class="n" style="color:var(--sell)">${locked}</div><div class="l">Locked</div></div>
+        <div class="box"><div class="n" style="color:var(--buy)">${onlineCount}</div><div class="l">Owner online</div></div></div>
       <div class="pm-legend">
-        <span><span class="pm-sw" style="background:#4a5160"></span>Mansion</span>
-        <span><span class="pm-sw" style="background:#8a5a3b"></span>House</span>
-        <span><span class="pm-sw" style="background:#6b6353"></span>Trailer</span>
-        <span><span class="pm-sw" style="border-color:#f06a6a;background:transparent"></span>Locked</span></div></div>
+        <span><span class="pm-sw" style="background:#8b94a4"></span>Mansion</span>
+        <span><span class="pm-sw" style="background:#e3cfa3"></span>House</span>
+        <span><span class="pm-sw" style="background:#d9cdb1"></span>Trailer</span>
+        <span><span class="pm-sw" style="border-color:#f06a6a;background:transparent"></span>Locked</span>
+        <span><span class="pm-sw" style="background:#34d39a;border-radius:50%"></span>Owner online</span></div></div>
     <div class="pm">
-      <div class="pm-map"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${ground}${grid}${blds}</svg></div>
+      <div class="pm-map"><svg viewBox="0 0 ${W} ${H}" preserveAspectRatio="xMidYMid meet">${ground}${trees}${grid}${blds}</svg>
+        <div class="pm-tip" id="pmTip"></div></div>
       <div class="pm-side" id="pmSide"></div></div>`;
-  document.querySelectorAll('.pm-bld').forEach(g=>g.onclick=()=>{ state.propSel=g.dataset.key; renderPropCard();
-    document.querySelectorAll('.pm-bld').forEach(x=>x.classList.toggle('sel',x.dataset.key===state.propSel)); });
+  const tip=$("#pmTip");
+  document.querySelectorAll('.pm-bld').forEach(g=>{
+    g.onclick=()=>{ state.propSel=g.dataset.key; renderPropCard();
+      document.querySelectorAll('.pm-bld').forEach(x=>x.classList.toggle('sel',x.dataset.key===state.propSel)); };
+    g.addEventListener('mousemove',e=>{ if(!tip)return; const ds=g.dataset;
+      const status = ds.locked==='1'?'<span class="lk">Locked</span>':(ds.sold==='1'?'Owned':'For sale');
+      tip.innerHTML=`<div class="tt">${ds.pt}</div>`+
+        `<div class="ts">${ds.owner?esc(ds.owner):'unowned'} · ${status}${ds.online==='1'?' · <span class="on">online</span>':''}</div>`+
+        (+ds.val>0?`<div class="ts">${(+ds.listings).toLocaleString()} listings · ${fmtU(+ds.val)}</div>`:'');
+      tip.style.left=e.clientX+'px'; tip.style.top=e.clientY+'px'; tip.style.opacity='1'; });
+    g.addEventListener('mouseleave',()=>{ if(tip)tip.style.opacity='0'; });
+  });
   renderPropCard();
 }
 function renderPropCard(){
