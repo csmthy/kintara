@@ -147,7 +147,7 @@ endpoints when first probed.
 
 | What | Endpoint | Notes |
 |---|---|---|
-| Active listings | `GET kintara.gg/api/marketplace/listings?sort=latest&currency=all&category=all&limit=40&offset=0&q=` | Returns `{ok, listings[], total, limit, offset, hasMore}`. Each listing: `id, sellerId, sellerName, itemType, quantity, priceGold, currency, priceUsd, createdAt, reservedBy, reservedUntilMs, itemDurability`. **No public sales-history here; no category field** (the `category` param is ignored — server returns everything). We build history ourselves. |
+| Active listings | `GET kintara.gg/api/marketplace/listings?sort=cheapest&currency=all&category=all&limit=100&offset=0&q=<itemType>` | Returns `{ok, listings[], total, limit, offset, hasMore}`. Each listing: `id, sellerId, sellerName, itemType, quantity, priceGold, currency, priceUsd, createdAt, reservedBy, reservedUntilMs, itemDurability`. **Page size caps at 100; `offset` caps at ~500** (deep offsets return an empty page with `total:null` — a hard upstream limit). `currency`/`category` are **ignored**, but **`q=` filters server-side** (substring match on itemType) — that's how we page the whole book: query **per item type** (`fetch_book_by_item()`), since almost every item is under the 500 cap. **No public sales-history here;** we build it ourselves. |
 | Daily completed sales | `GET kintara.gg/api/marketplace/stats?[currency=token&]itemType=<x>` | `{ok, currency, avg30d, samples:[{date, avgUnitPrice, sales}]}`. **Daily only** (ignores interval params), ~30 days, **sparse** (only days with sales). `avgUnitPrice` is per single item; gold prices are rounded to 2 decimals (sub-cent gold collapses to 0). Omit `currency` = gold; `currency=token` = USD. |
 | Live KINS price (USD) | `GET kintara.gg/api/token/blimp-stats` | `{priceUsd, ...}` — kintara's own KINS/USD, matches their index page. |
 | Item art | `kintara.gg/assets/hud/<category>/<name>.(png|svg)` | Real in-game icons. Mapping is per-item (`ICON_OVERRIDES` + `icon_asset()`); cosmetics = `cosmetics/<itemType>.png`, keys = bronze/silver/gold. **Pets/furniture**: the exact per-item paths aren't in the override map, so `icon_candidates()` probes likely schemes (`pets/<name>.png`, `furniture/<name>.png`, …) and the `/icon` route caches the first that returns 200, falling back to the generic paw for pets. Cached under a `__art` namespace so the old generic-paw files don't shadow real art. **The probed paths are unverified guesses** — confirm a real one in-browser and add it to `ICON_OVERRIDES` if a pet/furniture stays blank. |
@@ -770,12 +770,15 @@ A site-wide quality-of-life pass that sits under every tab:
   anything gone. The poller tracks `last_success`/`fail_streak`, and the header only shows a quiet
   "reconnecting to kintara…" note once it's **persistently** failing (≥3 misses AND no successful update
   in >4 min) — transient blips self-heal silently and are not surfaced.
-  **Deep-pagination rate limit (important):** kintara soft-rate-limits rapid deep paging by returning an
-  *empty* page (`{ok:true, listings:[], hasMore:false, total:null}`) rather than a 429. An empty page
-  therefore does **not** by itself mean end-of-book — `fetch_all_active()` only reports `complete=True`
-  once it has collected ≥97% of the page-1 `total`, so a throttled read can't trick `reconcile()` into
-  marking the unseen listings as removed. Page size is capped at 100 by the API (`PAGE=100`); keep the
-  poll gentle (the shared `KINTARA_MIN_GAP` pace) so deep pages keep serving.
+  **`offset` cap + per-item enumeration (important):** kintara caps the unfiltered book at `offset` ~500
+  (deep offsets return an empty page `{ok:true, listings:[], hasMore:false, total:null}`), so the book
+  can't be paged whole. The poller instead queries **per item type** via `q=` (`fetch_book_by_item()`)
+  — almost every item is under the cap, so we get its complete set (+ name). `_page_through()` validates
+  each query's completeness against its `total` (≥97%) — an empty/short page is treated as **incomplete**
+  (`capped=True`), never as end-of-book, so a throttled read can't make `reconcile()` false-remove.
+  `reconcile()` only marks removals for item types in the `complete_items` set (fully enumerated this
+  sweep); the ~5 bulk commodities that exceed 500 are captured cheapest-first (floor is right) but never
+  get removal detection. Page size caps at 100 (`PAGE=100`); keep the poll gentle (`KINTARA_MIN_GAP`).
 - **Live World** shows players in the spectator's *area of interest* (near the world hub),
   not all `onlineTotal` players — the game only streams nearby avatars to a spectator. The
   count is global; the radar/roster is the visible crowd. Switching shards opens a fresh
@@ -796,6 +799,19 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Full market data via per-item `q=` enumeration (kintara capped the book at ~500).** kintara
+  hard-limited its marketplace API to serve only ~the first 500 listings (`offset` past ~500 returns an
+  empty page even though `total` still reports 8k+) — which broke full-book removal detection and left
+  the Index/feed starved. **Discovered the `q=` search param filters server-side**, so the poller now
+  **reconstructs the whole book one item type at a time** (`fetch_book_by_item()` over `market_catalog()`
+  ≈ the ~150 in-game items): each `q=<itemType>` returns that item's complete listing set (almost all
+  items are well under 500) **already labeled with the item name** — the flagship Index data. Sorted
+  cheapest, so the floor is always captured even for the ~5 bulk commodities (wood/stone/coal/metal/fish)
+  that exceed 500. `reconcile()` now scopes removals to the **`complete_items`** set (item types fully
+  enumerated this sweep), so a bulk item we could only partially page is **never** false-removed →
+  removal-based sale attribution is restored for ~146/151 items. Live result: ~5,900 listings across
+  146/151 items reconstructed in ~100s/sweep. A newest-page sweep is merged in each cycle so brand-new
+  items appear instantly. `poll_loop` now logs `items_covered=N/total`.
 - **Fix: sales feed stalled (full-book poll couldn't complete → no removals).** The marketplace book
   grew to ~8,300 listings — past the `MAX_PAGES`(200)×`PAGE`(40)=8,000 pager ceiling — so the full poll
   returned `complete=False` every cycle and `reconcile()` never marked removals, so no sales could be

@@ -1138,59 +1138,101 @@ def icon_candidates(item_type):
 # fetching (runs on the user's machine; needs network)
 # ---------------------------------------------------------------------------
 
-def fetch_all_active(max_pages=MAX_PAGES):
-    """Page through the live listings. Returns (listings, complete). reconcile() only marks
-    listings gone on a COMPLETE fetch, so completeness must be trustworthy.
+_LISTINGS_HEADERS = {"User-Agent": "kintara-tracker/1.0 (personal market tracker)"}
 
-    **Completeness is validated against the book's `total`.** kintara.gg soft-rate-limits rapid
-    deep pagination by returning an *empty* page — `{ok:true, listings:[], hasMore:false,
-    total:null}` — instead of a 429. Naively that empty page looks like "end of book", and if we
-    trusted it we'd conclude the book is e.g. 500 listings and reconcile() would mark the other
-    ~8,000 still-live listings as removed → a flood of false sales. So we capture `total` from the
-    first page and only report complete=True once we've actually collected ~all of `total`. A
-    short/empty read before reaching `total` (rate-limit or deep-page failure) ⇒ complete=False:
-    keep last-good, mark nothing gone, retry next cycle.
 
-    max_pages caps depth: the full poll uses MAX_PAGES (whole book); the fast first-page poller
-    passes max_pages=1 (newest page only, capture-only)."""
+def _listings_page(params):
+    """Fetch ONE listings page (3 retries, paced). Returns the parsed dict or None on failure."""
     import requests
+    for attempt in range(3):
+        try:
+            pace_kintara()
+            r = requests.get(BASE, params=params, headers=_LISTINGS_HEADERS, timeout=HTTP_TIMEOUT)
+            if r.status_code in (429, 403):
+                kintara_rate_limited()
+            r.raise_for_status()
+            return r.json()
+        except Exception:
+            if attempt == 2:
+                return None
+            time.sleep(1.5 * (attempt + 1))
+    return None
+
+
+def _page_through(q, sort="cheapest", max_pages=MAX_PAGES):
+    """Page a (q-filtered) listings query. Returns (listings, capped).
+
+    `capped` = we stopped BEFORE getting the whole result set — the ~500-offset wall, the page
+    cap, or a failure — so coverage for this query is INCOMPLETE. `capped=False` means we got all
+    `total` rows. kintara soft-rate-limits deep paging by returning an empty page ({listings:[],
+    hasMore:false, total:null}); that's NOT a real end, so completeness is validated against the
+    page-1 `total` (≥97% with slack for churn) — never trust an empty page to mean 'done'."""
     out, offset, total = [], 0, None
-    headers = {"User-Agent": "kintara-tracker/1.0 (personal market tracker)"}
-
-    def _complete():
-        # only "complete" if we actually pulled ~the whole book (allow 3% slack for churn while paging)
-        return total is not None and len(out) >= total * 0.97
-
     for _ in range(max_pages):
-        params = {"sort": "latest", "currency": "all", "category": "all",
-                  "limit": PAGE, "offset": offset, "q": ""}
-        data = None
-        for attempt in range(3):
-            try:
-                pace_kintara()
-                r = requests.get(BASE, params=params, headers=headers, timeout=HTTP_TIMEOUT)
-                if r.status_code in (429, 403):
-                    kintara_rate_limited()
-                r.raise_for_status()
-                data = r.json()
-                break
-            except Exception:
-                if attempt == 2:
-                    return out, False          # give up on this page; keep partial data
-                time.sleep(1.5 * (attempt + 1))
-        if not data.get("ok"):
-            return out, False
+        data = _listings_page({"sort": sort, "currency": "all", "category": "all",
+                               "limit": PAGE, "offset": offset, "q": q})
+        if not data or not data.get("ok"):
+            return out, True                       # failure ⇒ incomplete
         if total is None and data.get("total") is not None:
-            total = data.get("total")
+            total = data["total"]
         batch = data.get("listings", [])
         out.extend(batch)
         if not data.get("hasMore") or not batch:
-            # reached an end / empty page — only a TRUE end if we got ~the whole book; an
-            # early empty page is a rate-limit/short read and must NOT be treated as complete.
-            return out, _complete()
+            capped = not (total is not None and len(out) >= total * 0.97)
+            return out, capped
         offset += PAGE
-    # hit the page cap
-    return out, _complete()
+    return out, True                               # hit page cap ⇒ incomplete
+
+
+def fetch_all_active(max_pages=MAX_PAGES):
+    """Newest-listing sweep (q=''), used by the fast first-page poller and as a freshness net.
+    Returns (listings, complete). NOTE: kintara now caps offset at ~500, so the unfiltered book
+    can't be fully paged this way — fetch_book_by_item() is the real full-book strategy. This
+    stays for the newest page (max_pages=1, capture-only)."""
+    out, capped = _page_through("", sort="latest", max_pages=max_pages)
+    return out, (not capped)
+
+
+_catalog_cache = {"at": 0, "items": []}
+
+
+def market_catalog():
+    """Item types to enumerate for the full book = the world-supply catalog (the ~150 items that
+    exist in-game) ∪ item types already in our listings DB. Cached ~10min."""
+    now = time.time()
+    if _catalog_cache["items"] and now - _catalog_cache["at"] < 600:
+        return _catalog_cache["items"]
+    items = set(world_item_supply()["map"].keys())
+    try:
+        con = connect(readonly=True)
+        for r in con.execute("SELECT DISTINCT item_type FROM listings WHERE item_type IS NOT NULL"):
+            items.add(r["item_type"])
+        con.close()
+    except Exception:
+        pass
+    if items:
+        _catalog_cache.update(at=now, items=sorted(items))
+    return _catalog_cache["items"]
+
+
+def fetch_book_by_item(catalog, per_item_max_pages=5):
+    """Reconstruct the live book by querying each item type through the server-side `q` filter.
+
+    kintara caps `offset` at ~500 on the *unfiltered* book, but `q=<itemType>` returns just that
+    item's listings — and almost every item has far fewer than 500, so we get its COMPLETE set
+    (and the item name for free). Sorted cheapest, so the floor is always captured even for the
+    handful of bulk commodities (wood/stone/…) whose count exceeds the cap. Returns
+    (listings, complete_items): complete_items = the item types we fully enumerated (capped=False),
+    i.e. the ones it's SAFE to detect removals for. Dedupes across queries by listing id."""
+    by_id, complete_items = {}, set()
+    for it in catalog:
+        listings, capped = _page_through(it, sort="cheapest", max_pages=per_item_max_pages)
+        for L in listings:
+            if L.get("id") is not None:
+                by_id[L["id"]] = L
+        if not capped:
+            complete_items.add(it)
+    return list(by_id.values()), complete_items
 
 
 def fetch_kins_ohlcv(timeframe="day", aggregate=1, limit=1000, before=None):
@@ -3207,9 +3249,22 @@ def reconcile(con, listings, complete, record_poll=True):
                 (ts, L.get("priceGold"), L.get("currency"), L.get("priceUsd"),
                  up, pu, rb, ru, dur, lid))
     newly_removed = 0
+    # `complete` gates removal-marking. It can be:
+    #   True              — full book seen; any active listing not in `seen` is removed.
+    #   set(item_types)   — only these item types were fully enumerated (per-item q= sweep);
+    #                       scope removals to them so partially-covered bulk items (wood/stone,
+    #                       capped at the API's ~500 offset limit) are NEVER false-removed.
+    #   False/None        — capture-only (no removals).
     if complete and seen:
-        active = con.execute("SELECT id FROM listings WHERE active=1").fetchall()
-        gone = [r["id"] for r in active if r["id"] not in seen]
+        if complete is True:
+            active = con.execute("SELECT id FROM listings WHERE active=1").fetchall()
+            gone = [r["id"] for r in active if r["id"] not in seen]
+        else:
+            covered = set(complete)
+            active = con.execute(
+                "SELECT id, item_type FROM listings WHERE active=1").fetchall()
+            gone = [r["id"] for r in active
+                    if r["item_type"] in covered and r["id"] not in seen]
         for lid in gone:
             con.execute("UPDATE listings SET active=0,removed_at=? WHERE id=?",
                         (ts, lid))
@@ -3794,23 +3849,33 @@ def poll_loop(interval):
     while True:
         con = connect()
         try:
-            listings, complete = fetch_all_active()
-            if not listings and not complete:
+            # Full book via per-item q= enumeration (kintara caps the unfiltered book at offset
+            # ~500; querying each item type gets its complete listing set + the item name).
+            catalog = market_catalog()
+            listings, complete_items = fetch_book_by_item(catalog)
+            # freshness net: also grab the newest page so a brand-new item/listing not yet in the
+            # catalog still gets captured immediately (capture-only — doesn't widen removal scope).
+            newest, _ = _page_through("", sort="latest", max_pages=2)
+            ids = {L["id"] for L in listings}
+            listings += [L for L in newest if L.get("id") not in ids]
+            if not listings and not complete_items:
                 # got nothing this cycle (upstream down/slow) — keep last-good data and
                 # just note it; the UI only surfaces a problem once this persists.
                 _state["fail_streak"] = _state.get("fail_streak", 0) + 1
                 _state.update(last=now_iso(), error="upstream unreachable")
                 print(f"[{now_iso()}] poll: upstream unreachable (streak {_state['fail_streak']})")
             else:
-                a, r = reconcile(con, listings, complete)
+                a, r = reconcile(con, listings, complete_items)
                 # auto-pick a gold item once, if not set and we can guess
                 if not get_setting(con, "gold_item"):
                     g = guess_gold_item(con)
                     if g:
                         set_setting(con, "gold_item", g)
                 _state.update(last=now_iso(), last_active=a, last_removed=r,
-                              error=None, last_success=now_iso(), fail_streak=0)
-                print(f"[{now_iso()}] active={a} newly_removed={r} complete={complete}")
+                              error=None, last_success=now_iso(), fail_streak=0,
+                              last_items_covered=len(complete_items), last_catalog=len(catalog))
+                print(f"[{now_iso()}] active={a} newly_removed={r} "
+                      f"items_covered={len(complete_items)}/{len(catalog)}")
         except Exception as e:
             # unexpected (DB etc.) — count it but keep serving; don't crash the loop
             _state["fail_streak"] = _state.get("fail_streak", 0) + 1
@@ -3822,16 +3887,15 @@ def poll_loop(interval):
 
 
 def firstpage_loop(interval):
-    """Fast capture-only poll of just page 1 (newest listings).
+    """Fast capture-only poll of just the newest page.
 
-    The full poll (poll_loop) pages the entire book every POLL_INTERVAL seconds — that's
-    ~143 requests at PAGE=40 for ~5700 listings, so a single sweep takes a minute-plus.
-    Anything created AND sold inside that window is never captured, so the sale can only
-    be recovered as a count tick with no listing detail (a synthetic row). This loop hits
-    only offset=0 (1 request) every few seconds and upserts via reconcile(..., complete=
-    False) — capture-only, never marks removals — so newly-created listings are recorded
-    almost immediately and can be matched to sales properly. Removal detection stays with
-    the full poll, which is the only fetch that sees the whole book."""
+    The full poll (poll_loop) re-enumerates the whole book per item every POLL_INTERVAL
+    seconds (~150 requests, a minute-plus). Anything created AND sold inside that window
+    would otherwise only be recoverable as a count tick with no listing detail (synthetic).
+    This loop hits the newest page (1 request) every few seconds and upserts via
+    reconcile(..., complete=False) — capture-only, never marks removals — so newly-created
+    listings are recorded almost immediately and can be matched to sales. Removal detection
+    stays with the full per-item poll, which scopes removals to fully-covered item types."""
     while True:
         con = connect()
         try:
