@@ -6237,9 +6237,25 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
 .mw-lb-row .track i{display:block;height:100%;border-radius:8px;min-width:2px;
   background:linear-gradient(90deg,var(--gold),var(--gold2))}
 .mw-lb-row .val{font:700 13px var(--ui);color:var(--gold2);text-align:right;white-space:nowrap;min-width:62px}
-.mw-lb-row:nth-child(-n+3) .track i{box-shadow:0 0 12px rgba(246,214,138,.55)}
-.mw-lb-row:nth-child(1) .rk{color:var(--gold2);font-size:14px}
 @media(max-width:640px){.mw-lb-row{grid-template-columns:24px 22px minmax(70px,1fr) 2fr auto;gap:7px}}
+
+/* market-cap podium (top 3, above the leaderboard) */
+.mw-podium{display:flex;align-items:flex-end;justify-content:center;gap:14px;padding:6px 0 2px}
+.mw-pod{display:flex;flex-direction:column;align-items:center;flex:1 1 0;max-width:200px;text-align:center;min-width:0}
+.mw-pod-medal{font-size:22px;line-height:1}
+.mw-pod-ico{margin-top:4px;height:60px;display:flex;align-items:flex-end;justify-content:center}
+.mw-pod-ico img{width:46px;height:46px;object-fit:contain;image-rendering:-webkit-optimize-contrast}
+.mw-pod.p1 .mw-pod-ico img{width:60px;height:60px}
+.mw-pod-nm{margin-top:6px;font:700 14px var(--ui);color:var(--ink);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.mw-pod-val{font:800 16px var(--ui);color:var(--gold2);margin-top:2px}
+.mw-pod-base{margin-top:10px;width:100%;border-radius:12px 12px 0 0;display:flex;align-items:flex-start;
+  justify-content:center;font:900 26px var(--ui);color:rgba(12,16,26,.55);padding-top:8px}
+.mw-pod.p1 .mw-pod-base{height:104px;background:linear-gradient(180deg,var(--gold2),#b9892f);box-shadow:0 0 26px rgba(246,214,138,.4)}
+.mw-pod.p2 .mw-pod-base{height:76px;background:linear-gradient(180deg,#cfd8e2,#8a98a8)}
+.mw-pod.p3 .mw-pod-base{height:56px;background:linear-gradient(180deg,#d99564,#9c5f33)}
+@media(max-width:560px){.mw-podium{gap:6px}.mw-pod-nm{font:700 11px var(--ui)}
+  .mw-pod-ico img{width:34px;height:34px}.mw-pod.p1 .mw-pod-ico img{width:42px;height:42px}
+  .mw-pod-val{font-size:13px}.mw-pod-base{font-size:20px}}
 
 /* biggest trades */
 .mw-tr{width:100%;border-collapse:collapse;font:13px var(--ui)}
@@ -8473,23 +8489,43 @@ async function loadMarket(){
 
 /* Market-cap leaderboard — every item ranked by (in-world supply × USD floor), as a
    horizontal bar chart with icon + name and the $ value on the right. */
+/* top-3 podium (#2 left · #1 center, tallest · #3 right) */
+function mwPodium(top){
+  const medal=['🥇','🥈','🥉'];
+  return `<div class="mw-podium">`+[1,0,2].map(idx=>{   // display order: 2nd, 1st, 3rd
+    const r=top[idx]; if(!r) return '';
+    const fb=(CAT_EMO[r.category]||'📦').replace(/'/g,'');
+    return `<div class="mw-pod p${idx+1}">
+      <div class="mw-pod-medal">${medal[idx]}</div>
+      <div class="mw-pod-ico"><img src="/icon/${r.item_type}" alt="" loading="lazy" onerror="this.parentElement.textContent='${fb}'"></div>
+      <div class="mw-pod-nm" title="${esc(r.item_type)} · ${(r.supply||0).toLocaleString()} in world @ ${fmtU(r.floor_usd)}">${esc(r.label)}</div>
+      <div class="mw-pod-val">${mwUsd(r.market_cap)}</div>
+      <div class="mw-pod-base"><span>${idx+1}</span></div>
+    </div>`;
+  }).join('')+`</div>`;
+}
+
 function mwLeaderboard(caps){
   if(!caps||!caps.ok||!(caps.items||[]).length) return '';
   const items=caps.items, max=items[0].market_cap||1;   // server sorts desc → [0] is the max
+  const rest=items.slice(3);                              // #4 onward go in the list below the podium
   return `<section class="mw-panel">
     <div class="mw-panel-h"><span class="t">🏆 Market cap leaderboard</span>
       <span class="s">${items.length} items · supply × USD floor · total ${mwUsd(caps.total_market_cap)}</span></div>
-    <div class="mw-panel-b mw-lb">`+items.map((r,i)=>{
-      const w=Math.max(0.4, r.market_cap/max*100);
-      const fb=(CAT_EMO[r.category]||'📦').replace(/'/g,'');
-      return `<div class="mw-lb-row">
-        <span class="rk">${i+1}</span>
-        <span class="ico"><img src="/icon/${r.item_type}" alt="" loading="lazy" onerror="this.parentElement.textContent='${fb}'"></span>
-        <span class="nm" title="${esc(r.item_type)} · ${(r.supply||0).toLocaleString()} in world @ ${fmtU(r.floor_usd)}">${esc(r.label)}</span>
-        <span class="track"><i style="width:${w.toFixed(2)}%"></i></span>
-        <span class="val">${mwUsd(r.market_cap)}</span>
-      </div>`;
-    }).join('')+`</div>
+    <div class="mw-panel-b">
+      ${mwPodium(items.slice(0,3))}
+      <div class="mw-lb" style="margin-top:18px">`+rest.map((r,i)=>{
+        const w=Math.max(0.4, r.market_cap/max*100);
+        const fb=(CAT_EMO[r.category]||'📦').replace(/'/g,'');
+        return `<div class="mw-lb-row">
+          <span class="rk">${i+4}</span>
+          <span class="ico"><img src="/icon/${r.item_type}" alt="" loading="lazy" onerror="this.parentElement.textContent='${fb}'"></span>
+          <span class="nm" title="${esc(r.item_type)} · ${(r.supply||0).toLocaleString()} in world @ ${fmtU(r.floor_usd)}">${esc(r.label)}</span>
+          <span class="track"><i style="width:${w.toFixed(2)}%"></i></span>
+          <span class="val">${mwUsd(r.market_cap)}</span>
+        </div>`;
+      }).join('')+`</div>
+    </div>
   </section>`;
 }
 
