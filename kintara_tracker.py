@@ -5300,6 +5300,119 @@ def make_app():
                         "counts": {k: sum(1 for p in plots if p["kind"] == k)
                                    for k in ("mansion", "house", "trailer")}})
 
+    @app.route("/api/property-detail")
+    def property_detail():
+        """Everything about ONE property spot — the 'Zillow page'. Each property is also a
+        tradeable key item (`key_<kind>_<num>`), so we surface its full marketplace history:
+        every recorded sale (price in USD-at-the-time, seller, days-on-market), all-time
+        high/low/avg, current ask if a key is listed now, plus the live owner + their portfolio."""
+        kind = (request.args.get("kind") or "").strip().lower()
+        plural = {"mansion": "mansions", "house": "houses", "trailer": "trailers"}.get(kind)
+        try:
+            num = int(request.args.get("num"))
+        except (TypeError, ValueError):
+            num = None
+        if not plural or num is None:
+            return jsonify({"ok": False, "error": "kind (mansion/house/trailer) + num required"}), 400
+        key = f"key_{kind}_{num}"
+        try:
+            raw = fetch_property_status()
+        except Exception as e:
+            return jsonify({"ok": False, "error": "property source: " + str(e)}), 502
+        info = (raw.get(plural) or {}).get(str(num)) or {}
+        owner, owner_id = info.get("ownerName"), info.get("ownerId")
+        # owner's full property portfolio (across all kinds)
+        holdings = []
+        if owner_id is not None:
+            for k2, pl2 in (("mansion", "mansions"), ("house", "houses"), ("trailer", "trailers")):
+                for n2, i2 in (raw.get(pl2) or {}).items():
+                    if i2.get("ownerId") == owner_id:
+                        try:
+                            holdings.append({"kind": k2, "num": int(n2),
+                                             "locked": bool(i2.get("locked"))})
+                        except (TypeError, ValueError):
+                            pass
+        coords = PROPERTY_PLOTS.get(kind, {}).get(num)
+        con = connect(readonly=True)
+        try:
+            rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
+            kp = current_kins_usd()
+            gmap = gold_daily_usd(con)
+
+            def usd_of(total, currency, day):
+                if total is None:
+                    return None
+                if currency == "gold":
+                    gu = gmap.get(day) or rate
+                    return total * gu if gu else None
+                return total                      # token total is already USD
+
+            sales = []
+            for r in con.execute(
+                    """SELECT qty, price, total, currency, seller_name, listing_ms, day, ts
+                       FROM sales_events WHERE item_type=? AND listing_id IS NOT NULL
+                       ORDER BY ts""", (key,)):
+                day = r["day"] or datetime.utcfromtimestamp((r["ts"] or 0) / 1000).strftime("%Y-%m-%d")
+                tot = r["total"]
+                if tot is None and r["price"] is not None:
+                    tot = r["price"] * (r["qty"] or 1)
+                u = usd_of(tot, r["currency"], day)
+                sales.append({"ts": r["ts"], "date": day, "usd": u, "raw": tot,
+                              "currency": r["currency"], "seller": r["seller_name"],
+                              "dom_days": (r["listing_ms"] / 86400000.0) if r["listing_ms"] else None})
+            usds = [s["usd"] for s in sales if s["usd"] is not None]
+            doms = [s["dom_days"] for s in sales if s["dom_days"] is not None]
+            last = sales[-1] if sales else None
+            # current asks (is a key listed right now?)
+            asks = []
+            for r in con.execute(
+                    """SELECT price_gold, price_usd, currency, seller_name, quantity FROM listings
+                       WHERE item_type=? AND active=1""", (key,)):
+                raw_px = r["price_usd"] if r["currency"] == "token" else r["price_gold"]
+                u = r["price_usd"] if r["currency"] == "token" else ((r["price_gold"] or 0) * rate)
+                asks.append({"usd": u, "raw": raw_px, "currency": r["currency"],
+                             "seller": r["seller_name"]})
+            asks.sort(key=lambda x: x["usd"] if x["usd"] is not None else 1e18)
+            # owner's marketplace footprint
+            owner_listings, owner_value = 0, 0.0
+            if owner:
+                for r in con.execute(
+                        """SELECT item_type, currency, per_unit, quantity FROM listings
+                           WHERE active=1 AND per_unit IS NOT NULL AND seller_name=?""", (owner,)):
+                    au = listing_unit_usd(r["per_unit"], r["currency"], rate)
+                    mu, _s = active_market_unit_usd(con, r["item_type"], rate, owner)
+                    v = mu if mu is not None else au
+                    owner_listings += 1
+                    owner_value += (v or 0) * (r["quantity"] or 1)
+        finally:
+            con.close()
+        return jsonify({
+            "ok": True, "kind": kind, "num": num, "key": key,
+            "label": f"{kind.capitalize()} {num}",
+            "property": {
+                "owner": owner, "owner_id": owner_id,
+                "sold": bool(info.get("sold")), "locked": bool(info.get("locked")),
+                "owner_properties": len(holdings), "owner_holdings": holdings,
+                "coords": coords,
+            },
+            "owner_market": {"listings": owner_listings, "value": round(owner_value, 2)},
+            "market": {
+                "sales_count": len(sales),
+                "last_sold": last,
+                "high_usd": max(usds) if usds else None,
+                "low_usd": min(usds) if usds else None,
+                "avg_usd": (sum(usds) / len(usds)) if usds else None,
+                "avg_dom_days": (sum(doms) / len(doms)) if doms else None,
+                "first_sale": sales[0]["date"] if sales else None,
+                "current_ask": asks[0] if asks else None,
+                "listed_count": len(asks),
+                "history": [{"ts": s["ts"], "date": s["date"], "usd": s["usd"]}
+                            for s in sales if s["usd"] is not None],
+                "recent": list(reversed(sales))[:25],
+            },
+            "kins_price": kp, "gold_rate": rate,
+        })
+
     @app.route("/api/player")
     def player():
         """Aggregate everything we publicly know about one player into a single profile:
@@ -5896,6 +6009,48 @@ td.isd{cursor:help}
 .pm-stat .box{flex:1;border:1px solid var(--line);border-radius:11px;padding:9px 11px;text-align:center}
 .pm-stat .box .n{font:700 18px var(--mono);color:var(--gold2)}
 .pm-stat .box .l{font:11px var(--ui);color:var(--mut);text-transform:uppercase;letter-spacing:.08em}
+
+/* ===== Property detail ("Zillow") page ===== */
+.pd{display:flex;flex-direction:column;gap:var(--s4);padding:2px}
+.pd-back{align-self:flex-start;background:var(--panel2);border:1px solid var(--line);color:var(--ink);
+  border-radius:9px;padding:7px 13px;font:600 13px var(--ui);cursor:pointer}
+.pd-back:hover{border-color:var(--gold);color:var(--gold2)}
+.pd-hero{display:flex;justify-content:space-between;align-items:flex-end;gap:18px;flex-wrap:wrap;
+  border:1px solid var(--line);border-radius:var(--r2);padding:22px 24px;
+  background:radial-gradient(120% 160% at 0% 0%,rgba(232,181,74,.10),transparent 55%),linear-gradient(180deg,var(--panel2),var(--panel))}
+.pd-title h1{font:800 30px var(--ui);margin:0;color:var(--ink);display:flex;align-items:center;gap:12px;flex-wrap:wrap}
+.pd-sub{margin-top:6px;font:14px var(--ui);color:var(--mut)}
+.pd-sub a{color:var(--gold2);text-decoration:none;border-bottom:1px dotted rgba(246,214,138,.4)}
+.pd-badge{font:700 11px var(--mono);text-transform:uppercase;letter-spacing:.08em;padding:4px 9px;border-radius:999px}
+.pd-badge.owned{background:rgba(52,211,154,.16);color:var(--buy)}
+.pd-badge.sale{background:rgba(232,181,74,.18);color:var(--gold2)}
+.pd-badge.locked{background:rgba(240,106,106,.16);color:var(--sell)}
+.pd-price{text-align:right}
+.pd-price .big{font:800 38px var(--ui);color:var(--gold2);line-height:1}
+.pd-price .lab{font:11px var(--mono);color:var(--mut);text-transform:uppercase;letter-spacing:.1em;margin-top:4px}
+.pd-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:var(--s3)}
+.pd-card{border:1px solid var(--line);border-radius:var(--r1);padding:14px 16px;background:var(--panel)}
+.pd-card .v{font:800 22px var(--ui);color:var(--ink)}
+.pd-card .l{margin-top:3px;font:11px var(--mono);text-transform:uppercase;letter-spacing:.08em;color:var(--mut)}
+.pd-grid{display:grid;grid-template-columns:1.5fr 1fr;gap:var(--s4)}
+@media(max-width:900px){.pd-grid{grid-template-columns:1fr}.pd-hero{align-items:flex-start}.pd-price{text-align:left}}
+.pd-panel{border:1px solid var(--line);border-radius:var(--r2);background:var(--panel);overflow:hidden}
+.pd-panel-h{padding:14px 18px;border-bottom:1px solid var(--line);font:700 15px var(--ui);color:var(--ink)}
+.pd-panel-b{padding:16px 18px}
+.pd-empty{color:var(--mut);font:13px var(--ui);text-align:center;padding:34px 10px}
+.pd-chart{width:100%;height:210px;display:block}
+.pd-chart .ln{fill:none;stroke:var(--gold2);stroke-width:2}.pd-chart .dt{fill:var(--gold2)}
+.pd-chart .ax{fill:var(--mut);font:10px var(--mono)}
+.pd-row{display:flex;justify-content:space-between;gap:10px;padding:9px 0;border-top:1px solid rgba(255,255,255,.06);font:13px var(--ui);color:var(--mut)}
+.pd-row:first-child{border-top:0}.pd-row b{color:#dbe5f0;font:600 13px var(--mono)}
+.pd-hold{display:flex;flex-wrap:wrap;gap:7px;margin-top:8px}
+.pd-chip{font:600 12px var(--ui);padding:4px 10px;border-radius:8px;background:var(--panel2);border:1px solid var(--line);cursor:pointer;color:var(--ink)}
+.pd-chip:hover{border-color:var(--gold);color:var(--gold2)}
+.pd-tbl{width:100%;border-collapse:collapse;font:13px var(--ui)}
+.pd-tbl th{text-align:left;font:600 11px var(--mono);text-transform:uppercase;letter-spacing:.07em;color:var(--mut);padding:8px;border-bottom:1px solid var(--line)}
+.pd-tbl td{padding:9px 8px;border-bottom:1px solid rgba(255,255,255,.05)}
+.pd-tbl tr:last-child td{border-bottom:0}.pd-tbl .num{text-align:right;font-family:var(--mono)}
+.pd-tbl .usd{color:var(--gold2);font-weight:600}
 
 /* ===== game-styled sales index (matches the in-game menus) ===== */
 .gw{--gold:#e8b54a;--gold2:#f6d68a;font-family:'Fredoka',system-ui,sans-serif;
@@ -8392,10 +8547,12 @@ function renderPlayer(){
 }
 
 async function loadProperty(){
-  if(!document.querySelector('.pm') && TAB==="props") $("#view").innerHTML=skel(6);
+  if(!document.querySelector('.pm') && !state.propDetail && TAB==="props") $("#view").innerHTML=skel(6);
   let d; try{ d=await (await fetch("/api/property")).json(); }
-  catch(e){ if(TAB==="props") $("#view").innerHTML=`<div class="empty warn">Couldn't load properties.</div>`; return; }
-  if(TAB!=="props") return; PROP=d; renderProperty();
+  catch(e){ if(TAB==="props"&&!state.propDetail) $("#view").innerHTML=`<div class="empty warn">Couldn't load properties.</div>`; return; }
+  if(TAB!=="props") return; PROP=d;
+  if(state.propDetail) return;          // a detail page is open — don't clobber it with the map
+  renderProperty();
 }
 const KIND_COLOR={mansion:'#e8b54a',house:'#5aa9e6',trailer:'#9b7bd8'};
 function renderProperty(){
@@ -8457,7 +8614,7 @@ function renderProperty(){
       <text class="pm-tag" x="${lab[0].toFixed(1)}" y="${tagY.toFixed(1)}" text-anchor="middle">${esc(onm)}</text>`
       +(online?`<circle class="pm-online-dot" cx="${(lab[0]+0).toFixed(1)}" cy="${(tagY-9).toFixed(1)}" r="3"/>`:'')
       +(p.locked?`<text class="pm-lock" x="${(fx1-3).toFixed(1)}" y="${(wtop+9).toFixed(1)}" text-anchor="end">🔒</text>`:'');
-    return `<g class="pm-bld ${sel?'sel':''}" data-key="${p.kind}${p.num}"
+    return `<g class="pm-bld ${sel?'sel':''}" data-key="${p.kind}${p.num}" data-kind="${p.kind}" data-num="${p.num}"
         data-pt="${esc((p.kind[0].toUpperCase()+p.kind.slice(1))+' '+p.num)}" data-owner="${esc(p.owner||'')}"
         data-sold="${p.sold?1:0}" data-locked="${p.locked?1:0}" data-online="${online?1:0}"
         data-val="${p.market_value||0}" data-listings="${p.listings||0}">
@@ -8493,8 +8650,7 @@ function renderProperty(){
       <div class="pm-side" id="pmSide"></div></div>`;
   const tip=$("#pmTip");
   document.querySelectorAll('.pm-bld').forEach(g=>{
-    g.onclick=()=>{ state.propSel=g.dataset.key; renderPropCard();
-      document.querySelectorAll('.pm-bld').forEach(x=>x.classList.toggle('sel',x.dataset.key===state.propSel)); };
+    g.onclick=()=>{ if(tip)tip.style.opacity='0'; openPropertyDetail(g.dataset.kind, +g.dataset.num); };
     g.addEventListener('mousemove',e=>{ if(!tip)return; const ds=g.dataset;
       const status = ds.locked==='1'?'<span class="lk">Locked</span>':(ds.sold==='1'?'Owned':'For sale');
       tip.innerHTML=`<div class="tt">${ds.pt}</div>`+
@@ -8525,6 +8681,92 @@ function renderPropCard(){
 function jumpToSeller(name){ fstate.q=name; fstate.currency='all'; fstate.category='all'; TAB='live';
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x.dataset.t==='live'));
   render(); schedule(); }
+
+/* ===== Property detail ("Zillow") page ===== */
+function backToMap(){ state.propDetail=null; renderProperty(); }
+async function openPropertyDetail(kind,num){
+  state.propDetail={kind,num};
+  $("#view").innerHTML=`<div class="pd">${skel(5)}</div>`;
+  let d; try{ d=await (await fetch(`/api/property-detail?kind=${encodeURIComponent(kind)}&num=${num}`)).json(); }
+  catch(e){ d={ok:false}; }
+  if(TAB!=="props" || !state.propDetail) return;
+  renderPropertyDetail(d);
+}
+const PD_ICON={mansion:'🏰',house:'🏠',trailer:'🚚'};
+function pdUsd(v){ return v==null?'—':(v>=1e6?'$'+(v/1e6).toFixed(2)+'M':v>=1000?'$'+Math.round(v).toLocaleString():'$'+(+v).toFixed(2)); }
+function pdHistChart(hist){
+  if(!hist||hist.length<2) return `<div class="pd-empty">No recorded sales yet — the price history fills in here as this property's key trades on the market.</div>`;
+  const W=900,H=210,PL=58,PR=14,PT=14,PB=24,pw=W-PL-PR,ph=H-PT-PB;
+  const xs=hist.map(p=>p.ts),ys=hist.map(p=>p.usd);
+  const x0=Math.min(...xs),x1=Math.max(...xs); let lo=Math.min(...ys),hi=Math.max(...ys);
+  const X=t=>PL+(x1===x0?pw/2:(t-x0)/(x1-x0)*pw);
+  const pad=(hi-lo)*0.15||hi*0.12||1, ylo=Math.max(0,lo-pad), yhi=hi+pad;
+  const Y=v=>PT+ph-(yhi===ylo?0.5:(v-ylo)/(yhi-ylo))*ph;
+  const line=hist.map((p,i)=>`${i?'L':'M'}${X(p.ts).toFixed(1)} ${Y(p.usd).toFixed(1)}`).join(' ');
+  const area=`M${X(hist[0].ts).toFixed(1)} ${(PT+ph).toFixed(1)} `+hist.map(p=>`L${X(p.ts).toFixed(1)} ${Y(p.usd).toFixed(1)}`).join(' ')+` L${X(hist[hist.length-1].ts).toFixed(1)} ${(PT+ph).toFixed(1)} Z`;
+  const dots=hist.map(p=>`<circle class="dt" cx="${X(p.ts).toFixed(1)}" cy="${Y(p.usd).toFixed(1)}" r="3"/>`).join('');
+  let grid='';[0,.5,1].forEach(f=>{const v=yhi-(yhi-ylo)*f,yy=PT+ph*f;
+    grid+=`<line x1="${PL}" y1="${yy}" x2="${W-PR}" y2="${yy}" stroke="rgba(120,140,165,.12)"/><text class="ax" x="${PL-7}" y="${yy+3}" text-anchor="end">${pdUsd(v)}</text>`;});
+  const t0=new Date(x0),t1=new Date(x1);
+  return `<svg class="pd-chart" viewBox="0 0 ${W} ${H}" preserveAspectRatio="none">
+    <defs><linearGradient id="pdg" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="rgba(246,214,138,.26)"/><stop offset="1" stop-color="rgba(246,214,138,0)"/></linearGradient></defs>
+    ${grid}<path d="${area}" fill="url(#pdg)"/><path class="ln" d="${line}"/>${dots}
+    <text class="ax" x="${PL}" y="${H-7}">${t0.toLocaleDateString()}</text>
+    <text class="ax" x="${W-PR}" y="${H-7}" text-anchor="end">${t1.toLocaleDateString()}</text></svg>`;
+}
+function renderPropertyDetail(d){
+  if(!d||d.ok===false){ $("#view").innerHTML=`<div class="pd"><button class="pd-back" onclick="backToMap()">← All properties</button><div class="pd-empty">Couldn't load this property.</div></div>`; return; }
+  const pr=d.property||{}, m=d.market||{}, om=d.owner_market||{};
+  const headline = (m.last_sold&&m.last_sold.usd!=null)?m.last_sold.usd:(m.current_ask?m.current_ask.usd:null);
+  const headlineLab = (m.last_sold&&m.last_sold.usd!=null)?'last sold':(m.current_ask?'listed now':'unvalued');
+  const statusBadge = pr.sold?`<span class="pd-badge owned">Owned</span>`:`<span class="pd-badge sale">For sale</span>`;
+  const lockBadge = pr.locked?`<span class="pd-badge locked">🔒 Locked</span>`:'';
+  const ownerLink = pr.owner?`Owned by <a onclick="jumpToSeller('${esc(pr.owner).replace(/'/g,"")}')">${esc(pr.owner)}</a> · holds ${pr.owner_properties} propert${pr.owner_properties===1?'y':'ies'}`:'Unowned';
+  const askLine = m.current_ask?`${pdUsd(m.current_ask.usd)} <span class="mut">(${m.current_ask.currency==='gold'?(+m.current_ask.raw).toLocaleString()+'g':'$'+(+m.current_ask.raw).toLocaleString()})</span>`:'Not listed';
+  const holdings=(pr.owner_holdings||[]).map(h=>`<span class="pd-chip" onclick="openPropertyDetail('${h.kind}',${h.num})">${PD_ICON[h.kind]||''} ${h.kind} ${h.num}${h.locked?' 🔒':''}</span>`).join('');
+  const recent=(m.recent||[]);
+  const rows=recent.length?recent.map(s=>`<tr>
+      <td>${new Date(s.ts).toLocaleDateString()}</td>
+      <td class="num usd">${pdUsd(s.usd)}</td>
+      <td class="num mut">${s.currency==='gold'?(+s.raw).toLocaleString()+'g':'$'+(+(s.raw||0)).toLocaleString()}</td>
+      <td>${s.seller?esc(s.seller):'<span class="mut">—</span>'}</td>
+      <td class="num mut">${s.dom_days!=null?(s.dom_days<1?Math.round(s.dom_days*24)+'h':s.dom_days.toFixed(1)+'d'):'—'}</td>
+    </tr>`).join(''):`<tr><td colspan="5" class="pd-empty" style="padding:24px">No recorded sales yet.</td></tr>`;
+  $("#view").innerHTML=`<div class="pd">
+    <button class="pd-back" onclick="backToMap()">← All properties</button>
+    <section class="pd-hero">
+      <div class="pd-title">
+        <h1>${PD_ICON[d.kind]||''} ${esc(d.label)} ${statusBadge} ${lockBadge}</h1>
+        <div class="pd-sub">${ownerLink}</div>
+      </div>
+      <div class="pd-price"><div class="big">${pdUsd(headline)}</div><div class="lab">${headlineLab}</div></div>
+    </section>
+    <div class="pd-cards">
+      <div class="pd-card"><div class="v">${pdUsd(m.last_sold?m.last_sold.usd:null)}</div><div class="l">Last sold</div></div>
+      <div class="pd-card"><div class="v">${pdUsd(m.high_usd)}</div><div class="l">All-time high</div></div>
+      <div class="pd-card"><div class="v">${pdUsd(m.low_usd)}</div><div class="l">All-time low</div></div>
+      <div class="pd-card"><div class="v">${(m.sales_count||0).toLocaleString()}</div><div class="l">Times sold</div></div>
+      <div class="pd-card"><div class="v">${m.listed_count?pdUsd(m.current_ask.usd):'—'}</div><div class="l">${m.listed_count?'Asking now':'Not listed'}</div></div>
+      <div class="pd-card"><div class="v">${m.avg_dom_days!=null?(m.avg_dom_days<1?Math.round(m.avg_dom_days*24)+'h':m.avg_dom_days.toFixed(1)+'d'):'—'}</div><div class="l">Avg days on market</div></div>
+    </div>
+    <div class="pd-grid">
+      <section class="pd-panel"><div class="pd-panel-h">Price history</div><div class="pd-panel-b">${pdHistChart(m.history)}</div></section>
+      <section class="pd-panel"><div class="pd-panel-h">Property & owner</div><div class="pd-panel-b">
+        <div class="pd-row"><span>Status</span><b>${pr.sold?'Owned':'For sale'}</b></div>
+        <div class="pd-row"><span>Access</span><b style="color:${pr.locked?'var(--sell)':'var(--buy)'}">${pr.locked?'Locked':'Open'}</b></div>
+        <div class="pd-row"><span>Current ask</span><b>${askLine}</b></div>
+        <div class="pd-row"><span>Owner</span><b>${pr.owner?esc(pr.owner):'—'}</b></div>
+        <div class="pd-row"><span>Owner's marketplace</span><b>${(om.listings||0).toLocaleString()} listings · ${pdUsd(om.value)}</b></div>
+        ${holdings?`<div style="margin-top:12px;font:12px var(--mono);color:var(--mut)">Owner's properties</div><div class="pd-hold">${holdings}</div>`:''}
+        ${pr.owner?`<div class="controls" style="margin-top:14px"><button class="go" onclick="jumpToSeller('${esc(pr.owner).replace(/'/g,"")}')">View ${esc(pr.owner)}'s listings</button></div>`:''}
+      </div></section>
+    </div>
+    <section class="pd-panel"><div class="pd-panel-h">Sale history</div><div class="pd-panel-b" style="padding:4px 12px">
+      <table class="pd-tbl"><thead><tr><th>Date</th><th class="num">Price (USD)</th><th class="num">Paid</th><th>Buyer/seller</th><th class="num">On market</th></tr></thead>
+      <tbody>${rows}</tbody></table>
+    </div></section>
+  </div>`;
+}
 
 /* ================= Market Watch (home / splash) ================= */
 function mwUsd0(v){ return '$'+Math.round(v||0).toLocaleString(); }
@@ -8748,7 +8990,7 @@ function schedule(){
 }
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
   document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));
-  t.classList.add("on"); TAB=t.dataset.t; fadeView(); render(); schedule();
+  t.classList.add("on"); TAB=t.dataset.t; state.propDetail=null; fadeView(); render(); schedule();
 });
 $("#cmdkBtn").onclick=openCmdk;
 $("#cmdkInput").oninput=e=>cmdkRender(e.target.value);

@@ -510,6 +510,15 @@ distills it into a small, indexed **`market.db`** that the website actually serv
 - `GET /api/property` — every mansion/house/trailer: owner, lock state, real map
   coordinates, plus a marketplace cross-reference (the owner's live listing count + total
   ask USD) and how many properties that owner holds.
+- `GET /api/property-detail?kind=mansion|house|trailer&num=N` — the **per-property "Zillow" page**
+  data. Each property is also a tradeable key item (`key_<kind>_<num>`), so this bundles its full
+  marketplace history: every recorded sale priced in **USD-at-the-time** (gold sales converted via
+  `gold_daily_usd()`, token already USD) with seller + days-on-market, all-time high/low/avg, sales
+  count, the **current ask** if a key is listed now, plus the live owner/lock and the owner's full
+  property portfolio + marketplace footprint. `{ok, kind, num, key, label, property:{owner, owner_id,
+  sold, locked, owner_properties, owner_holdings[], coords}, owner_market:{listings, value},
+  market:{sales_count, last_sold, high_usd, low_usd, avg_usd, avg_dom_days, first_sale, current_ask,
+  listed_count, history[], recent[]}}`.
 - `GET /api/merchant` — traveling-merchant tracker **and** cost calculator in one payload:
   `state` (five donation resources: wood, stone, coal, cooked fish, **metal** current/goal/**pct**,
   overall %, mode, gold stock) and `calc` (`gold_rate` + the current `MERCHANT_TRADE_COST`
@@ -692,10 +701,15 @@ second. The tabs below are numbered by topic, not bar order.
    flanking the door), a door, and a **chimney** on mansions; drawn back-to-front so nearer ones
    overlap. Each carries an **always-visible owner-name tag** + kind/num, a **🔒 lock badge** if
    locked, and a **pulsing green dot** if the owner is online (matched against the live-world roster).
-   **Hover** shows a floating tooltip (owner · status · listings · market value · online); **click**
-   selects (gold glow) and opens the owner side-card (name + id, owned/for-sale, locked/open, how many
-   properties they hold, live marketplace listing count + value, "view their listings" jump). Header
-   stats include mansion/house/trailer/locked counts + **owners online**. Polled ~30s.
+   **Hover** shows a floating tooltip (owner · status · listings · market value · online). **Clicking a
+   property opens its full "Zillow" detail page** (`openPropertyDetail`/`renderPropertyDetail` ←
+   `/api/property-detail`): headline valuation (last-sold or current ask), stat cards (last sold /
+   all-time high / low / times sold / asking now / avg days-on-market), an SVG **price-history chart**
+   of the property's key, a property+owner panel (status, access, current ask, owner's marketplace
+   footprint, the owner's other properties as clickable chips, a "view their listings" jump), and a
+   **sale-history table** (date · USD price · paid · seller · time-on-market). A "← All properties"
+   button returns to the map. Header stats include mansion/house/trailer/locked counts + **owners
+   online**. Map polled ~30s; the detail page isn't clobbered by the poll while open.
 8. **Player** — a per-player profile (`/api/player`, `loadPlayer`/`renderPlayer`). Type a player **name**
    (+ optional **wallet**) → header (name, seller id, first seen), stat cards (**marketplace earned** in
    USD/$KINS, items sold, avg sale, gold earned, **active listings + ask value**; a *spent (buy side)* card
@@ -809,6 +823,16 @@ sees the latest state at a glance.
 - **Top tab order adjusted for hosted-site flow.** The visual nav order is now Market Watch,
   Index, Merchant, Gold Price, Live listings, Sales feed, Arbitrage, Live World, Property Map,
   Player. Tab IDs/routes are unchanged.
+- **Property Map → "Zillow for Kintara" (per-property detail pages).** Clicking any property now opens
+  a full detail/index page for that exact spot. Each property is also a tradeable key item
+  (`key_<kind>_<num>`), so the new `GET /api/property-detail` surfaces its whole marketplace history:
+  every recorded sale priced in **USD-at-the-time** (gold via `gold_daily_usd()`), all-time high/low/avg,
+  times sold, current ask if a key is listed, days-on-market, plus the live owner, lock state, and the
+  owner's full property portfolio + marketplace footprint. The page (`renderPropertyDetail`) shows a
+  headline valuation, stat cards, an SVG **price-history chart**, a property/owner panel with the owner's
+  other properties as clickable chips, and a **sale-history table** — with a back button to the map.
+  (Most properties show empty history for now — key sales are rare and our window is short — but it fills
+  in as they trade; current asks already render, e.g. a trailer key listed at $3,500.)
 - **Property Map: fixed the 500 + visual/interaction overhaul.** `/api/property` was throwing
   `IndexError: No item with that key` (the owner-listings cross-ref `SELECT` was missing `item_type`
   while the loop read `r["item_type"]`) → the page showed "Couldn't load properties." Fixed the query.
