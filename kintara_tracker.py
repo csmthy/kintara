@@ -79,8 +79,16 @@ MARKET_SYNC = (os.environ.get("MARKET_SYNC", "1") == "1")
 MARKET_SYNC_INTERVAL = _envi("MARKET_SYNC_INTERVAL", 300)   # seconds between incremental pulls
 
 # --- 24/7 cadence + politeness (all tunable via env, with hosting-friendly defaults) ---
-POLL_INTERVAL = _envi("POLL_INTERVAL", 90)        # FULL-book poll seconds (paging the whole book for removal detection; was 45)
+POLL_INTERVAL = _envi("POLL_INTERVAL", 90)        # legacy; the listing refresher is now per-item/tiered (see below)
 FIRSTPAGE_INTERVAL = _envi("FIRSTPAGE_INTERVAL", 3)  # fast page-1 poll seconds: 1 request, captures newest listings before they can be created+sold between full polls
+# Tiered per-item listing refresher (replaces the uniform full-book sweep). Sales are detected
+# event-driven (a /stats count tick triggers a targeted re-fetch — see refresh_item_listings),
+# so this loop only keeps floors/supply fresh + is a removal backstop: hot (heavily-listed) items
+# refresh often, cold items rotate slowly. Load is proportional to activity, not catalog size.
+LISTING_GAP = _envf("LISTING_GAP", 0.6)               # min seconds between per-item refreshes
+LISTING_HOT_STALE = _envi("LISTING_HOT_STALE", 45)    # re-check heavily-listed items at least this often
+LISTING_COLD_STALE = _envi("LISTING_COLD_STALE", 300) # re-check quiet items this often
+LISTING_HOT_LIQ = _envi("LISTING_HOT_LIQ", 15)        # active-listing count that makes an item "hot"
 STATS_GAP = _envf("STATS_GAP", 0.5)               # spacing between stats requests
 STATS_STALE_HOT = _envi("STATS_STALE_HOT", 120)   # re-check actively-traded items this often
 STATS_STALE_COLD = _envi("STATS_STALE_COLD", 420) # re-check quiet items this often (was 900 — tightened so cold items' sales aren't missed)
@@ -1908,7 +1916,22 @@ def _log_sales(con, it, cur, d, n, marginal, observed_ts=None):
     return matched
 
 
-def _archive_samples(con, it, cur, samples):
+def refresh_item_listings(con, it):
+    """Targeted re-fetch of ONE item's live listings (q=<it>, cheapest) + scoped reconcile, so a
+    just-vanished listing is marked removed immediately. This is the event-driven core: instead of
+    sweeping the whole book to discover a removal, we fetch only the item that just sold, the
+    instant /stats says it sold. Removals are marked only if we fully covered the item (not capped),
+    so bulk commodities are never false-removed. Returns (active_count, newly_removed)."""
+    try:
+        listings, capped = _page_through(it, sort="cheapest", max_pages=5)
+    except Exception:
+        return 0, 0
+    if not listings and capped:
+        return 0, 0
+    return reconcile(con, listings, (set() if capped else {it}), record_poll=False)
+
+
+def _archive_samples(con, it, cur, samples, on_tick=None):
     """Persist every daily sample AND detect ACTUAL SALES against the authoritative /stats
     completed-sale COUNT (cancellations don't move it). Detection is count-based and
     self-healing: for each item-day we keep the number of sale events we've logged equal to
@@ -1953,6 +1976,15 @@ def _archive_samples(con, it, cur, samples):
                 inc = new_sales - prev_sales            # true /stats rise (for the price back-out)
                 marg = _marginal_price(prev_sales, prev_avg, new_sales, new_avg, inc if inc > 0 else to_log)
                 obs_ts = None if d == utc_day() else day_end_ms(d)
+                # EVENT-DRIVEN: a fresh sale tick is the only moment a sold listing vanished.
+                # For today's sales, fetch this item's listings RIGHT NOW so the removal is marked
+                # before we attribute — turning what used to be a synthetic row (waiting on the slow
+                # full sweep) into a fully-attributed sale. on_tick is only wired in the live loop.
+                if on_tick and d == utc_day():
+                    try:
+                        on_tick(con, it)
+                    except Exception:
+                        pass
                 _log_sales(con, it, cur, d, to_log, marg, obs_ts)
         con.execute(
             """INSERT INTO sales_daily(item_type,currency,date,sales,avg_price,base)
@@ -2233,7 +2265,7 @@ def stats_loop(stale_sec=None, gap=None):
                 day_sales = (s[-1].get("sales", 0) if s else 0)  # 0 = no sales (not missing)
                 day = s[-1].get("date") if s else None
                 day_avg = s[-1].get("avgUnitPrice") if s else None
-                _archive_samples(con, it, cur, s)
+                _archive_samples(con, it, cur, s, on_tick=refresh_item_listings)
                 _upsert_stats(con, it, cur, day, day_sales, d.get("avg30d"), day_avg)
             except Exception:
                 _mark_stats_attempt(con, it, cur)
@@ -3845,37 +3877,59 @@ _state = {"last": None, "last_active": 0, "last_removed": 0, "error": None,
           "last_success": None, "fail_streak": 0}
 
 
+_listing_refresh = {}   # item_type -> last refresh epoch (in-memory; tiers the per-item poll)
+
+
+def _next_listing_item(con):
+    """Pick the most-overdue item to refresh, tiered by liquidity: heavily-listed ('hot') items
+    come due every LISTING_HOT_STALE, quiet ones every LISTING_COLD_STALE, never-fetched items
+    immediately. Returns item_type or None if nothing is due yet (loop idles)."""
+    catalog = market_catalog()
+    if not catalog:
+        return None
+    liq = {r["item_type"]: r["n"] for r in con.execute(
+        "SELECT item_type, COUNT(*) n FROM listings WHERE active=1 GROUP BY item_type")}
+    now = time.time()
+    best, best_overdue = None, 0.0
+    for it in catalog:
+        last = _listing_refresh.get(it, 0)
+        if last == 0:
+            return it                       # never refreshed → do it now
+        stale = LISTING_HOT_STALE if liq.get(it, 0) >= LISTING_HOT_LIQ else LISTING_COLD_STALE
+        overdue = (now - last) - stale      # >0 ⇒ due; larger ⇒ more overdue
+        if overdue > best_overdue:
+            best_overdue, best = overdue, it
+    return best
+
+
 def poll_loop(interval):
+    """Tiered per-item listing refresher (NOT a full sweep). Each tick refreshes the single
+    most-overdue item via q=<item> + scoped reconcile, so removals are detected per-item as a
+    backstop and floors/supply stay fresh — hot items often, cold items slowly. Sale attribution
+    itself is event-driven (refresh_item_listings fires on a /stats tick), so this loop's job is
+    freshness, not catching every sale. Load scales with activity, not catalog size."""
     while True:
         con = connect()
         try:
-            # Full book via per-item q= enumeration (kintara caps the unfiltered book at offset
-            # ~500; querying each item type gets its complete listing set + the item name).
-            catalog = market_catalog()
-            listings, complete_items = fetch_book_by_item(catalog)
-            # freshness net: also grab the newest page so a brand-new item/listing not yet in the
-            # catalog still gets captured immediately (capture-only — doesn't widen removal scope).
-            newest, _ = _page_through("", sort="latest", max_pages=2)
-            ids = {L["id"] for L in listings}
-            listings += [L for L in newest if L.get("id") not in ids]
-            if not listings and not complete_items:
-                # got nothing this cycle (upstream down/slow) — keep last-good data and
-                # just note it; the UI only surfaces a problem once this persists.
+            it = _next_listing_item(con)
+            if it is None:
+                time.sleep(2)               # nothing due — idle briefly (finally closes con)
+                continue
+            listings, capped = _page_through(it, sort="cheapest", max_pages=5)
+            _listing_refresh[it] = time.time()
+            if not listings and capped:
                 _state["fail_streak"] = _state.get("fail_streak", 0) + 1
                 _state.update(last=now_iso(), error="upstream unreachable")
-                print(f"[{now_iso()}] poll: upstream unreachable (streak {_state['fail_streak']})")
             else:
-                a, r = reconcile(con, listings, complete_items)
-                # auto-pick a gold item once, if not set and we can guess
+                _, r = reconcile(con, listings, (set() if capped else {it}), record_poll=False)
                 if not get_setting(con, "gold_item"):
                     g = guess_gold_item(con)
                     if g:
                         set_setting(con, "gold_item", g)
-                _state.update(last=now_iso(), last_active=a, last_removed=r,
-                              error=None, last_success=now_iso(), fail_streak=0,
-                              last_items_covered=len(complete_items), last_catalog=len(catalog))
-                print(f"[{now_iso()}] active={a} newly_removed={r} "
-                      f"items_covered={len(complete_items)}/{len(catalog)}")
+                active = con.execute(
+                    "SELECT COUNT(*) c FROM listings WHERE active=1").fetchone()["c"]
+                _state.update(last=now_iso(), last_active=active, last_removed=r,
+                              error=None, last_success=now_iso(), fail_streak=0)
         except Exception as e:
             # unexpected (DB etc.) — count it but keep serving; don't crash the loop
             _state["fail_streak"] = _state.get("fail_streak", 0) + 1
@@ -8672,7 +8726,7 @@ def main():
     import requests  # noqa: F401  (force the import tree to load now)
     app = make_app()
 
-    threading.Thread(target=poll_loop, args=(args.interval,), daemon=True).start()
+    threading.Thread(target=poll_loop, args=(LISTING_GAP,), daemon=True).start()  # tiered per-item refresher
     threading.Thread(target=firstpage_loop, args=(args.firstpage_interval,), daemon=True).start()  # fast page-1 capture
     threading.Thread(target=stats_loop, daemon=True).start()
     threading.Thread(target=gold_price_loop, daemon=True).start()
@@ -8688,8 +8742,8 @@ def main():
     _boss_census.start()    # boss-area census for the server bubble (resolves the region key)
     hosted = args.host not in ("127.0.0.1", "localhost")
     url = f"http://{'127.0.0.1' if not hosted else args.host}:{args.port}"
-    print(f"Dashboard: {url}   (full poll {args.interval}s · page-1 poll "
-          f"{args.firstpage_interval}s · kintara min-gap {KINTARA_MIN_GAP}s; Ctrl+C to stop)")
+    print(f"Dashboard: {url}   (per-item refresh {LISTING_GAP}s gap · page-1 poll "
+          f"{args.firstpage_interval}s · event-driven sales · kintara min-gap {KINTARA_MIN_GAP}s; Ctrl+C to stop)")
     if not args.no_browser and not hosted:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
     app.run(host=args.host, port=args.port, threaded=True)

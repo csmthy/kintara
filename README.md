@@ -189,22 +189,26 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
   the sale happened. High-liquidity/urgent pairs are prioritized, but quiet known items are
   still re-checked on the cold cadence, writing to both `sales_daily` (archive) and
   `item_stats` (last-day summary).
-- **Two-tier listing poll (capture vs. removal):** listings are polled by *two* loops.
-  **`poll_loop`** (FULL, `POLL_INTERVAL`=90s) pages the **whole book** via
-  `fetch_all_active()` and calls `reconcile(..., complete=True)` — this is the only fetch
-  that sees every listing, so it's the only one that marks vanished listings removed. But
-  a full sweep is ~143 requests at PAGE=40 (~5700 listings) ≈ a minute-plus at ≤2 req/s, so
-  a listing **created *and* sold inside one sweep** was never captured — the sale could only
-  be recovered later as a count tick with no detail (a synthetic row). **`firstpage_loop`**
-  (`FIRSTPAGE_INTERVAL`=3s) closes that blind spot: it fetches **only page 1**
-  (`fetch_all_active(max_pages=1)`, newest-first = 1 request) and calls
-  `reconcile(..., complete=False, record_poll=False)` — **capture-only**: it upserts the
-  newest listings (so every creation is recorded almost immediately) but never marks
-  removals (it can't see the rest of the book) and writes no `polls` row (avoids 17k/day of
-  bloat). Net: we now log essentially every listing the moment it appears, and removal
-  detection still lives with the full poll. `fetch_all_active(max_pages=N)` returns
-  `complete=False` when it hits the page cap with book remaining, so a capped fetch never
-  makes `reconcile` mistake unseen pages for removed listings.
+- **Event-driven sales + tiered listing refresh (no full-book sweep).** Three cooperating loops,
+  each doing the minimum:
+  - **`stats_loop`** polls `/stats` per item (the authoritative completed-sale COUNT). A count tick
+    is the *only* moment a sold listing vanished — so on a tick `_archive_samples` calls
+    **`refresh_item_listings(it)`**, a targeted `q=<it>` re-fetch + scoped `reconcile`, which marks
+    the just-vanished listing removed **right before** `_log_sales` attributes it. Removal→attribution
+    latency drops from ~the sweep interval to ~1s, and we only fetch listings for items that actually
+    sold (load ∝ trading volume, not catalog size).
+  - **`poll_loop`** is now a **tiered per-item refresher** (`_next_listing_item`), not a full sweep:
+    each tick refreshes the single most-overdue item (`q=<it>`, cheapest, scoped reconcile). Hot
+    (heavily-listed, ≥`LISTING_HOT_LIQ`) items come due every `LISTING_HOT_STALE` (45s), quiet ones
+    every `LISTING_COLD_STALE` (300s), never-fetched immediately — paced by `LISTING_GAP`. Its job is
+    keeping floors/supply fresh + a removal backstop; sale *attribution* is the event-driven path.
+  - **`firstpage_loop`** (`FIRSTPAGE_INTERVAL`=3s) still captures the newest page (capture-only,
+    `reconcile(..., complete=False)`) so brand-new listings are recorded instantly.
+
+  Removals are always scoped to fully-covered item types (the `complete_items`/`{it}` set passed to
+  `reconcile`), so a bulk commodity we can only partially page is never false-removed. Net: near-real-time
+  sales detection at a fraction of the old continuous ~150-request sweep, and it keeps scaling as the
+  game grows because cost tracks activity, not the number of items.
 - **Gold price (ours)**: `gold_price_loop` writes one `gold_price` row every ~3 min from
   the local `listings` DB (no external call). This is the live gold series.
 - **Servers / merchant / property**: `/api/servers` cached ~30s, `/api/merchant` ~60s,
@@ -799,6 +803,17 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Event-driven sales + tiered listing refresh (kill the full-book sweep).** Removal detection no
+  longer brute-force scans all ~150 items every cycle. **`stats_loop`** already knows the per-item
+  completed-sale count; on a count tick it now calls **`refresh_item_listings(it)`** — a targeted
+  `q=<it>` re-fetch + scoped reconcile — so the sold listing is marked removed and attributed within
+  ~1s, and we only fetch listings for items that actually sold. **`poll_loop`** became a **tiered
+  per-item refresher** (`_next_listing_item`): most-overdue item each tick, hot items every
+  `LISTING_HOT_STALE`(45s) / cold every `LISTING_COLD_STALE`(300s) / never-fetched first, paced by
+  `LISTING_GAP`(0.6s) — for floors/supply freshness + removal backstop, no blocking sweep. Result:
+  near-real-time attribution at a fraction of the old continuous ~150-req sweep, and **load scales
+  with trading volume, not catalog size** — so it keeps scaling as the playerbase grows. Removals stay
+  scoped to fully-covered items (no false-removes). See "Event-driven sales + tiered listing refresh".
 - **Full market data via per-item `q=` enumeration (kintara capped the book at ~500).** kintara
   hard-limited its marketplace API to serve only ~the first 500 listings (`offset` past ~500 returns an
   empty page even though `total` still reports 8k+) — which broke full-book removal detection and left
