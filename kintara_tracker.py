@@ -6360,11 +6360,11 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
   <div class="tabs">
     <div class="tab on" data-t="market">Market Watch</div>
     <div class="tab" data-t="hist">Index</div>
-    <div class="tab" data-t="arb">Arbitrage</div>
+    <div class="tab" data-t="merchant">Merchant</div>
+    <div class="tab" data-t="gold">Gold price</div>
     <div class="tab" data-t="live">Live listings</div>
     <div class="tab" data-t="removed">Sales feed</div>
-    <div class="tab" data-t="gold">Gold price</div>
-    <div class="tab" data-t="merchant">Merchant</div>
+    <div class="tab" data-t="arb">Arbitrage</div>
     <div class="tab" data-t="world">Live World</div>
     <div class="tab" data-t="props">Property Map</div>
     <div class="tab" data-t="player">Player</div>

@@ -806,6 +806,9 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Top tab order adjusted for hosted-site flow.** The visual nav order is now Market Watch,
+  Index, Merchant, Gold Price, Live listings, Sales feed, Arbitrage, Live World, Property Map,
+  Player. Tab IDs/routes are unchanged.
 - **Property Map: fixed the 500 + visual/interaction overhaul.** `/api/property` was throwing
   `IndexError: No item with that key` (the owner-listings cross-ref `SELECT` was missing `item_type`
   while the loop read `r["item_type"]`) → the page showed "Couldn't load properties." Fixed the query.
