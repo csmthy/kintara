@@ -907,6 +907,10 @@ def categorize(item_type: str) -> str:
         return "food"
     if item_type in BUILDING:
         return "building"
+    # fallback to kintara's own item-index category (auto-categorizes brand-new items)
+    wc = world_item_meta(item_type).get("category")
+    if wc:
+        return _WORLD_CAT_MAP.get(wc, "other")
     return "other"
 
 
@@ -1068,6 +1072,9 @@ def item_label(item_type: str) -> str:
         return item_type or ""
     if item_type in ITEM_LABELS:
         return ITEM_LABELS[item_type]
+    wl = world_item_meta(item_type).get("label")   # kintara's live display name (new items)
+    if wl:
+        return wl
     s = item_type
     for pre in _LABEL_PREFIXES:
         if s.startswith(pre):
@@ -1126,20 +1133,35 @@ def icon_asset(item_type):
 
 def icon_candidates(item_type):
     """Ordered HUD asset paths to try for an item — the first that returns 200 is cached.
-    Pets and furniture have per-item art whose exact path isn't in ICON_OVERRIDES, so we
-    probe the likely schemes; pets fall back to the generic paw so they never lose art."""
+    The FIRST candidate is kintara's own index icon path (so brand-new items resolve their real
+    art automatically); then per-type schemes (pets/furniture/overrides); then generic resource/
+    item guesses for bare new drops like `molten_rock`. Pets fall back to the generic paw."""
     if not item_type:
         return []
+    out = []
+    wi = world_item_meta(item_type).get("icon")     # e.g. "/assets/hud/mounts/trex.png"
+    if wi:
+        out.append(wi.split("/assets/hud/", 1)[-1] if "/assets/hud/" in wi else wi.lstrip("/"))
     if item_type.startswith("pet_"):
         short = item_type[len("pet_"):]
-        return [f"pets/{item_type}.png", f"pets/{short}.png", f"pets/{short}.svg",
+        out += [f"pets/{item_type}.png", f"pets/{short}.png", f"pets/{short}.svg",
                 f"cosmetics/{item_type}.png", f"cosmetics/pet_{short}.png", "pets/paw.svg"]
-    if item_type.startswith("furniture_"):
+    elif item_type.startswith("furniture_"):
         short = item_type[len("furniture_"):]
-        return [f"furniture/{item_type}.png", f"furniture/{short}.png",
+        out += [f"furniture/{item_type}.png", f"furniture/{short}.png",
                 f"furniture/{short}.svg", f"cosmetics/{item_type}.png"]
-    rel = icon_asset(item_type)
-    return [rel] if rel else []
+    else:
+        rel = icon_asset(item_type)
+        if rel:
+            out.append(rel)
+        # bare resource/item drops (no recognised prefix) — probe the common dirs, incl. the
+        # underscore-stripped name kintara uses for resource art (molten_rock → moltenrock.png).
+        if item_type not in ICON_OVERRIDES:
+            nu = item_type.replace("_", "")
+            out += [f"resources/{item_type}.png", f"items/{item_type}.png",
+                    f"resources/{nu}.png", f"items/{nu}.png", f"cosmetics/{item_type}.png"]
+    seen = set()
+    return [x for x in out if x and not (x in seen or seen.add(x))]
 
 
 # ---------------------------------------------------------------------------
@@ -2629,13 +2651,18 @@ def merchant_watch_loop(interval):
         time.sleep(interval)
 
 
-_world_supply_cache = {"at": 0, "map": {}, "players": 0, "generated": 0, "loaded": False}
+_world_supply_cache = {"at": 0, "map": {}, "meta": {}, "players": 0, "generated": 0, "loaded": False}
+
+# kintara.gg's own item-index category → our internal category buckets (fallback for items our
+# prefix rules don't recognise — e.g. brand-new drops like molten_rock). Auto-categorizes new items.
+_WORLD_CAT_MAP = {"materials": "material", "items": "material", "cosmetics": "cosmetic",
+                  "mounts": "mount", "pets": "pet", "furniture": "furniture", "gold": "currency"}
 
 
 def _load_world_supply_from_db():
     """Seed the in-memory cache from the last persisted snapshot (settings `world_supply_json`)
-    so the 'in world' / market-cap data is available the instant the site loads — even right
-    after a restart, before the first live refresh completes."""
+    so the 'in world' / market-cap data + the live label/icon/category catalog are available the
+    instant the site loads — even right after a restart, before the first live refresh completes."""
     c = _world_supply_cache
     try:
         con = connect(readonly=True)
@@ -2644,7 +2671,7 @@ def _load_world_supply_from_db():
         if raw:
             d = json.loads(raw)
             if d.get("map"):
-                c.update(map=d["map"], players=d.get("players", 0),
+                c.update(map=d["map"], meta=d.get("meta") or {}, players=d.get("players", 0),
                          generated=d.get("generated", 0), at=d.get("at", 0))
     except Exception:
         pass
@@ -2654,7 +2681,9 @@ def _load_world_supply_from_db():
 def refresh_world_supply():
     """Fetch the world index from the public read-fanout mirror; on success update the cache
     AND persist it to the DB (so it survives restarts). Returns True on a good fetch. The
-    fanout occasionally returns fanout_unavailable transiently — on failure we keep last-good."""
+    fanout occasionally returns fanout_unavailable transiently — on failure we keep last-good.
+    Captures the per-item **label, icon path, and category** too — kintara's index is our live
+    catalog, so new items get correct names/art/categories automatically (see world_item_meta)."""
     import requests
     try:
         r = requests.get(WORLD_INDEX_URL, params={"category": "all", "sort": "desc"},
@@ -2662,15 +2691,23 @@ def refresh_world_supply():
         r.raise_for_status()
         d = r.json() or {}
         if d.get("ok"):
-            m = {row["id"]: row.get("count") for row in d.get("rows", []) if row.get("id")}
+            m, meta = {}, {}
+            for row in d.get("rows", []):
+                rid = row.get("id")
+                if not rid:
+                    continue
+                m[rid] = row.get("count")
+                meta[rid] = {"label": row.get("label"), "icon": row.get("icon"),
+                             "category": row.get("category")}
             if m:
                 c = _world_supply_cache
-                c.update(map=m, players=d.get("playerCount") or 0,
+                c.update(map=m, meta=meta, players=d.get("playerCount") or 0,
                          generated=d.get("generatedAt") or 0, at=time.time(), loaded=True)
                 try:
                     con = connect()
                     set_setting(con, "world_supply_json", json.dumps(
-                        {"map": m, "players": c["players"], "generated": c["generated"], "at": c["at"]}))
+                        {"map": m, "meta": meta, "players": c["players"],
+                         "generated": c["generated"], "at": c["at"]}))
                     con.close()
                 except Exception as e:
                     print(f"[{now_iso()}] world supply persist failed: {e}")
@@ -2684,10 +2721,21 @@ def world_item_supply():
     """Return the cached world-supply snapshot INSTANTLY — no network on the request path.
     The background world_supply_loop keeps it fresh and persists it; the request just reads
     the in-memory cache (lazily seeded from the persisted snapshot on first use). Returns
-    {map:{item_type:count}, players, generated, at}. Powers the Index 'in world' column + mkt cap."""
+    {map:{item_type:count}, meta:{...}, players, generated, at}. Powers the Index 'in world'
+    column + mkt cap + the live label/icon/category catalog."""
     if not _world_supply_cache["loaded"]:
         _load_world_supply_from_db()
     return _world_supply_cache
+
+
+def world_item_meta(item_type):
+    """{label, icon, category} for an item from kintara's live index, or {} if unknown.
+    The fallback source that makes new items index automatically (name + art + category)."""
+    if not item_type:
+        return {}
+    if not _world_supply_cache["loaded"]:
+        _load_world_supply_from_db()
+    return (_world_supply_cache.get("meta") or {}).get(item_type) or {}
 
 
 def world_supply_loop(interval):
@@ -4902,14 +4950,15 @@ def make_app():
         window = max(1, int(float(request.args.get("window", 1) or 1)))
         con = connect(readonly=True)
         ref = con.execute("SELECT MAX(date) d FROM sales_daily").fetchone()["d"]
-        items = sorted({
-            r["item_type"]
-            for r in con.execute(
-                """SELECT item_type FROM listings
-                   UNION SELECT item_type FROM sales_daily
-                   UNION SELECT item_type FROM sales_events""")
-            if r["item_type"]
-        })
+        # item universe = anything we've seen listed/sold ∪ kintara's full live item index, so a
+        # brand-new item appears in the Index immediately (with its in-world supply) even before it
+        # has any marketplace listing or sale.
+        items = {r["item_type"] for r in con.execute(
+            """SELECT item_type FROM listings
+               UNION SELECT item_type FROM sales_daily
+               UNION SELECT item_type FROM sales_events""") if r["item_type"]}
+        items |= set(world_item_supply()["map"].keys())
+        items = sorted(items)
         agg = {}
         if ref:
             start = (_date.fromisoformat(ref) - _td(days=window - 1)).isoformat()
