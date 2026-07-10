@@ -13,10 +13,11 @@ frontend, `world_map.jpg`, and the realm PNGs in `MapImages/`.
 
 ---
 
-## Important: do NOT use gunicorn / multiple workers
-The background loops are threads started in `main()`. Run it as the single process
-`python kintara_tracker.py` (the Docker `CMD` already does this). Forking workers would
-multiply the pollers and hammer kintara.
+## Important: use one process, not multiple workers
+The background loops are threads started in `main()`. Run the single
+`python kintara_tracker.py` process (the Docker `CMD` already does this); Waitress provides
+request concurrency with an 8-thread pool. Gunicorn/multiple processes would multiply the
+pollers and hammer kintara.
 
 ## Persistence (the one thing you must get right)
 Mount a volume and point `KINTARA_DB` at it. The Dockerfile defaults to
@@ -33,6 +34,12 @@ land on the volume. If you skip the volume, the DB is wiped on every deploy/rest
 | `SOLANA_RPC` (or `RPC`) | _(public)_ | Solana JSON-RPC for the treasury sync + wallet stats. Public works for the light incremental load; set a Helius/QuickNode URL for reliability/headroom. |
 | `PORT` | `8765` | listen port (most hosts inject this) |
 | `KINTARA_HOST` | `0.0.0.0` (in Docker) | bind address |
+| `WEB_THREADS` | `8` | Waitress request threads; keeps collectors single-instance while serving concurrent visitors |
+| `KINSCAN_TRUSTED_PROXY` | _(unset)_ | trusted reverse-proxy IP; the Droplet service sets `127.0.0.1` for local Caddy |
+| `ANALYTICS_ONLINE_SEC` | `75` | recent-heartbeat window for the public unique-browser online count |
+| `ANALYTICS_FLUSH_SEC` | `15` | batch interval for small analytics aggregates written to SQLite |
+| `KINSCAN_ADMIN_PASSWORD` | _(generated)_ | optional password for `/admin/analytics`; generated into persistent settings when unset |
+| `CLOUDFLARE_WEB_ANALYTICS_TOKEN` | _(unset)_ | optional free Cloudflare Web Analytics site token; first-party analytics work without it |
 | `POLL_INTERVAL` | `90` | listing poll seconds |
 | `KINTARA_MIN_GAP` | `0.5` | global min seconds between **any** two kintara.gg requests (≈ ≤2 req/s total) |
 | `KINTARA_BACKOFF` | `45` | pause after a 429/403 rate-limit |
@@ -129,6 +136,22 @@ script — ask and I'll generate `.github/workflows/deploy.yml`.)*
   HTTPS at `https://yourdomain`. Not required — the IP works immediately.
 - **Firewall:** the setup opens port 80 if `ufw` is active. If you use a DO Cloud Firewall,
   allow inbound TCP **80** (and **443** if you add HTTPS).
+
+### Website usage stats (no added cost)
+The public header shows unique anonymous browsers active in the last 75 seconds. Your private
+dashboard is `https://kinscan.app/admin/analytics`; the browser will ask for Basic-auth credentials.
+The username can be anything. Retrieve the persistent generated password on the Droplet with:
+```bash
+ssh root@159.203.132.20 'sudo -u kintara /opt/kintara/venv/bin/python /opt/kintara/kintara_tracker.py --show-analytics-password'
+```
+To choose your own password, put `KINSCAN_ADMIN_PASSWORD=your-long-private-password` in
+`/opt/kintara-data/kinscan.env`, then run `systemctl restart kintara`. Keep that file off git.
+
+This first-party analytics is included in the existing process and SQLite DB. It stores only a hash
+of a random browser ID, not analytics IPs, wallets, player names, or searches. Cloudflare Web Analytics
+is an optional free second view: create a site token, add
+`CLOUDFLARE_WEB_ANALYTICS_TOKEN=<token>` to `kinscan.env`, and restart. It is not needed for the online
+counter or private dashboard.
 
 ---
 

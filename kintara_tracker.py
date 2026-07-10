@@ -36,15 +36,17 @@ Run:
 
 import argparse
 import gzip
+import hashlib
 import json
 import os
 import queue
 import re
+import secrets
 import sqlite3
 import threading
 import time
 import webbrowser
-from collections import defaultdict
+from collections import defaultdict, deque
 from datetime import datetime, timezone, timedelta as _td
 
 def _envf(name, default):
@@ -169,6 +171,12 @@ KINS_TREASURY_DEFAULT = "4zW4zuZb9rXpvw3cTYyGoQ2iHTtG9E17YpdeNUbwuQVt"
 KINS_TREASURY = {a.strip() for a in (os.environ.get("KINS_TREASURY") or KINS_TREASURY_DEFAULT).split(",") if a.strip()}
 ONCHAIN_MAX_SIGS = _envi("ONCHAIN_MAX_SIGS", 2000)   # older sigs backfilled per call (NOT a total cap — full history backfills over repeated loads)
 ONCHAIN_CACHE_SEC = _envi("ONCHAIN_CACHE_SEC", 600)  # re-scan a wallet at most this often
+WEB_THREADS = _envi("WEB_THREADS", 8)
+TRUSTED_PROXY = (os.environ.get("KINSCAN_TRUSTED_PROXY") or "").strip()
+ANALYTICS_ONLINE_SEC = _envi("ANALYTICS_ONLINE_SEC", 75)
+ANALYTICS_FLUSH_SEC = _envi("ANALYTICS_FLUSH_SEC", 15)
+CF_ANALYTICS_TOKEN = (os.environ.get("CLOUDFLARE_WEB_ANALYTICS_TOKEN") or "").strip()
+_analytics_admin_password = (os.environ.get("KINSCAN_ADMIN_PASSWORD") or "").strip()
 KINTARAGOLD_URL = "https://kintaragold.xyz/"
 # kintara.gg's live server list (population label + queue length per server).
 SERVERS_URL = "https://kintara.gg/api/servers"
@@ -471,6 +479,211 @@ def single_flight(name):
         wrapped.__doc__ = fn.__doc__
         return wrapped
     return decorate
+
+
+# Anonymous, first-party usage analytics. Browser IDs are random values generated
+# locally; only a one-way hash is retained. Presence lives in memory, while small
+# daily aggregates flush to SQLite in batches so heartbeats never become DB writes.
+_analytics_lock = threading.Lock()
+_online_tabs = {}
+_analytics_pending_metrics = defaultdict(float)
+_analytics_pending_visitors = {}
+_rate_lock = threading.Lock()
+_rate_hits = defaultdict(deque)
+
+
+def _analytics_hash(value):
+    return hashlib.sha256(("kinscan-v1:" + value).encode("utf-8")).hexdigest()[:32]
+
+
+def _analytics_clean(value, max_len=80):
+    value = str(value or "")[:max_len]
+    return value if re.fullmatch(r"[A-Za-z0-9_.:-]+", value) else ""
+
+
+def _analytics_prune_locked(now_ms):
+    cutoff = now_ms - ANALYTICS_ONLINE_SEC * 1000
+    for key, row in list(_online_tabs.items()):
+        if row["last"] < cutoff:
+            _online_tabs.pop(key, None)
+
+
+def analytics_online_count():
+    now_ms = int(time.time() * 1000)
+    with _analytics_lock:
+        _analytics_prune_locked(now_ms)
+        return len({row["visitor"] for row in _online_tabs.values()})
+
+
+def analytics_record(metric, dimension="all", value=1):
+    metric = _analytics_clean(metric, 48)
+    dimension = _analytics_clean(dimension, 96) or "other"
+    if not metric:
+        return
+    with _analytics_lock:
+        _analytics_pending_metrics[(utc_day(), metric, dimension)] += float(value)
+
+
+def analytics_heartbeat(visitor_id, tab_id, tab, load_ms=None):
+    visitor_id = _analytics_clean(visitor_id)
+    tab_id = _analytics_clean(tab_id)
+    tab = _analytics_clean(tab, 32) or "unknown"
+    if not visitor_id or not tab_id:
+        return None
+    visitor = _analytics_hash(visitor_id)
+    now_ms = int(time.time() * 1000)
+    day = utc_day()
+    key = (visitor, tab_id)
+    with _analytics_lock:
+        _analytics_prune_locked(now_ms)
+        old = _online_tabs.get(key)
+        is_visit = old is None
+        tab_changed = is_visit or old.get("tab") != tab
+        _online_tabs[key] = {"visitor": visitor, "last": now_ms, "tab": tab}
+
+        pending_key = (day, visitor)
+        p = _analytics_pending_visitors.get(pending_key)
+        if p is None:
+            p = {"first": now_ms, "last": now_ms, "sessions": 0}
+            _analytics_pending_visitors[pending_key] = p
+        p["first"] = min(p["first"], now_ms)
+        p["last"] = max(p["last"], now_ms)
+        if is_visit:
+            p["sessions"] += 1
+            _analytics_pending_metrics[(day, "site_visit", "all")] += 1
+        if tab_changed:
+            _analytics_pending_metrics[(day, "tab_view", tab)] += 1
+        if is_visit and load_ms is not None:
+            try:
+                load_ms = max(0.0, min(60000.0, float(load_ms)))
+                _analytics_pending_metrics[(day, "client_load_ms_sum", "all")] += load_ms
+                _analytics_pending_metrics[(day, "client_load_count", "all")] += 1
+            except (TypeError, ValueError):
+                pass
+        return len({row["visitor"] for row in _online_tabs.values()})
+
+
+def analytics_leave(visitor_id, tab_id):
+    visitor_id = _analytics_clean(visitor_id)
+    tab_id = _analytics_clean(tab_id)
+    if not visitor_id or not tab_id:
+        return analytics_online_count()
+    visitor = _analytics_hash(visitor_id)
+    with _analytics_lock:
+        _online_tabs.pop((visitor, tab_id), None)
+        _analytics_prune_locked(int(time.time() * 1000))
+        return len({row["visitor"] for row in _online_tabs.values()})
+
+
+def analytics_flush_once():
+    with _analytics_lock:
+        metrics = dict(_analytics_pending_metrics)
+        visitors = {k: dict(v) for k, v in _analytics_pending_visitors.items()}
+        _analytics_pending_metrics.clear()
+        _analytics_pending_visitors.clear()
+    if not metrics and not visitors:
+        return
+    con = connect()
+    try:
+        con.executemany(
+            """INSERT INTO analytics_daily(day,metric,dimension,value) VALUES(?,?,?,?)
+               ON CONFLICT(day,metric,dimension) DO UPDATE
+               SET value=analytics_daily.value+excluded.value""",
+            [(day, metric, dim, value) for (day, metric, dim), value in metrics.items()])
+        con.executemany(
+            """INSERT INTO analytics_visitors
+                   (day,visitor_hash,first_seen,last_seen,sessions) VALUES(?,?,?,?,?)
+               ON CONFLICT(day,visitor_hash) DO UPDATE SET
+                   first_seen=MIN(analytics_visitors.first_seen,excluded.first_seen),
+                   last_seen=MAX(analytics_visitors.last_seen,excluded.last_seen),
+                   sessions=analytics_visitors.sessions+excluded.sessions""",
+            [(day, visitor, p["first"], p["last"], p["sessions"])
+             for (day, visitor), p in visitors.items()])
+        con.commit()
+    except Exception:
+        with _analytics_lock:
+            for key, value in metrics.items():
+                _analytics_pending_metrics[key] += value
+            for key, p in visitors.items():
+                cur = _analytics_pending_visitors.get(key)
+                if cur is None:
+                    _analytics_pending_visitors[key] = p
+                else:
+                    cur["first"] = min(cur["first"], p["first"])
+                    cur["last"] = max(cur["last"], p["last"])
+                    cur["sessions"] += p["sessions"]
+        raise
+    finally:
+        con.close()
+
+
+def analytics_flush_loop():
+    while True:
+        time.sleep(ANALYTICS_FLUSH_SEC)
+        try:
+            analytics_flush_once()
+        except Exception:
+            pass
+
+
+def analytics_stats(days=30):
+    try:
+        analytics_flush_once()
+    except Exception:
+        pass
+    try:
+        days = int(days)
+    except (TypeError, ValueError):
+        days = 30
+    days = max(1, min(180, days))
+    cutoff = (datetime.now(timezone.utc) - _td(days=days - 1)).strftime("%Y-%m-%d")
+    con = connect(readonly=True)
+    try:
+        visitor_rows = [dict(r) for r in con.execute(
+            """SELECT day,COUNT(*) visitors,COALESCE(SUM(sessions),0) sessions
+               FROM analytics_visitors WHERE day>=? GROUP BY day ORDER BY day""", (cutoff,))]
+        metric_rows = [dict(r) for r in con.execute(
+            "SELECT day,metric,dimension,value FROM analytics_daily WHERE day>=?",
+            (cutoff,))]
+
+        def range_summary(n):
+            start = (datetime.now(timezone.utc) - _td(days=n - 1)).strftime("%Y-%m-%d")
+            row = con.execute(
+                """SELECT COUNT(DISTINCT visitor_hash) visitors,
+                          COALESCE(SUM(sessions),0) sessions
+                   FROM analytics_visitors WHERE day>=?""", (start,)).fetchone()
+            return {"visitors": row["visitors"] or 0, "sessions": row["sessions"] or 0}
+
+        ranges = {"today": range_summary(1), "d7": range_summary(7), "d30": range_summary(30)}
+    finally:
+        con.close()
+
+    metrics = defaultdict(float)
+    daily = {r["day"]: {"day": r["day"], "visitors": r["visitors"],
+                         "sessions": r["sessions"], "pageviews": 0} for r in visitor_rows}
+    for r in metric_rows:
+        metrics[(r["metric"], r["dimension"])] += r["value"] or 0
+        if r["metric"] == "site_visit":
+            daily.setdefault(r["day"], {"day": r["day"], "visitors": 0,
+                                        "sessions": 0, "pageviews": 0})["pageviews"] += r["value"] or 0
+    tabs = [{"tab": dim, "views": int(value)} for (metric, dim), value in metrics.items()
+            if metric == "tab_view"]
+    tabs.sort(key=lambda x: x["views"], reverse=True)
+    api_names = {dim for metric, dim in metrics if metric == "api_requests"}
+    apis = []
+    for name in api_names:
+        count = metrics[("api_requests", name)]
+        apis.append({"endpoint": name, "requests": int(count),
+                     "avg_ms": round(metrics[("api_ms_sum", name)] / count, 1) if count else None,
+                     "errors": int(metrics[("api_errors", name)])})
+    apis.sort(key=lambda x: (x["avg_ms"] or 0), reverse=True)
+    load_count = metrics[("client_load_count", "all")]
+    return {"ok": True, "online": analytics_online_count(), "ranges": ranges,
+            "daily": sorted(daily.values(), key=lambda x: x["day"]),
+            "tabs": tabs, "apis": apis,
+            "avg_client_load_ms": round(metrics[("client_load_ms_sum", "all")] / load_count)
+            if load_count else None,
+            "generated_at": int(time.time() * 1000)}
 
 
 def now_iso() -> str:
@@ -848,6 +1061,26 @@ def init_db() -> None:
             data       TEXT,
             updated_at INTEGER
         );
+
+        -- Privacy-preserving site analytics. Only a hash of the browser-generated
+        -- anonymous ID is retained; live presence itself is memory-only.
+        CREATE TABLE IF NOT EXISTS analytics_visitors (
+            day          TEXT,
+            visitor_hash TEXT,
+            first_seen   INTEGER,
+            last_seen    INTEGER,
+            sessions     INTEGER DEFAULT 0,
+            PRIMARY KEY (day, visitor_hash)
+        );
+        CREATE INDEX IF NOT EXISTS idx_av_day ON analytics_visitors(day);
+        CREATE TABLE IF NOT EXISTS analytics_daily (
+            day       TEXT,
+            metric    TEXT,
+            dimension TEXT,
+            value     REAL DEFAULT 0,
+            PRIMARY KEY (day, metric, dimension)
+        );
+        CREATE INDEX IF NOT EXISTS idx_ad_day ON analytics_daily(day);
         """
     )
 
@@ -927,6 +1160,14 @@ def init_db() -> None:
             "SELECT DISTINCT item_type FROM listings WHERE category IS NULL"):
         con.execute("UPDATE listings SET category=? WHERE item_type=?",
                     (categorize(r["item_type"]), r["item_type"]))
+    global _analytics_admin_password
+    if not _analytics_admin_password:
+        _analytics_admin_password = get_setting(con, "analytics_admin_password", "")
+    if not _analytics_admin_password:
+        _analytics_admin_password = secrets.token_urlsafe(18)
+        set_setting(con, "analytics_admin_password", _analytics_admin_password)
+        print("KinScan analytics admin password generated. Retrieve it with: "
+              "python kintara_tracker.py --show-analytics-password")
     con.commit()
     con.close()
 
@@ -4175,8 +4416,33 @@ def firstpage_loop(interval):
 # ---------------------------------------------------------------------------
 
 def make_app():
-    from flask import Flask, jsonify, request, Response, send_file
+    from flask import Flask, jsonify, request, Response, send_file, g
     app = Flask(__name__)
+
+    def rate_limited(bucket, limit, window_sec):
+        key = (bucket, request.remote_addr or "unknown")
+        now = time.monotonic()
+        with _rate_lock:
+            hits = _rate_hits[key]
+            while hits and hits[0] <= now - window_sec:
+                hits.popleft()
+            if len(hits) >= limit:
+                return True
+            hits.append(now)
+        return False
+
+    @app.before_request
+    def request_guard():
+        g.request_started = time.perf_counter()
+        if not request.path.startswith("/api/"):
+            return None
+        if rate_limited("api", 300, 60):
+            return jsonify({"ok": False, "error": "rate_limited"}), 429
+        if request.path == "/api/refresh-stats" and rate_limited("refresh-stats", 2, 120):
+            return jsonify({"ok": False, "error": "refresh rate limited"}), 429
+        if request.path == "/api/wallet-onchain" and rate_limited("wallet-onchain", 40, 60):
+            return jsonify({"ok": False, "error": "wallet scan rate limited"}), 429
+        return None
 
     @app.after_request
     def compress_response(response):
@@ -4198,6 +4464,19 @@ def make_app():
         response.headers["Content-Encoding"] = "gzip"
         response.headers["Content-Length"] = str(len(packed))
         response.headers.add("Vary", "Accept-Encoding")
+        return response
+
+    @app.after_request
+    def record_request_metrics(response):
+        endpoint = request.endpoint or "unknown"
+        if (request.path.startswith("/api/") and
+                endpoint not in {"analytics_heartbeat_route", "analytics_leave_route",
+                                 "admin_analytics_data"}):
+            elapsed = (time.perf_counter() - getattr(g, "request_started", time.perf_counter())) * 1000
+            analytics_record("api_requests", endpoint)
+            analytics_record("api_ms_sum", endpoint, elapsed)
+            if response.status_code >= 400:
+                analytics_record("api_errors", endpoint)
         return response
 
     def _icon_send(fp, ext):
@@ -4264,7 +4543,12 @@ def make_app():
 
     @app.route("/")
     def index():
-        return Response(INDEX_HTML, mimetype="text/html")
+        html = INDEX_HTML
+        if CF_ANALYTICS_TOKEN and re.fullmatch(r"[A-Za-z0-9_-]{16,128}", CF_ANALYTICS_TOKEN):
+            beacon = ("<script defer src=\"https://static.cloudflareinsights.com/beacon.min.js\" "
+                      f"data-cf-beacon='{{\"token\":\"{CF_ANALYTICS_TOKEN}\"}}'></script>")
+            html = html.replace("</head>", beacon + "</head>")
+        return Response(html, mimetype="text/html")
 
     @app.route("/favicon.ico")
     @app.route("/favicon.png")
@@ -4300,6 +4584,48 @@ def make_app():
         con.close()
         meta = api_cache_put("status-meta", {"tracking_since": since, "total_rows": n})
         return jsonify({**_state, **meta})
+
+    @app.route("/api/analytics/heartbeat", methods=["POST"])
+    def analytics_heartbeat_route():
+        body = request.get_json(silent=True) or {}
+        online = analytics_heartbeat(body.get("visitor_id"), body.get("tab_id"),
+                                     body.get("tab"), body.get("load_ms"))
+        if online is None:
+            return jsonify({"ok": False, "error": "invalid analytics id"}), 400
+        return jsonify({"ok": True, "online": online,
+                        "window_sec": ANALYTICS_ONLINE_SEC})
+
+    @app.route("/api/analytics/leave", methods=["POST"])
+    def analytics_leave_route():
+        body = request.get_json(silent=True) or {}
+        return jsonify({"ok": True,
+                        "online": analytics_leave(body.get("visitor_id"), body.get("tab_id"))})
+
+    def admin_authorized():
+        if rate_limited("admin-auth", 30, 300):
+            return False
+        auth = request.authorization
+        return bool(auth and _analytics_admin_password and
+                    secrets.compare_digest(auth.password or "", _analytics_admin_password))
+
+    def admin_denied():
+        response = Response("Authentication required", status=401, mimetype="text/plain")
+        response.headers["WWW-Authenticate"] = 'Basic realm="KinScan Analytics"'
+        return response
+
+    @app.route("/admin/analytics")
+    def admin_analytics_page():
+        if not admin_authorized():
+            return admin_denied()
+        response = Response(ANALYTICS_HTML, mimetype="text/html")
+        response.headers["Cache-Control"] = "no-store"
+        return response
+
+    @app.route("/api/admin/analytics")
+    def admin_analytics_data():
+        if not admin_authorized():
+            return admin_denied()
+        return jsonify(analytics_stats(request.args.get("days", 30)))
 
     @app.route("/api/items")
     def items():
@@ -5972,6 +6298,11 @@ td.isd{cursor:help}
   border:1px solid var(--line);background:rgba(255,255,255,.03);font:600 12px var(--ui);user-select:none}
 .kpx .kpx-t{color:var(--gold2);font:700 10px var(--mono);letter-spacing:.06em}
 .kpx .kpx-v{color:#cdd9e6;font:600 13px var(--mono);border-radius:6px;padding:0 2px}
+.online-pill{display:inline-flex;align-items:center;gap:7px;min-height:34px;padding:7px 11px;
+  border:1px solid var(--line);border-radius:999px;background:rgba(255,255,255,.03);
+  color:#cdd9e6;font:600 12px var(--ui);white-space:nowrap;user-select:none}
+.online-dot{width:7px;height:7px;border-radius:50%;background:var(--buy);
+  box-shadow:0 0 8px rgba(52,211,154,.75);flex:0 0 7px}
 .srv-btn{display:inline-flex;align-items:center;gap:8px;padding:7px 12px;border-radius:999px;
   border:1px solid var(--line);background:rgba(255,255,255,.03);cursor:pointer;color:#cdd9e6;
   font:600 12px var(--ui);user-select:none;transition:border-color .12s,background .12s}
@@ -6513,6 +6844,7 @@ a{color:var(--gold2)}
   .kbtn kbd{display:none}
   .kpx{margin-left:auto;padding:6px 10px}
   .kpx .kpx-v{font-size:12px}
+  .online-pill{padding:6px 9px;font-size:11.5px}
   .srv{margin-left:0}
 
   /* content rhythm */
@@ -6790,6 +7122,9 @@ kbd{font:11px var(--mono);background:rgba(255,255,255,.06);border:1px solid var(
   <span class="live-upd"><i class="d"></i><span id="upd">live</span></span>
   <button class="kbtn" id="cmdkBtn" data-tip="Search items, sellers &amp; tabs">🔍 Search <kbd>⌘K</kbd></button>
   <div class="kpx" id="kpx" data-tip="live $KINS price (USD)"></div>
+  <div class="online-pill" data-tip="unique anonymous browsers active in the last 75 seconds">
+    <i class="online-dot"></i><span id="onlineCount">— online</span>
+  </div>
   <div class="srv" id="srv"></div>
 </div></header>
 <div class="cmdk" id="cmdk"><div class="cmdk-box">
@@ -6827,6 +7162,40 @@ const state={dir:"gold_to_kins", fee:0, goldItem:null, items:[], cats:[], labels
 const pageReq={};
 function beginPageLoad(tab){ pageReq[tab]=(pageReq[tab]||0)+1; return pageReq[tab]; }
 function pageLoadCurrent(tab,req){ return TAB===tab && pageReq[tab]===req; }
+function analyticsId(storage,key){
+  try{
+    let id=storage.getItem(key);
+    if(!id){ id=(globalThis.crypto&&crypto.randomUUID?crypto.randomUUID():Date.now().toString(36)+Math.random().toString(36).slice(2)); storage.setItem(key,id); }
+    return id;
+  }catch(e){ return Date.now().toString(36)+Math.random().toString(36).slice(2); }
+}
+const ANALYTICS_VISITOR=analyticsId(localStorage,"kinscan_visitor_v1");
+const ANALYTICS_TAB=analyticsId(sessionStorage,"kinscan_tab_v1");
+let analyticsBusy=false, analyticsLoadSent=false;
+
+async function analyticsHeartbeat(force){
+  if(analyticsBusy || (!force && document.visibilityState==="hidden")) return;
+  analyticsBusy=true;
+  let loadMs=null;
+  if(!analyticsLoadSent){
+    const nav=performance.getEntriesByType&&performance.getEntriesByType("navigation")[0];
+    if(nav&&Number.isFinite(nav.duration)) loadMs=Math.round(nav.duration);
+  }
+  try{
+    const r=await fetch("/api/analytics/heartbeat",{method:"POST",keepalive:true,
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({visitor_id:ANALYTICS_VISITOR,tab_id:ANALYTICS_TAB,tab:TAB,load_ms:loadMs})});
+    const d=await r.json();
+    if(d&&d.ok){ analyticsLoadSent=true; const el=$("#onlineCount");
+      if(el) el.textContent=(d.online||0)+" online"; }
+  }catch(e){/* presence is optional; never disturb the app */}
+  finally{ analyticsBusy=false; }
+}
+function analyticsLeave(){
+  if(!navigator.sendBeacon) return;
+  const body=JSON.stringify({visitor_id:ANALYTICS_VISITOR,tab_id:ANALYTICS_TAB});
+  navigator.sendBeacon("/api/analytics/leave",new Blob([body],{type:"application/json"}));
+}
 
 /* Commodities (materials/potions/food) trade in bulk — a single unit is a fraction of a
    cent and nobody sells one (the Solana fee dwarfs it), so we quote these per 1,000 units.
@@ -7098,7 +7467,7 @@ function gotoTab(t){
   document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x.dataset.t===t));
   TAB=t; state.propDetail=null; hideDeal(); hideSold();
   if(changed) $('#view').innerHTML=skel(7);   // never leave the previous page under a new active tab
-  fadeView(); render(); schedule();
+  fadeView(); render(); schedule(); analyticsHeartbeat(true);
 }
 function openCmdk(){ const o=$('#cmdk'); o.classList.add('on'); const i=$('#cmdkInput'); i.value=''; cmdkRender(''); i.focus(); }
 function closeCmdk(){ $('#cmdk').classList.remove('on'); }
@@ -9312,10 +9681,46 @@ $("#cmdkBtn").onclick=openCmdk;
 $("#cmdkInput").oninput=e=>cmdkRender(e.target.value);
 $("#cmdk").onclick=e=>{ if(e.target.id==="cmdk") closeCmdk(); };
 defineMorph($("#view"));   // flicker-free re-renders across every tab
-loadStatus(); loadServers(); loadKinsPx(); render(); schedule();
+loadStatus(); loadServers(); loadKinsPx(); analyticsHeartbeat(true); render(); schedule();
 setInterval(loadStatus,6000); setInterval(loadServers,30000); setInterval(loadKinsPx,30000);
+setInterval(()=>analyticsHeartbeat(false),25000);
+document.addEventListener("visibilitychange",()=>{ if(document.visibilityState==="visible") analyticsHeartbeat(true); });
+addEventListener("pagehide",analyticsLeave);
 </script>
 </body></html>"""
+
+
+ANALYTICS_HTML = r"""<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>KinScan Analytics</title>
+<style>
+:root{--bg:#09101b;--panel:#111b2a;--line:#26364c;--ink:#e8eef5;--mut:#8da2ba;--gold:#e8b54a;--green:#36d39a;--red:#f06a6a}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.5 system-ui,sans-serif;font-variant-numeric:tabular-nums}
+header{border-bottom:1px solid var(--line)}.head,main{width:min(1180px,calc(100% - 32px));margin:auto}.head{display:flex;align-items:center;gap:14px;padding:18px 0}
+h1{font-size:19px;margin:0;color:var(--gold)}.live{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 9px var(--green)}
+.sub{color:var(--mut);font-size:12px}.controls{margin-left:auto;display:flex;align-items:center;gap:8px}select{background:var(--panel);color:var(--ink);border:1px solid var(--line);padding:7px 10px;border-radius:6px}
+main{padding:24px 0 50px}.kpis{display:grid;grid-template-columns:repeat(5,1fr);border:1px solid var(--line);border-radius:7px;overflow:hidden}
+.kpi{padding:16px;border-right:1px solid var(--line);min-width:0}.kpi:last-child{border:0}.k{font-size:11px;color:var(--mut);text-transform:uppercase}.v{font-size:25px;font-weight:750;margin-top:3px}.v.green{color:var(--green)}
+section{margin-top:22px}h2{font-size:13px;letter-spacing:0;text-transform:uppercase;color:var(--mut);margin:0 0 10px}.chart{height:210px;display:flex;align-items:flex-end;gap:5px;border:1px solid var(--line);border-radius:7px;padding:18px 14px 28px;position:relative}
+.bar{flex:1;min-width:4px;background:var(--gold);border-radius:3px 3px 0 0;position:relative}.bar:hover{background:#f6d68a}.bar span{display:none;position:absolute;bottom:calc(100% + 6px);left:50%;transform:translateX(-50%);white-space:nowrap;background:#172337;border:1px solid var(--line);padding:4px 7px;border-radius:4px;font-size:11px;z-index:2}.bar:hover span{display:block}
+.bar i{position:absolute;top:calc(100% + 7px);left:50%;transform:translateX(-50%);font-style:normal;font-size:9px;color:var(--mut)}
+.cols{display:grid;grid-template-columns:.8fr 1.2fr;gap:18px}table{width:100%;border-collapse:collapse;border:1px solid var(--line);background:var(--panel)}th,td{padding:9px 11px;border-bottom:1px solid var(--line);text-align:left}th{font-size:10px;color:var(--mut);text-transform:uppercase}td.num,th.num{text-align:right}tr:last-child td{border:0}.err{color:var(--red)}
+.privacy{margin-top:24px;padding:12px 14px;border-left:3px solid var(--green);background:var(--panel);color:var(--mut);font-size:12px}
+@media(max-width:760px){.kpis{grid-template-columns:1fr 1fr}.kpi{border-bottom:1px solid var(--line)}.cols{grid-template-columns:1fr}.head{flex-wrap:wrap}.controls{margin-left:0}.chart{overflow-x:auto}.bar{flex:0 0 16px}}
+</style></head><body>
+<header><div class="head"><span class="live"></span><div><h1>KinScan Analytics</h1><div class="sub">Private first-party usage and performance</div></div><div class="controls"><label for="days" class="sub">Window</label><select id="days"><option value="7">7 days</option><option value="30" selected>30 days</option><option value="90">90 days</option></select><span class="sub" id="updated"></span></div></div></header>
+<main><div class="kpis" id="kpis"></div><section><h2>Daily visitors</h2><div class="chart" id="chart"></div></section><div class="cols"><section><h2>Most-used tabs</h2><div id="tabs"></div></section><section><h2>API health</h2><div id="apis"></div></section></div><div class="privacy">Anonymous by design: KinScan stores only a one-way hash of a random browser ID. It does not store analytics IP addresses, player names, wallets, or marketplace searches.</div></main>
+<script>
+const $=s=>document.querySelector(s),num=v=>Number(v||0).toLocaleString(),ms=v=>v==null?'—':Math.round(v)+' ms';
+function table(head,rows){return '<table><thead><tr>'+head.map(x=>'<th class="'+(x.n?'num':'')+'">'+x.l+'</th>').join('')+'</tr></thead><tbody>'+rows.join('')+'</tbody></table>'}
+async function load(){const days=$('#days').value;let d;try{d=await(await fetch('/api/admin/analytics?days='+days,{cache:'no-store'})).json()}catch(e){return}const r=d.ranges||{},today=r.today||{},d7=r.d7||{},d30=r.d30||{};
+$('#kpis').innerHTML=[['Online now',d.online,'green'],['Visitors today',today.visitors],['Visitors 7d',d7.visitors],['Visitors 30d',d30.visitors],['Avg load',ms(d.avg_client_load_ms)]].map(x=>'<div class="kpi"><div class="k">'+x[0]+'</div><div class="v '+(x[2]||'')+'">'+(typeof x[1]==='number'?num(x[1]):x[1])+'</div></div>').join('');
+const daily=d.daily||[],mx=Math.max(1,...daily.map(x=>x.visitors||0));$('#chart').innerHTML=daily.map(x=>'<div class="bar" style="height:'+Math.max(2,(x.visitors||0)/mx*100)+'%"><span>'+x.day+' · '+num(x.visitors)+' visitors · '+num(x.sessions)+' sessions</span><i>'+x.day.slice(5)+'</i></div>').join('');
+$('#tabs').innerHTML=table([{l:'Tab'},{l:'Views',n:1}],(d.tabs||[]).slice(0,15).map(x=>'<tr><td>'+x.tab+'</td><td class="num">'+num(x.views)+'</td></tr>'));
+$('#apis').innerHTML=table([{l:'Endpoint'},{l:'Requests',n:1},{l:'Avg',n:1},{l:'Errors',n:1}],(d.apis||[]).slice(0,18).map(x=>'<tr><td>'+x.endpoint+'</td><td class="num">'+num(x.requests)+'</td><td class="num">'+ms(x.avg_ms)+'</td><td class="num '+(x.errors?'err':'')+'">'+num(x.errors)+'</td></tr>'));
+$('#updated').textContent='updated '+new Date(d.generated_at).toLocaleTimeString();}
+$('#days').onchange=load;load();setInterval(load,15000);
+</script></body></html>"""
 
 
 def main():
@@ -9330,9 +9735,14 @@ def main():
                     help="bind address (use 0.0.0.0 when hosted; env KINTARA_HOST)")
     ap.add_argument("--gold-item", help="itemType that represents tradeable gold")
     ap.add_argument("--no-browser", action="store_true")
+    ap.add_argument("--show-analytics-password", action="store_true",
+                    help="print the private analytics dashboard password and exit")
     args = ap.parse_args()
 
     init_db()
+    if args.show_analytics_password:
+        print(_analytics_admin_password)
+        return
     if args.gold_item:
         con = connect(); set_setting(con, "gold_item", args.gold_item); con.close()
 
@@ -9347,6 +9757,8 @@ def main():
 
     threading.Thread(target=prime_request_caches, args=(app,), daemon=True,
                      name="public-cache-warmup").start()
+    threading.Thread(target=analytics_flush_loop, daemon=True,
+                     name="analytics-flush").start()
     threading.Thread(target=poll_loop, args=(LISTING_GAP,), daemon=True).start()  # tiered per-item refresher
     threading.Thread(target=firstpage_loop, args=(args.firstpage_interval,), daemon=True).start()  # fast page-1 capture
     threading.Thread(target=stats_loop, daemon=True).start()
@@ -9363,11 +9775,23 @@ def main():
     _boss_census.start()    # boss-area census for the server bubble (resolves the region key)
     hosted = args.host not in ("127.0.0.1", "localhost")
     url = f"http://{'127.0.0.1' if not hosted else args.host}:{args.port}"
-    print(f"Dashboard: {url}   (per-item refresh {LISTING_GAP}s gap · page-1 poll "
-          f"{args.firstpage_interval}s · event-driven sales · kintara min-gap {KINTARA_MIN_GAP}s; Ctrl+C to stop)")
+    print(f"Dashboard: {url}   (Waitress {WEB_THREADS} threads · per-item refresh "
+          f"{LISTING_GAP}s gap · page-1 poll {args.firstpage_interval}s · event-driven sales · "
+          f"kintara min-gap {KINTARA_MIN_GAP}s; Ctrl+C to stop)")
     if not args.no_browser and not hosted:
         threading.Timer(1.0, lambda: webbrowser.open(url)).start()
-    app.run(host=args.host, port=args.port, threaded=True)
+    try:
+        from waitress import serve
+        waitress_args = {"host": args.host, "port": args.port, "threads": WEB_THREADS}
+        if TRUSTED_PROXY:
+            waitress_args.update(
+                trusted_proxy=TRUSTED_PROXY,
+                trusted_proxy_headers={"x-forwarded-for", "x-forwarded-host", "x-forwarded-proto"},
+                clear_untrusted_proxy_headers=True)
+        serve(app, **waitress_args)
+    except ImportError:
+        print("waitress is not installed; using Flask's local development server")
+        app.run(host=args.host, port=args.port, threaded=True)
 
 
 if __name__ == "__main__":

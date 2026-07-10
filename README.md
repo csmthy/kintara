@@ -19,13 +19,14 @@ single-page web dashboard. Runs locally or as a hosted site.
 ## Run
 
 ```bash
-pip install flask requests websockets   # websockets is optional — only the Live World tab needs it
-python kintara_tracker.py            # dashboard at http://127.0.0.1:8765
+pip install -r requirements.txt
+python kintara_tracker.py             # dashboard at http://127.0.0.1:8765
 ```
 
 CLI flags: `--interval <s>` (listing poll seconds, default **90**), `--port <n>`
 (default 8765), `--host <addr>` (bind address; `0.0.0.0` when hosted), `--gold-item
-<itemType>` (override the gold item), `--no-browser`.
+<itemType>` (override the gold item), `--no-browser`, and `--show-analytics-password`
+(print the private analytics dashboard password and exit).
 
 **Env-tunable cadence + politeness** (defaults are 24/7-friendly; flags override env):
 `KINTARA_DB` (DB path — point at a volume when hosted),
@@ -40,6 +41,11 @@ kintara.gg requests, a shared pacer across all loops ⇒ ≈ ≤2 req/s total),
 `KINTARA_BACKOFF` (45 — pause after a 429/403), `STATS_STALE_HOT`/`STATS_STALE_COLD`
 (120/900 — per-item stats refresh cadence). All kintara.gg requests go through
 `pace_kintara()` so it can run continuously without bursting the marketplace.
+Web serving/analytics: `WEB_THREADS` (8 Waitress request threads),
+`KINSCAN_TRUSTED_PROXY` (trusted reverse-proxy IP; `127.0.0.1` on the Droplet),
+`ANALYTICS_ONLINE_SEC` (75), `ANALYTICS_FLUSH_SEC` (15),
+`KINSCAN_ADMIN_PASSWORD` (optional private analytics password; generated and persisted if unset),
+and `CLOUDFLARE_WEB_ANALYTICS_TOKEN` (optional free Cloudflare Web Analytics site token).
 Historical-pipeline cadence (all DB-local, no kintara request): `SNAPSHOT_INTERVAL` (300 — order-book
 snapshot tick), `SNAPSHOT_RETENTION_DAYS` (14 — prune raw snapshots after roll-up), `MERCHANT_SNAP_INTERVAL`
 (300 — merchant campaign snapshot tick).
@@ -48,8 +54,9 @@ snapshot tick), `SNAPSHOT_RETENTION_DAYS` (14 — prune raw snapshots after roll
 *and* runs the DB-building loops), so serverless (Vercel/etc.) won't work — use an
 always-on container/VM with a persistent volume (Fly.io / Railway / Oracle free VM).
 Ships a `Dockerfile`, `requirements.txt`, `.dockerignore`. Run as the single
-`python kintara_tracker.py` process — **not** gunicorn (the loops are threads in `main()`;
-forking workers would multiply the pollers).
+`python kintara_tracker.py` process — it serves requests through Waitress's thread pool.
+Do **not** add gunicorn/multiple worker processes: the loops are threads in `main()` and
+forking workers would multiply the pollers.
 
 **Publishing updates:** from the Mac repo, run `bash deploy/publish.sh "what changed"`.
 It stages/commits local changes, pushes `main`, SSHes to the DigitalOcean Droplet, and
@@ -229,6 +236,12 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
   1KB is gzip-compressed when supported. Cache-producing endpoints are single-flight, so a cache
   expiry cannot make concurrent visitors repeat the same SQLite aggregate. Upstream latency is no
   longer visitor latency.
+- **Anonymous site analytics:** each browser creates a random local ID; the server retains only a
+  one-way hash, never analytics IPs, wallets, player names, or searches. A heartbeat every 25s powers
+  the header's unique-browser online count (75s activity window, multiple tabs deduplicated). Daily
+  visitors, visits, tab views, client load time, and API request/latency/error aggregates flush to
+  SQLite every ~15s. The password-protected dashboard is `/admin/analytics`; Cloudflare Web Analytics
+  can be layered on with its optional free site token, but is not required.
 - **Item icons** download once to `icons_cache/`, then serve from disk. Uncached discovery is
   asynchronous (2 workers); misses are browser-cached briefly and server-negative-cached for 1h.
 
@@ -294,6 +307,10 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
   live order book), `gold_rate`. Drives the Merchant tab's forecast.
 - **`polls`** — one row per listing poll (ts, active, removed, ok).
 - **`settings`** — key/value (notably `gold_item`).
+- **`analytics_visitors`** — one privacy-preserving row per `(UTC day, hashed anonymous browser)`:
+  first/last seen and visit count. The raw browser ID and visitor IP are never stored.
+- **`analytics_daily`** — small daily aggregate counters keyed by `(day, metric, dimension)` for tab
+  usage, client load time, and API request count/latency/errors. Live presence is memory-only.
 
 Schema migrations are handled inline in `init_db()` (ALTER + backfill for older DBs).
 
@@ -354,6 +371,11 @@ distills it into a small, indexed **`market.db`** that the website actually serv
   identity assets for the hosted KinScan brand. The favicon/apple icon use the real
   Kintara gold HUD icon through the same disk cache as `/icon/gold`.
 - `GET /api/status` — poller state, tracking-since, row count.
+- `POST /api/analytics/heartbeat` — anonymous browser/tab heartbeat; returns the current deduplicated
+  online count. `POST /api/analytics/leave` removes a closing tab immediately.
+- `GET /admin/analytics` and `GET /api/admin/analytics?days=7|30|90` — Basic-auth-protected private
+  usage/performance dashboard and its aggregate data. Password comes from `KINSCAN_ADMIN_PASSWORD` or
+  the persistent generated `settings.analytics_admin_password` value.
 - `GET /api/market-watch` — whole-market on-chain stats for the **Market Watch** home page,
   aggregated live from the compact `market.db` (~95k treasury-derived txns, each priced in USD at
   the KINS/USD of the trade's own minute). **Trading volume = the `marketplace` category ONLY;** the
@@ -830,6 +852,13 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Free first-party analytics + live visitor count + production request concurrency.** Added a
+  compact header bubble showing unique anonymous browsers active in the last 75s, deduplicated across
+  tabs. Privacy-preserving daily visitor/visit/tab and performance aggregates are batched into SQLite,
+  with a Basic-auth private dashboard at `/admin/analytics`; no IP, wallet, player name, or search is
+  stored. Added conservative per-IP API limits, switched the single collector process from Flask's dev
+  server to an 8-thread Waitress server behind the existing Caddy proxy, and added an optional free
+  Cloudflare Web Analytics token hook. No new paid service is required.
 - **Load-time + tab reliability overhaul.** Fixed the race behind "new tab highlighted, old page
   still visible": tab navigation now paints a skeleton immediately and every async top-level loader
   carries a request generation, so a late response from Index/Arbitrage/Merchant/Market Watch/etc.

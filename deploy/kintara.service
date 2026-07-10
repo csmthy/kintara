@@ -15,6 +15,11 @@ Environment=KINTARA_HOST=0.0.0.0
 # the app listens on 8765; Caddy (added with your domain) fronts it on 80/443 for HTTPS.
 # Before the domain step you can reach it directly at http://<DROPLET_IP>:8765 to verify.
 Environment=PORT=8765
+# One Waitress process keeps the background collectors single-instance; request
+# concurrency comes from threads, not multiple worker processes.
+Environment=WEB_THREADS=8
+# Only Caddy on this Droplet is trusted to supply the real visitor IP/scheme.
+Environment=KINSCAN_TRUSTED_PROXY=127.0.0.1
 # 24/7 politeness (tweak if you ever see 403/429 in the logs)
 Environment=POLL_INTERVAL=90
 Environment=KINTARA_MIN_GAP=0.5
@@ -22,6 +27,8 @@ Environment=KINTARA_MIN_GAP=0.5
 # Put your ntfy topic here for the merchant donation-drive phone alert, e.g.:
 #   NOTIFY_NTFY_TOPIC=your-secret-topic
 #   KINTARA_PUBLIC_URL=https://your-domain   (optional tap-through link in the push)
+#   KINSCAN_ADMIN_PASSWORD=choose-a-private-analytics-password   (optional; auto-generated otherwise)
+#   CLOUDFLARE_WEB_ANALYTICS_TOKEN=your-free-site-token          (optional)
 # The leading '-' makes the file optional, so the service still starts if it's absent.
 EnvironmentFile=-/opt/kintara-data/kinscan.env
 ExecStart=/opt/kintara/venv/bin/python /opt/kintara/kintara_tracker.py --no-browser
