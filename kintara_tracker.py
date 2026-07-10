@@ -35,8 +35,10 @@ Run:
 """
 
 import argparse
+import gzip
 import json
 import os
+import queue
 import re
 import sqlite3
 import threading
@@ -390,6 +392,85 @@ GOLD_RANGES = {
 PAGE = 100
 MAX_PAGES = 400          # headroom: 40k-listing ceiling so a growing book can't hit the cap again
 HTTP_TIMEOUT = 20
+# Visitor-facing reads should fail fast and keep serving last-good data. The longer
+# timeout above is reserved for background collectors, where waiting is preferable
+# to dropping a market observation.
+PUBLIC_HTTP_TIMEOUT = (3.05, 6)
+
+_refresh_lock = threading.Lock()
+_refreshing = set()
+_api_cache_lock = threading.Lock()
+_api_payload_cache = {}
+_endpoint_locks = defaultdict(threading.Lock)
+_icon_job_lock = threading.Lock()
+_icon_jobs = set()
+_icon_retry_after = {}
+_icon_queue = queue.Queue()
+
+
+def _icon_worker():
+    while True:
+        job = _icon_queue.get()
+        try:
+            job()
+        except Exception:
+            pass
+        finally:
+            _icon_queue.task_done()
+
+
+for _icon_worker_num in range(2):
+    threading.Thread(target=_icon_worker, daemon=True,
+                     name=f"icon-fetch-{_icon_worker_num + 1}").start()
+
+
+def refresh_once(key, fn):
+    """Run one daemon refresh per key; request threads keep serving stale data."""
+    with _refresh_lock:
+        if key in _refreshing:
+            return False
+        _refreshing.add(key)
+
+    def run():
+        try:
+            fn()
+        except Exception:
+            pass
+        finally:
+            with _refresh_lock:
+                _refreshing.discard(key)
+
+    threading.Thread(target=run, daemon=True, name=f"refresh-{key}").start()
+    return True
+
+
+def api_cache_get(key, ttl):
+    with _api_cache_lock:
+        hit = _api_payload_cache.get(key)
+        if hit and time.time() - hit[0] < ttl:
+            return hit[1]
+    return None
+
+
+def api_cache_put(key, payload):
+    with _api_cache_lock:
+        _api_payload_cache[key] = (time.time(), payload)
+    return payload
+
+
+def single_flight(name):
+    """Serialize a cache-producing endpoint so an expiry cannot stampede SQLite."""
+    def decorate(fn):
+        lock = _endpoint_locks[name]
+
+        def wrapped(*args, **kwargs):
+            with lock:
+                return fn(*args, **kwargs)
+
+        wrapped.__name__ = fn.__name__
+        wrapped.__doc__ = fn.__doc__
+        return wrapped
+    return decorate
 
 
 def now_iso() -> str:
@@ -420,10 +501,11 @@ def day_end_ms(day: str):
 def connect(readonly: bool = False) -> sqlite3.Connection:
     if readonly:
         con = sqlite3.connect(f"file:{DB_PATH}?mode=ro", uri=True, timeout=10)
+        con.execute("PRAGMA query_only=ON;")
     else:
         con = sqlite3.connect(DB_PATH, timeout=30)
+        con.execute("PRAGMA journal_mode=WAL;")
     con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL;")
     return con
 
 
@@ -592,6 +674,10 @@ def init_db() -> None:
         CREATE INDEX IF NOT EXISTS idx_category ON listings(category);
         CREATE INDEX IF NOT EXISTS idx_active   ON listings(active);
         CREATE INDEX IF NOT EXISTS idx_removed  ON listings(removed_at);
+        CREATE INDEX IF NOT EXISTS idx_l_active_created
+            ON listings(active, created_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_l_active_unit
+            ON listings(active, unit_price);
 
         CREATE TABLE IF NOT EXISTS polls (
             ts TEXT, active INTEGER, removed INTEGER, ok INTEGER
@@ -624,6 +710,8 @@ def init_db() -> None:
         );
         CREATE INDEX IF NOT EXISTS idx_sd_item ON sales_daily(item_type, currency);
         CREATE INDEX IF NOT EXISTS idx_sd_date ON sales_daily(date);
+        CREATE INDEX IF NOT EXISTS idx_sd_date_item_cur
+            ON sales_daily(date, item_type, currency);
 
         -- our own directly-measured gold price series. The gold_price_loop writes
         -- one row every ~3 min = average per-gold USD ask of the 3 cheapest live
@@ -827,7 +915,11 @@ def init_db() -> None:
         except Exception as e:
             print(f"[{now_iso()}] sales purge v2 error: {e}")
     con.execute("CREATE INDEX IF NOT EXISTS idx_l_sold ON listings(item_type,currency,sold_claimed,removed_at)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_l_active_item_cur_unit "
+                "ON listings(active,item_type,currency,per_unit)")
     con.execute("CREATE INDEX IF NOT EXISTS idx_se_item_day ON sales_events(item_type,currency,day)")
+    con.execute("CREATE INDEX IF NOT EXISTS idx_se_feed ON sales_events(ts DESC) "
+                "WHERE listing_id IS NOT NULL")
     con.execute(
         "UPDATE listings SET per_unit = unit_price*1.0/quantity "
         "WHERE per_unit IS NULL AND quantity > 0 AND unit_price IS NOT NULL")
@@ -1274,7 +1366,7 @@ def fetch_kins_ohlcv(timeframe="day", aggregate=1, limit=1000, before=None):
         params["before_timestamp"] = int(before)
     r = requests.get(f"{GECKO_OHLCV}/{timeframe}", params=params,
                      headers={"User-Agent": BROWSER_UA, "Accept": "application/json"},
-                     timeout=HTTP_TIMEOUT)
+                     timeout=PUBLIC_HTTP_TIMEOUT)
     r.raise_for_status()
     lst = (r.json().get("data", {}).get("attributes", {}).get("ohlcv_list") or [])
     out = [(row[0], row[4]) for row in lst]
@@ -1285,25 +1377,30 @@ def fetch_kins_ohlcv(timeframe="day", aggregate=1, limit=1000, before=None):
 _KINS_DAILY_CACHE = {"ts": 0, "map": {}}
 
 
-def kins_daily_usd():
-    """{ 'YYYY-MM-DD' (UTC): KINS close USD } for the last ~1000 days of daily
-    candles. Cached ~5 min. Lets us re-price an item's daily USD sale history in
-    $KINS (item_usd / kins_usd) to separate item alpha from token beta."""
-    import time as _t
-    if _t.time() - _KINS_DAILY_CACHE["ts"] < 300 and _KINS_DAILY_CACHE["map"]:
-        return _KINS_DAILY_CACHE["map"]
-    try:
-        rows = fetch_kins_ohlcv("day", 1, 1000)
-    except Exception:
-        return _KINS_DAILY_CACHE["map"]
+def _refresh_kins_daily():
+    rows = fetch_kins_ohlcv("day", 1, 1000)
     m = {}
     for ts, close in rows:
         if close and close > 0:
             m[datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d")] = close
     if m:
-        _KINS_DAILY_CACHE["map"] = m
-        _KINS_DAILY_CACHE["ts"] = _t.time()
-    return m
+        _KINS_DAILY_CACHE.update(ts=time.time(), map=m)
+    return _KINS_DAILY_CACHE["map"]
+
+
+def kins_daily_usd():
+    """{ 'YYYY-MM-DD' (UTC): KINS close USD } for the last ~1000 days of daily
+    candles. Cached ~5 min. Lets us re-price an item's daily USD sale history in
+    $KINS (item_usd / kins_usd) to separate item alpha from token beta."""
+    now = time.time()
+    if _KINS_DAILY_CACHE["map"]:
+        if now - _KINS_DAILY_CACHE["ts"] >= 300:
+            refresh_once("kins-daily", _refresh_kins_daily)
+        return _KINS_DAILY_CACHE["map"]
+    try:
+        return _refresh_kins_daily()
+    except Exception:
+        return _KINS_DAILY_CACHE["map"]
 
 
 def item_index_meta(con, item_type: str) -> dict:
@@ -1438,6 +1535,14 @@ def kins_series_for_range(window_sec, bucket_sec):
 _kins_intraday_cache = {}   # bucket_sec -> (fetched_at, [(t_ms, price)])
 
 
+def _refresh_kins_intraday(window_sec, bucket_sec):
+    candles = kins_series_for_range(window_sec, bucket_sec)
+    ms = [(int(t * 1000), c) for t, c in candles if c and c > 0]
+    if ms:
+        _kins_intraday_cache[bucket_sec] = (time.time(), ms)
+    return ms
+
+
 def kins_intraday_ms(window_sec, bucket_sec):
     """KINS USD price as [(t_ms, price)] over the window at bucket resolution, for
     converting a high-resolution series to $KINS at the price PREVAILING AT EACH TICK
@@ -1445,37 +1550,43 @@ def kins_intraday_ms(window_sec, bucket_sec):
     Cached ~3 min per bucket so opening several item charts doesn't hammer GeckoTerminal."""
     now = time.time()
     hit = _kins_intraday_cache.get(bucket_sec)
-    if hit and now - hit[0] < 180:
+    if hit:
+        if now - hit[0] >= 180:
+            refresh_once(f"kins-intraday-{bucket_sec}",
+                         lambda: _refresh_kins_intraday(window_sec, bucket_sec))
         return hit[1]
     try:
-        candles = kins_series_for_range(window_sec, bucket_sec)
-        ms = [(int(t * 1000), c) for t, c in candles if c and c > 0]
+        return _refresh_kins_intraday(window_sec, bucket_sec)
     except Exception:
-        ms = []
-    if ms:
-        _kins_intraday_cache[bucket_sec] = (now, ms)
-    return ms
+        return []
 
 
 _kins_px_cache = {"at": 0, "px": None}
+
+
+def _refresh_kins_px():
+    import requests
+    r = requests.get("https://kintara.gg/api/token/blimp-stats",
+                     headers={"User-Agent": BROWSER_UA}, timeout=PUBLIC_HTTP_TIMEOUT)
+    r.raise_for_status()
+    px = (r.json() or {}).get("priceUsd")
+    if px:
+        _kins_px_cache.update(at=time.time(), px=px)
+    return _kins_px_cache["px"]
 
 
 def current_kins_usd():
     """Live KINS price in USD (kintara's own figure, matches the index page).
     Cached ~2 min."""
     now = time.time()
-    if _kins_px_cache["px"] and now - _kins_px_cache["at"] < 120:
+    if _kins_px_cache["px"]:
+        if now - _kins_px_cache["at"] >= 120:
+            refresh_once("kins-price", _refresh_kins_px)
         return _kins_px_cache["px"]
     try:
-        import requests
-        r = requests.get("https://kintara.gg/api/token/blimp-stats",
-                         headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
-        px = (r.json() or {}).get("priceUsd")
-        if px:
-            _kins_px_cache.update(at=now, px=px)
+        return _refresh_kins_px()
     except Exception:
-        pass
-    return _kins_px_cache["px"]
+        return _kins_px_cache["px"]
 
 
 # ---------------------------------------------------------------------------
@@ -1795,16 +1906,19 @@ _kgold_cache = {"at": 0, "data": None, "spot": None}
 _goldhist_cache = {}   # range -> (ts, payload), ~3 min TTL (avoids gecko rate limits)
 
 
-def fetch_kintara_gold_history():
+def fetch_kintara_gold_history(force=False):
     """Rip kintaragold.xyz's own gold-USD price history (embedded in its page as
     {"history":[{t,price}],"spotPriceUsd":..}). Returns (sorted [(t_ms, usd)], spot).
     This is an independent gold price series (not derived from KINS), which is
     what lets KINS/gold actually move. Cached ~3 min."""
     import requests
     now = time.time()
-    if _kgold_cache["data"] and now - _kgold_cache["at"] < 180:
+    if _kgold_cache["data"] and not force:
+        if now - _kgold_cache["at"] >= 180:
+            refresh_once("kintara-gold", lambda: fetch_kintara_gold_history(True))
         return _kgold_cache["data"], _kgold_cache["spot"]
-    r = requests.get(KINTARAGOLD_URL, headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
+    r = requests.get(KINTARAGOLD_URL, headers={"User-Agent": BROWSER_UA},
+                     timeout=PUBLIC_HTTP_TIMEOUT)
     r.raise_for_status()
     html = r.text
     # the series lives in the (escaped) RSC payload and can straddle chunk
@@ -2337,6 +2451,43 @@ def gold_series_for_chart(con):
     return kg, spot
 
 
+def refresh_gold_history(rng="1D"):
+    """Build one chart payload outside Flask so it can be warmed in the background."""
+    rng = rng if rng in GOLD_RANGES else "1D"
+    window_sec, bucket_sec = GOLD_RANGES[rng]
+    con = connect(readonly=True)
+    try:
+        gold, spot = gold_series_for_chart(con)
+    finally:
+        con.close()
+    if not gold:
+        raise RuntimeError("no gold price data yet")
+    candles = kins_series_for_range(window_sec, bucket_sec)
+    gstart = gold[0][0]
+    series = []
+    for ts, ku in candles:
+        tms = ts * 1000
+        if tms < gstart:
+            continue
+        gu = interp_gold(gold, tms)
+        series.append({"t": int(tms), "gold_usd": gu, "kins_usd": ku,
+                       "kins_per_gold": (gu / ku) if (gu and ku) else None})
+    payload = {"ok": True, "range": rng, "spot": spot, "series": series}
+    _goldhist_cache[rng] = (time.time(), payload)
+    return payload
+
+
+def prime_public_caches():
+    """Warm network-backed visitor data after startup; failures remain last-good."""
+    for fn in (current_kins_usd, fetch_servers, fetch_merchant,
+               fetch_property_status, fetch_kintara_gold_history,
+               lambda: refresh_gold_history("1D"), kins_daily_usd):
+        try:
+            fn()
+        except Exception:
+            pass
+
+
 # ---------------------------------------------------------------------------
 # Historical order-book pipeline (Substrate A + B)
 #   snapshot_loop  -> orderbook_snapshots  (the market's shape over time)
@@ -2530,30 +2681,35 @@ _merchant_cache = {"at": 0, "data": None}
 _property_cache = {"at": 0, "data": None}
 
 
-def fetch_servers():
+def fetch_servers(force=False):
     """kintara.gg's live server list (name, populationLabel, full, queueLength,
     minLevel). Cached ~30s; raises on a cold failure (caller serves last-good)."""
     import requests
     now = time.time()
-    if _servers_cache["data"] and now - _servers_cache["at"] < 30:
+    if _servers_cache["data"] and not force:
+        if now - _servers_cache["at"] >= 30:
+            refresh_once("servers", lambda: fetch_servers(True))
         return _servers_cache["data"]
-    r = requests.get(SERVERS_URL, headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
+    r = requests.get(SERVERS_URL, headers={"User-Agent": BROWSER_UA},
+                     timeout=PUBLIC_HTTP_TIMEOUT)
     r.raise_for_status()
     servers = (r.json() or {}).get("servers") or []
     _servers_cache.update(at=now, data=servers)
     return servers
 
 
-def fetch_merchant():
+def fetch_merchant(force=False):
     """kintara.gg's traveling-merchant campaign state (the same public endpoint the
     game client reads). Cached ~60s; serves last-good on failure."""
     import requests
     now = time.time()
-    if _merchant_cache["data"] and now - _merchant_cache["at"] < 60:
+    if _merchant_cache["data"] and not force:
+        if now - _merchant_cache["at"] >= 60:
+            refresh_once("merchant", lambda: fetch_merchant(True))
         return _merchant_cache["data"]
     try:
         r = requests.get(MERCHANT_URL, headers={"User-Agent": BROWSER_UA},
-                         timeout=HTTP_TIMEOUT)
+                         timeout=PUBLIC_HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json() or {}
         _merchant_cache.update(at=now, data=data)
@@ -2943,16 +3099,18 @@ def merchant_forecast(con, gold_rate):
     }
 
 
-def fetch_property_status():
+def fetch_property_status(force=False):
     """kintara.gg's public property ownership board (mansions/houses/trailers →
     ownerName, ownerId, sold, locked). Cached ~30s, last-good on failure."""
     import requests
     now = time.time()
-    if _property_cache["data"] and now - _property_cache["at"] < 30:
+    if _property_cache["data"] and not force:
+        if now - _property_cache["at"] >= 30:
+            refresh_once("property", lambda: fetch_property_status(True))
         return _property_cache["data"]
     try:
         r = requests.get(PROPERTY_STATUS_URL, headers={"User-Agent": BROWSER_UA},
-                         timeout=HTTP_TIMEOUT)
+                         timeout=PUBLIC_HTTP_TIMEOUT)
         r.raise_for_status()
         data = r.json() or {}
         _property_cache.update(at=now, data=data)
@@ -4020,15 +4178,75 @@ def make_app():
     from flask import Flask, jsonify, request, Response, send_file
     app = Flask(__name__)
 
+    @app.after_request
+    def compress_response(response):
+        """Compress the large embedded app shell and JSON tables on the wire."""
+        accept = request.headers.get("Accept-Encoding", "")
+        ctype = response.headers.get("Content-Type", "")
+        if ("gzip" not in accept.lower() or response.direct_passthrough or
+                response.status_code < 200 or response.status_code >= 300 or
+                response.headers.get("Content-Encoding") or
+                not (ctype.startswith("application/json") or ctype.startswith("text/"))):
+            return response
+        data = response.get_data()
+        if len(data) < 1024:
+            return response
+        packed = gzip.compress(data, compresslevel=5)
+        if len(packed) >= len(data):
+            return response
+        response.set_data(packed)
+        response.headers["Content-Encoding"] = "gzip"
+        response.headers["Content-Length"] = str(len(packed))
+        response.headers.add("Vary", "Accept-Encoding")
+        return response
+
     def _icon_send(fp, ext):
         return send_file(os.path.abspath(fp),
                          mimetype="image/svg+xml" if ext == "svg" else f"image/{ext}",
                          max_age=604800)
 
-    def _serve_cached_icon(item_type, status_on_error=502):
+    def _queue_icon_download(item_type, prefix, cands):
+        now = time.time()
+        with _icon_job_lock:
+            if item_type in _icon_jobs or now < _icon_retry_after.get(item_type, 0):
+                return
+            _icon_jobs.add(item_type)
+
+        def download():
+            ok = False
+            try:
+                import requests
+                for rel in cands:
+                    ext = rel.rsplit(".", 1)[-1]
+                    try:
+                        r = requests.get(f"https://kintara.gg/assets/hud/{rel}",
+                                         headers={"User-Agent": BROWSER_UA},
+                                         timeout=PUBLIC_HTTP_TIMEOUT)
+                        if r.status_code != 200 or not r.content:
+                            continue
+                        fp = os.path.join(ICON_DIR, f"{prefix}.{ext}")
+                        tmp = fp + ".tmp"
+                        with open(tmp, "wb") as f:
+                            f.write(r.content)
+                        os.replace(tmp, fp)
+                        ok = True
+                        break
+                    except Exception:
+                        continue
+            finally:
+                with _icon_job_lock:
+                    _icon_jobs.discard(item_type)
+                    if ok:
+                        _icon_retry_after.pop(item_type, None)
+                    else:
+                        _icon_retry_after[item_type] = time.time() + 3600
+
+        _icon_queue.put(download)
+
+    def _serve_cached_icon(item_type, status_on_error=404):
         """Serve real Kintara HUD art, resolved by trying each candidate path and caching
-        the first that exists. Pets/furniture get a fresh cache namespace (`__art`) so the
-        old generic-paw files don't shadow the real per-item art."""
+        the first that exists. A cache miss queues bounded background discovery and returns
+        immediately, so guessed/missing art can never occupy a visitor request thread."""
         cands = icon_candidates(item_type)
         if not cands:
             return Response(status=404)
@@ -4039,22 +4257,10 @@ def make_app():
             fp = os.path.join(ICON_DIR, f"{prefix}.{ext}")
             if os.path.exists(fp):
                 return _icon_send(fp, ext)
-        import requests
-        for rel in cands:
-            ext = rel.rsplit(".", 1)[-1]
-            try:
-                pace_kintara()
-                r = requests.get(f"https://kintara.gg/assets/hud/{rel}",
-                                 headers={"User-Agent": BROWSER_UA}, timeout=HTTP_TIMEOUT)
-                if r.status_code != 200 or not r.content:
-                    continue
-                fp = os.path.join(ICON_DIR, f"{prefix}.{ext}")
-                with open(fp, "wb") as f:
-                    f.write(r.content)
-                return _icon_send(fp, ext)
-            except Exception:
-                continue
-        return Response(status=status_on_error)
+        _queue_icon_download(item_type, prefix, cands)
+        response = Response(status=status_on_error)
+        response.headers["Cache-Control"] = "public, max-age=300"
+        return response
 
     @app.route("/")
     def index():
@@ -4085,14 +4291,21 @@ def make_app():
 
     @app.route("/api/status")
     def status():
+        cached = api_cache_get("status-meta", 60)
+        if cached is not None:
+            return jsonify({**_state, **cached})
         con = connect(readonly=True)
         since = con.execute("SELECT MIN(first_seen) m FROM listings").fetchone()["m"]
         n = con.execute("SELECT COUNT(*) c FROM listings").fetchone()["c"]
         con.close()
-        return jsonify({**_state, "tracking_since": since, "total_rows": n})
+        meta = api_cache_put("status-meta", {"tracking_since": since, "total_rows": n})
+        return jsonify({**_state, **meta})
 
     @app.route("/api/items")
     def items():
+        cached = api_cache_get("items", 300)
+        if cached is not None:
+            return jsonify(cached)
         con = connect(readonly=True)
         rows = [r["item_type"] for r in con.execute(
             "SELECT DISTINCT item_type FROM listings ORDER BY item_type")]
@@ -4102,10 +4315,12 @@ def make_app():
         gold_item = get_setting(con, "gold_item")
         con.close()
         labels = {it: item_label(it) for it in rows}
-        return jsonify({"items": rows, "categories": cats,
-                        "labels": labels, "gold_item": gold_item})
+        payload = {"items": rows, "categories": cats,
+                   "labels": labels, "gold_item": gold_item}
+        return jsonify(api_cache_put("items", payload))
 
     @app.route("/api/market-watch")
+    @single_flight("market-watch")
     def market_watch():
         """Stats for the Market Watch home page, aggregated live from market.db (95k
         treasury-derived txns, each priced in USD at the trade's own minute).
@@ -4113,7 +4328,11 @@ def make_app():
         Trading volume = the **marketplace** category ONLY (player↔player item trades). The
         **spin wheel** (the `sink` category — the only txns that burn ~50% of what the player
         pays) is gambling, NOT trading, so it's reported in its own `spinwheel` block and kept
-        out of every market total. ~ms on 95k rows, so no caching."""
+        out of every market total. Cached briefly because the all-history aggregates
+        grow with the ledger and otherwise repeat for every visitor."""
+        cached = api_cache_get("market-watch", 60)
+        if cached is not None:
+            return jsonify(cached)
         mcon = market_connect()
         if mcon is None:
             return jsonify({"ok": False, "error": "market dataset not loaded"}), 503
@@ -4159,7 +4378,7 @@ def make_app():
                    ORDER BY usd_value DESC LIMIT 12""")]
         finally:
             mcon.close()
-        return jsonify({
+        payload = {
             "ok": True,
             "generated_at": int(meta.get("generated_at", 0) or 0),
             "ts_min": int(meta.get("ts_min", 0) or 0),
@@ -4185,14 +4404,19 @@ def make_app():
             "payout": {"n": po.get("n", 0), "kins": po.get("kins", 0), "usd": po.get("usd", 0)},
             "daily": daily,
             "top_trades": top,
-        })
+        }
+        return jsonify(api_cache_put("market-watch", payload))
 
     @app.route("/api/market-caps")
+    @single_flight("market-caps")
     def market_caps():
         """Every item ranked by **market cap** = total world units × per-unit USD floor (the
         lesser of the USD floor and the gold floor converted to USD, i.e. `item_floors()`'s
         `usd_equiv`). Drives the Market Watch market-cap leaderboard. Items missing either a
         live floor or a world-supply number can't be valued and are omitted."""
+        cached = api_cache_get("market-caps", 30)
+        if cached is not None:
+            return jsonify(cached)
         con = connect(readonly=True)
         try:
             rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
@@ -4212,12 +4436,13 @@ def make_app():
                 "supply": s, "floor_usd": feq, "market_cap": feq * s,
             })
         items.sort(key=lambda x: x["market_cap"], reverse=True)
-        return jsonify({
+        payload = {
             "ok": True, "items": items,
             "total_market_cap": sum(x["market_cap"] for x in items),
             "players": sup["players"], "generated": sup["generated"],
             "kins_price": current_kins_usd(),
-        })
+        }
+        return jsonify(api_cache_put("market-caps", payload))
 
     @app.route("/api/settings", methods=["GET", "POST"])
     def settings():
@@ -4231,23 +4456,35 @@ def make_app():
         return jsonify(out)
 
     @app.route("/api/arbitrage")
+    @single_flight("arbitrage")
     def arbitrage():
         con = connect(readonly=True)
         gold_item = request.args.get("gold_item") or get_setting(con, "gold_item")
         direction = request.args.get("direction", "gold_to_kins")
         fee = float(request.args.get("fee", 0) or 0)
         min_qty = int(float(request.args.get("min_qty", 0) or 0))
+        cache_key = ("arbitrage", gold_item, direction, fee, min_qty)
+        cached = api_cache_get(cache_key, 5)
+        if cached is not None:
+            con.close()
+            return jsonify(cached)
         out = compute_arbitrage(con, gold_item, direction, fee, min_qty)
         con.close()
-        return jsonify(out)
+        return jsonify(api_cache_put(cache_key, out))
 
     @app.route("/api/mispricing")
+    @single_flight("mispricing")
     def mispricing():
         con = connect(readonly=True)
         gold_item = request.args.get("gold_item") or get_setting(con, "gold_item")
+        cache_key = ("mispricing", gold_item)
+        cached = api_cache_get(cache_key, 15)
+        if cached is not None:
+            con.close()
+            return jsonify(cached)
         out = compute_mispricing(con, gold_item)
         con.close()
-        return jsonify(out)
+        return jsonify(api_cache_put(cache_key, out))
 
     @app.route("/api/kins-price")
     def kins_price():
@@ -4942,12 +5179,17 @@ def make_app():
         })
 
     @app.route("/api/sales-summary")
+    @single_flight("sales-summary")
     def sales_summary():
         """Per-item marketplace summary over a window (1/7/30 days ending on the
         most recent trading day): total sales, sales-weighted avg gold & USD
         price, and the USD price in $KINS. Reads the archive."""
         from datetime import date as _date, timedelta as _td
         window = max(1, int(float(request.args.get("window", 1) or 1)))
+        cache_key = ("sales-summary", window)
+        cached = api_cache_get(cache_key, 20)
+        if cached is not None:
+            return jsonify(cached)
         con = connect(readonly=True)
         ref = con.execute("SELECT MAX(date) d FROM sales_daily").fetchone()["d"]
         # item universe = anything we've seen listed/sold ∪ kintara's full live item index, so a
@@ -5001,9 +5243,10 @@ def make_app():
                 "world_supply": supply,   # total units of this item across all players
                 "market_cap": mcap,       # world_supply × USD floor
             })
-        return jsonify({"ok": True, "ref_day": ref, "window": window,
-                        "kins_price": kins_px, "gold_rate": rate, "items": out,
-                        "world_players": wsupply["players"], "world_generated": wsupply["generated"]})
+        payload = {"ok": True, "ref_day": ref, "window": window,
+                   "kins_price": kins_px, "gold_rate": rate, "items": out,
+                   "world_players": wsupply["players"], "world_generated": wsupply["generated"]}
+        return jsonify(api_cache_put(cache_key, payload))
 
     @app.route("/api/gold-history")
     def gold_history():
@@ -5012,38 +5255,19 @@ def make_app():
         resolution; kins_per_gold = gold_usd / kins_usd (truly moves intraday).
         range = 4H | 1D | 3D | 7D | 14D | ALL."""
         rng = (request.args.get("range") or "1D").upper()
-        window_sec, bucket_sec = GOLD_RANGES.get(rng, GOLD_RANGES["1D"])
-        # serve a cached payload for ~3 min so toggling/auto-refresh never bursts
-        # GeckoTerminal (the source of the earlier rate-limiting).
+        if rng not in GOLD_RANGES:
+            rng = "1D"
+        # Always serve last-good immediately. A stale entry refreshes in a daemon
+        # thread, so a visitor never inherits GeckoTerminal's network latency.
         cached = _goldhist_cache.get(rng)
-        if cached and time.time() - cached[0] < 180:
+        if cached:
+            if time.time() - cached[0] >= 180:
+                refresh_once(f"gold-history-{rng}", lambda: refresh_gold_history(rng))
             return jsonify(cached[1])
-        con = connect(readonly=True)
         try:
-            gold, spot = gold_series_for_chart(con)   # our series, kintaragold fallback
-        finally:
-            con.close()
-        if not gold:
-            return jsonify({"ok": False, "error": "no gold price data yet"}), 502
-        try:
-            candles = kins_series_for_range(window_sec, bucket_sec)
+            return jsonify(refresh_gold_history(rng))
         except Exception as e:
-            if cached:                       # rate-limited? serve last good payload
-                return jsonify(cached[1])
             return jsonify({"ok": False, "error": "kins price source: " + str(e)}), 502
-        gstart = gold[0][0] if gold else None
-        series = []
-        for ts, ku in candles:
-            tms = ts * 1000
-            if gstart and tms < gstart:     # before gold history begins
-                continue
-            gu = interp_gold(gold, tms)
-            kpg = (gu / ku) if (gu and ku) else None
-            series.append({"t": int(tms), "gold_usd": gu, "kins_usd": ku,
-                           "kins_per_gold": kpg})
-        payload = {"ok": True, "range": rng, "spot": spot, "series": series}
-        _goldhist_cache[rng] = (time.time(), payload)
-        return jsonify(payload)
 
     @app.route("/api/servers")
     def servers():
@@ -5619,6 +5843,19 @@ def make_app():
         return jsonify({"ok": True, "wallet": wallet, "mint": kins_mint(), **agg})
 
     return app
+
+
+def prime_request_caches(app):
+    """Warm shared network and aggregate caches before the first real visit."""
+    prime_public_caches()
+    with app.test_client() as client:
+        for path in ("/api/status", "/api/items", "/api/market-watch",
+                     "/api/market-caps", "/api/sales-summary?window=1",
+                     "/api/arbitrage?direction=gold_to_kins"):
+            try:
+                client.get(path)
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -6587,6 +6824,9 @@ const state={dir:"gold_to_kins", fee:0, goldItem:null, items:[], cats:[], labels
   goldMode:"gold_usd", goldRange:"1D", srvOpen:false, mintQty:1, merchResOpen:null, salesCov:"",
   playerName:"", playerWallet:"", playerData:null,
   liveShard:1, liveSel:null, liveSearch:"", liveSearchBusy:false, liveSearchStatus:"", propSel:null, servers:[]};
+const pageReq={};
+function beginPageLoad(tab){ pageReq[tab]=(pageReq[tab]||0)+1; return pageReq[tab]; }
+function pageLoadCurrent(tab,req){ return TAB===tab && pageReq[tab]===req; }
 
 /* Commodities (materials/potions/food) trade in bulk — a single unit is a fraction of a
    cent and nobody sells one (the Solana fee dwarfs it), so we quote these per 1,000 units.
@@ -6852,8 +7092,14 @@ const CMD_TABS=[['market','Market Watch'],['arb','Arbitrage'],['live','Live list
   ['hist','Index'],['gold','Gold price'],['merchant','Merchant'],
   ['world','Live World'],['props','Property Map']];
 let cmdkList=[], cmdkSel=0;
-function gotoTab(t){ document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x.dataset.t===t));
-  TAB=t; fadeView(); render(); schedule(); }
+function gotoTab(t){
+  if(!document.querySelector(`.tab[data-t="${t}"]`)) return;
+  const changed=TAB!==t;
+  document.querySelectorAll('.tab').forEach(x=>x.classList.toggle('on',x.dataset.t===t));
+  TAB=t; state.propDetail=null; hideDeal(); hideSold();
+  if(changed) $('#view').innerHTML=skel(7);   // never leave the previous page under a new active tab
+  fadeView(); render(); schedule();
+}
 function openCmdk(){ const o=$('#cmdk'); o.classList.add('on'); const i=$('#cmdkInput'); i.value=''; cmdkRender(''); i.focus(); }
 function closeCmdk(){ $('#cmdk').classList.remove('on'); }
 function cmdkRender(q){ q=(q||'').trim().toLowerCase(); const res=[];
@@ -6895,6 +7141,7 @@ async function loadStatus(){
     : "";
 }
 async function loadItems(){
+  if(state.items.length) return;
   const d=await (await fetch("/api/items")).json();
   state.items=d.items; state.cats=d.categories||[]; state.labels=d.labels||{};
   if(state.goldItem==null) state.goldItem=d.gold_item;
@@ -6922,11 +7169,15 @@ function wireModeSeg(){
 }
 async function loadArb(){
   if(state.dir==="mispricing") return loadMispricing();
+  const req=beginPageLoad("arb");
   if(TAB==="arb" && !$("#view").querySelector(".controls")) $("#view").innerHTML=skel(8);
-  await loadItems(); ensureGoldSpark();
+  await loadItems();
+  if(!pageLoadCurrent("arb",req)) return;
+  ensureGoldSpark();
   const p=new URLSearchParams({direction:state.dir, min_qty:state.minQty||0});
   if(state.goldItem) p.set("gold_item", state.goldItem);
   const d=await (await fetch("/api/arbitrage?"+p)).json();
+  if(!pageLoadCurrent("arb",req)) return;
   state.rate=d.gold_rate;
   state.rowMap={}; (d.rows||[]).forEach(r=>state.rowMap[r.item_type]=r);
   const dirA=state.dir==="gold_to_kins";
@@ -7085,12 +7336,15 @@ async function loadArb(){
    weighted fair value carried to today's rates (see compute_mispricing). Display
    currency (KINS/Gold/Both) is just a unit choice — the comparison is one number. */
 async function loadMispricing(){
+  const req=beginPageLoad("arb");
   if(TAB==="arb" && !$("#view").querySelector(".controls")) $("#view").innerHTML=skel(8);
   hideDeal(); hideSold();                         // clear any stale arb hover card
   await loadItems();
+  if(!pageLoadCurrent("arb",req)) return;
   const p=new URLSearchParams();
   if(state.goldItem) p.set("gold_item", state.goldItem);
   const d=await (await fetch("/api/mispricing?"+(p.toString()))).json();
+  if(!pageLoadCurrent("arb",req)) return;
   state.rate=d.gold_rate;
   const RATE=d.gold_rate, KP=d.kins_price;
   const cur=state.mpCur;
@@ -7288,11 +7542,12 @@ function rowIcon(r){ const fb=(CAT_EMO[r.category]||"📦").replace(/'/g,"");
     `onerror="this.parentElement.textContent='${fb}'"></span>`; }
 
 async function loadLive(){
+  const myseq=++fstate.seq;   // tag this request; only the latest is allowed to render
   // (re)build the shared controls if this tab doesn't already own them (Live listings and
   // Sales feed share #ltable + the filter bar, so switching between them must rebind).
   if(!$("#ltable") || ltableOwner!=="live"){ await loadItems();
+    if(TAB!=="live" || myseq!==fstate.seq) return;
     $("#view").innerHTML=listingControls(); ltableOwner="live"; bindListingControls(loadLive); }
-  const myseq=++fstate.seq;   // tag this request; only the latest is allowed to render
   const rows=await (await fetch("/api/current?"+lqs())).json();
   if(TAB!=="live" || !$("#ltable") || myseq!==fstate.seq) return;   // tab changed or a newer fetch superseded this one — don't clobber
   $("#ltable").innerHTML = !rows.length
@@ -7319,9 +7574,10 @@ function saleAmt(r){
 }
 function salePrice(r){ return saleAmt(r); }   // back-compat alias
 async function loadRemoved(){   // "Sales feed" tab — ACTUAL completed sales (rich rows)
-  if(!$("#ltable") || ltableOwner!=="removed"){ await loadItems();
-    $("#view").innerHTML=listingControls(); ltableOwner="removed"; bindListingControls(loadRemoved); }
   const myseq=++fstate.seq;   // tag this request; only the latest is allowed to render
+  if(!$("#ltable") || ltableOwner!=="removed"){ await loadItems();
+    if(TAB!=="removed" || myseq!==fstate.seq) return;
+    $("#view").innerHTML=listingControls(); ltableOwner="removed"; bindListingControls(loadRemoved); }
   const rows=await (await fetch("/api/sales-feed?"+lqs())).json();
   if(TAB!=="removed" || !$("#ltable") || myseq!==fstate.seq) return;   // tab changed or a newer fetch superseded this one — don't clobber
   salesCoverage();   // cross-check vs the in-game number (async, fills the badge when ready)
@@ -7360,9 +7616,14 @@ const CAT_EMO={material:"🪨",currency:"🪙",cosmetic:"👕",mount:"🐴",pet:
   furniture:"🪑",tool:"⛏️",weapon:"⚔️",potion:"🧪",food:"🍖",key:"🔑",building:"🏠",other:"📦"};
 function fmtK(v){ return v>=1000?(+(v/1000).toFixed(2))+"K":(""+v); }
 async function loadHist(){
+  const req=beginPageLoad("hist");
   await loadItems();
-  try{ SUMMARY=await (await fetch("/api/sales-summary?window="+(state.histWindow||1))).json(); }
-  catch(e){ SUMMARY={ok:false}; }
+  if(!pageLoadCurrent("hist",req)) return;
+  let next;
+  try{ next=await (await fetch("/api/sales-summary?window="+(state.histWindow||1))).json(); }
+  catch(e){ next={ok:false}; }
+  if(!pageLoadCurrent("hist",req)) return;
+  SUMMARY=next;
   renderHist();
 }
 function iconImg(r){
@@ -8007,9 +8268,13 @@ document.addEventListener("click",e=>{
 /* ---------------- traveling merchant (tracker + cost calculator) --------- */
 let MERCH=null;
 async function loadMerchant(){
+  const req=beginPageLoad("merchant");
   if(!document.querySelector('.mwrap')) $("#view").innerHTML=skel(5);
-  try{ MERCH=await (await fetch("/api/merchant")).json(); }
-  catch(e){ $("#view").innerHTML=`<div class="empty warn">Couldn't load merchant data.</div>`; return; }
+  let next;
+  try{ next=await (await fetch("/api/merchant")).json(); }
+  catch(e){ if(pageLoadCurrent("merchant",req)) $("#view").innerHTML=`<div class="empty warn">Couldn't load merchant data.</div>`; return; }
+  if(!pageLoadCurrent("merchant",req)) return;
+  MERCH=next;
   merchHistCache=null;   // refresh the resource-history chart data alongside the tracker
   MERCH_EVENTS=null; _meFetch=null;   // re-pull restock markers (a new one may have fired)
   renderMerchant();
@@ -8273,10 +8538,11 @@ const REALM_MAPS={
 };
 async function loadWorld(){
   if(state.liveSearchBusy) return;        // don't disrupt an in-progress all-server search
+  const req=beginPageLoad("world");
   if(!document.querySelector('.lw-roster') && TAB==="world") $("#view").innerHTML=skel(7);
   let d; try{ d=await (await fetch("/api/live?shard="+state.liveShard)).json(); }
-  catch(e){ if(TAB==="world") $("#view").innerHTML=`<div class="empty warn">Couldn't reach the live world.</div>`; return; }
-  if(TAB!=="world") return; WORLD=d; renderWorld();
+  catch(e){ if(pageLoadCurrent("world",req)) $("#view").innerHTML=`<div class="empty warn">Couldn't reach the live world.</div>`; return; }
+  if(!pageLoadCurrent("world",req)) return; WORLD=d; renderWorld();
 }
 function realmInfo(r){ return (WORLD&&WORLD.realms&&WORLD.realms[r])||{l:(r||'Overworld'),e:'📍'}; }
 function serverName(n){ const s=(state.servers||[]).find(x=>x.id===n); return s&&s.name?s.name:('Server '+n); }
@@ -8596,10 +8862,11 @@ function renderPlayer(){
 }
 
 async function loadProperty(){
+  const req=beginPageLoad("props");
   if(!document.querySelector('.pm') && !state.propDetail && TAB==="props") $("#view").innerHTML=skel(6);
   let d; try{ d=await (await fetch("/api/property")).json(); }
-  catch(e){ if(TAB==="props"&&!state.propDetail) $("#view").innerHTML=`<div class="empty warn">Couldn't load properties.</div>`; return; }
-  if(TAB!=="props") return; PROP=d;
+  catch(e){ if(pageLoadCurrent("props",req)&&!state.propDetail) $("#view").innerHTML=`<div class="empty warn">Couldn't load properties.</div>`; return; }
+  if(!pageLoadCurrent("props",req)) return; PROP=d;
   if(state.propDetail) return;          // a detail page is open — don't clobber it with the map
   renderProperty();
 }
@@ -8830,11 +9097,12 @@ function mwCountUp(el,to,fmt){ if(!el)return; if(RM){el.textContent=fmt(to);retu
 
 let MW=null;
 async function loadMarket(){
+  const req=beginPageLoad("market");
   let d, caps=null, neterr=false;
   try{ const [r1,r2]=await Promise.all([fetch("/api/market-watch"), fetch("/api/market-caps")]);
        d=await r1.json(); caps=await r2.json(); }
   catch(e){ neterr=true; }       // fetch/parse failed — server blip, NOT a missing dataset
-  if(TAB!=="market") return;
+  if(!pageLoadCurrent("market",req)) return;
   const v=$("#view");
   if(neterr){
     // transient (e.g. server restarting / dataset being rebuilt): show a quiet
@@ -9038,8 +9306,7 @@ function schedule(){
   }
 }
 document.querySelectorAll(".tab").forEach(t=>t.onclick=()=>{
-  document.querySelectorAll(".tab").forEach(x=>x.classList.remove("on"));
-  t.classList.add("on"); TAB=t.dataset.t; state.propDetail=null; fadeView(); render(); schedule();
+  gotoTab(t.dataset.t);
 });
 $("#cmdkBtn").onclick=openCmdk;
 $("#cmdkInput").oninput=e=>cmdkRender(e.target.value);
@@ -9078,6 +9345,8 @@ def main():
     import requests  # noqa: F401  (force the import tree to load now)
     app = make_app()
 
+    threading.Thread(target=prime_request_caches, args=(app,), daemon=True,
+                     name="public-cache-warmup").start()
     threading.Thread(target=poll_loop, args=(LISTING_GAP,), daemon=True).start()  # tiered per-item refresher
     threading.Thread(target=firstpage_loop, args=(args.firstpage_interval,), daemon=True).start()  # fast page-1 capture
     threading.Thread(target=stats_loop, daemon=True).start()

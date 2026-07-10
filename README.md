@@ -150,7 +150,7 @@ endpoints when first probed.
 | Active listings | `GET kintara.gg/api/marketplace/listings?sort=cheapest&currency=all&category=all&limit=100&offset=0&q=<itemType>` | Returns `{ok, listings[], total, limit, offset, hasMore}`. Each listing: `id, sellerId, sellerName, itemType, quantity, priceGold, currency, priceUsd, createdAt, reservedBy, reservedUntilMs, itemDurability`. **Page size caps at 100; `offset` caps at ~500** (deep offsets return an empty page with `total:null` — a hard upstream limit). `currency`/`category` are **ignored**, but **`q=` filters server-side** (substring match on itemType) — that's how we page the whole book: query **per item type** (`fetch_book_by_item()`), since almost every item is under the 500 cap. **No public sales-history here;** we build it ourselves. |
 | Daily completed sales | `GET kintara.gg/api/marketplace/stats?[currency=token&]itemType=<x>` | `{ok, currency, avg30d, samples:[{date, avgUnitPrice, sales}]}`. **Daily only** (ignores interval params), ~30 days, **sparse** (only days with sales). `avgUnitPrice` is per single item; gold prices are rounded to 2 decimals (sub-cent gold collapses to 0). Omit `currency` = gold; `currency=token` = USD. |
 | Live KINS price (USD) | `GET kintara.gg/api/token/blimp-stats` | `{priceUsd, ...}` — kintara's own KINS/USD, matches their index page. |
-| Item art | `kintara.gg/assets/hud/<category>/<name>.(png|svg)` | Real in-game icons. Mapping is per-item (`ICON_OVERRIDES` + `icon_asset()`); cosmetics = `cosmetics/<itemType>.png`, keys = bronze/silver/gold. **Pets/furniture**: the exact per-item paths aren't in the override map, so `icon_candidates()` probes likely schemes (`pets/<name>.png`, `furniture/<name>.png`, …) and the `/icon` route caches the first that returns 200, falling back to the generic paw for pets. Cached under a `__art` namespace so the old generic-paw files don't shadow real art. **The probed paths are unverified guesses** — confirm a real one in-browser and add it to `ICON_OVERRIDES` if a pet/furniture stays blank. |
+| Item art | `kintara.gg/assets/hud/<category>/<name>.(png|svg)` | Real in-game icons. Mapping is per-item (`ICON_OVERRIDES` + `icon_asset()`); cosmetics = `cosmetics/<itemType>.png`, keys = bronze/silver/gold. **Pets/furniture**: the exact per-item paths aren't in the override map, so `icon_candidates()` probes likely schemes (`pets/<name>.png`, `furniture/<name>.png`, …) and `/icon` caches the first 200. Cache misses return immediately and enter a bounded 2-worker background discovery queue; failed guesses are negative-cached for 1h, so missing art cannot tie up visitor threads. Cached under a `__art` namespace so the old generic-paw files don't shadow real art. **The probed paths are unverified guesses** — confirm a real one in-browser and add it to `ICON_OVERRIDES` if a pet/furniture stays blank. |
 | Item display names | (ripped from `kintara.gg/game.js` label catalog) | Baked into `ITEM_LABELS` dict (133 entries). `item_label()` resolves itemType→name with a prettify fallback. e.g. `cosmetic_dog_mask`→"Jotchua", `wild_sword`→"Training Sword". |
 | **Gold USD price (ours)** | our own `listings` DB | Authoritative while the tracker runs. `gold_price_loop` snapshots one row into `gold_price` every ~3 min = `our_gold_price()` (avg per-gold USD of the 3 cheapest live token gold listings). Drives both the gold chart and the arbitrage gold rate. |
 | **Gold USD price history (fallback)** | (ripped from `kintaragold.xyz` HTML) | The page embeds `"history":[{t,price}]` + `"spotPriceUsd"` in its RSC payload (escaped, can straddle chunk boundaries — we regex the `t`/`price` pairs). Independent gold-USD series (~10-min, ~25 days), NOT derived from KINS. `fetch_kintara_gold_history()`, cached ~3 min. Used **only to backfill the stretch before our own `gold_price` data begins** (see `gold_series_for_chart()`) and as the gold-rate fallback when no live gold listings exist. |
@@ -221,7 +221,16 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
   good payload if gecko rate-limits); the kintaragold rip (fallback/backfill only) is
   cached ~3 min; KINS spot price ~2 min. So the gold chart hits external APIs at most
   ~once / 3 min per range.
-- **Item icons** download once to `icons_cache/`, then serve from disk.
+- **Visitor-path performance:** network-backed public data (KINS price/history, server list,
+  merchant state, property status, and gold history) uses **stale-while-refresh**: once a good
+  value exists, an expired cache returns immediately while one daemon refresh updates it.
+  Startup warms the default 1D gold chart, shared feeds, and default aggregate pages. Heavy aggregates are briefly cached
+  (`market-watch` 60s, market caps 30s, Index summary 20s, arbitrage 5s), and HTML/JSON over
+  1KB is gzip-compressed when supported. Cache-producing endpoints are single-flight, so a cache
+  expiry cannot make concurrent visitors repeat the same SQLite aggregate. Upstream latency is no
+  longer visitor latency.
+- **Item icons** download once to `icons_cache/`, then serve from disk. Uncached discovery is
+  asynchronous (2 workers); misses are browser-cached briefly and server-negative-cached for 1h.
 
 ---
 
@@ -233,7 +242,8 @@ Past data never changes, so we **archive it and only re-fetch recent/live data.*
   `reserved_by`, `reserved_until` (epoch ms), `item_durability`, `created_at`,
   `first_seen`, `last_seen`, `active` (1/0), `removed_at`. `reconcile()` upserts and marks
   vanished listings `active=0, removed_at=now` (only on a complete non-empty fetch, so a
-  network blip can't wipe the market). `removed` ≠ guaranteed sale (sold or delisted).
+  network blip can't wipe the market). Composite indexes cover active newest/price sorts and
+  item/currency floor scans as history grows. `removed` ≠ guaranteed sale (sold or delisted).
 - **`item_stats`** — last-day summary per `(item_type, currency)`: `day`, `day_sales`,
   `day_avg`, `avg30d`, `updated_at`. Drives the arbitrage "sold today" column.
 - **`sales_daily`** — the daily archive (see above).
@@ -820,6 +830,20 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Load-time + tab reliability overhaul.** Fixed the race behind "new tab highlighted, old page
+  still visible": tab navigation now paints a skeleton immediately and every async top-level loader
+  carries a request generation, so a late response from Index/Arbitrage/Merchant/Market Watch/etc.
+  cannot overwrite the current tab (same-tab refresh races are rejected too). Network-backed shared
+  data now refreshes stale-while-serving-last-good in daemon threads instead of making a visitor wait
+  up to the old 20s timeout; startup prewarms the default Gold chart, shared feeds, and landing-page
+  aggregates. Added short
+  payload caches plus single-flight rebuilds for expensive aggregate endpoints, gzip for the large
+  app shell/JSON tables, and
+  covering SQLite indexes for active listing sorts/floors plus the attributed sales feed. Uncached
+  item-art discovery also moved out of `/icon` request threads into a bounded background queue, with
+  1h negative caching for nonexistent guessed paths. `/api/items`
+  is also fetched once per browser session. Local warm benchmarks: Market Watch ~0.9s -> ~1ms,
+  status ~30ms -> ~1ms, Gold 1D ~6s cold -> ~3ms warm; compressed transfer sizes are much smaller.
 - **Top tab order adjusted for hosted-site flow.** The visual nav order is now Market Watch,
   Index, Merchant, Gold Price, Live listings, Sales feed, Arbitrage, Live World, Property Map,
   Player. Tab IDs/routes are unchanged.
