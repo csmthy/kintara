@@ -465,10 +465,53 @@ def api_cache_get(key, ttl):
     return None
 
 
-def api_cache_put(key, payload):
+# Snapshots worth surviving a restart. The home-page payload is a whole-ledger scan (~30s
+# cold), so without this every deploy left a window where the first visitor blocked on it.
+# We mirror these to the settings table and reload them at boot, so the site always has
+# something warm to serve and freshness comes from the background refresh.
+_PERSIST_SNAPSHOTS = {"market-watch", "market-caps",
+                      ("sales-summary", 1), ("sales-summary", 7), ("sales-summary", 30)}
+
+
+def _snap_setting_name(key):
+    return "snap:" + (key if isinstance(key, str) else ":".join(str(p) for p in key))
+
+
+def api_cache_put(key, payload, persist=True):
     with _api_cache_lock:
         _api_payload_cache[key] = (time.time(), payload)
+    if persist and key in _PERSIST_SNAPSHOTS and isinstance(payload, dict) and payload.get("ok"):
+        try:
+            con = connect()
+            set_setting(con, _snap_setting_name(key), json.dumps(payload))
+            con.close()
+        except Exception:
+            pass          # a snapshot we can't persist is not worth failing a request over
     return payload
+
+
+def load_persisted_snapshots():
+    """Re-seed the payload cache from the last persisted snapshots so the very first request
+    after a restart is instant instead of paying for a cold rebuild."""
+    n = 0
+    try:
+        con = connect(readonly=True)
+        for key in _PERSIST_SNAPSHOTS:
+            raw = get_setting(con, _snap_setting_name(key))
+            if not raw:
+                continue
+            try:
+                payload = json.loads(raw)
+            except Exception:
+                continue
+            with _api_cache_lock:
+                # age 0 so it's served immediately; the TTL/warmup refreshes it right after
+                _api_payload_cache[key] = (time.time(), payload)
+            n += 1
+        con.close()
+    except Exception as e:
+        print(f"[{now_iso()}] snapshot preload skipped: {e}")
+    return n
 
 
 _swr_building = set()
@@ -9995,6 +10038,10 @@ def main():
     # Importing both single-threaded here removes that race.
     import requests  # noqa: F401  (force the import tree to load now)
     app = make_app()
+
+    _sn = load_persisted_snapshots()
+    if _sn:
+        print(f"[{now_iso()}] preloaded {_sn} cached snapshots — first paint is warm")
 
     # Retire listings we haven't re-seen in days before anything reads them: phantom 'active'
     # rows both quote stale asks as live and make every floor pass scan ~36x the real book.
