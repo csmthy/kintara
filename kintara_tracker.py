@@ -89,6 +89,11 @@ FIRSTPAGE_INTERVAL = _envi("FIRSTPAGE_INTERVAL", 3)  # fast page-1 poll seconds:
 # event-driven (a /stats count tick triggers a targeted re-fetch — see refresh_item_listings),
 # so this loop only keeps floors/supply fresh + is a removal backstop: hot (heavily-listed) items
 # refresh often, cold items rotate slowly. Load is proportional to activity, not catalog size.
+# Cache-first serving: the heavy Index / market-cap payloads are rebuilt on a timer by
+# warmup_loop and served stale-while-revalidate, so a page load never waits on SQLite.
+# Raise API_SNAPSHOT_TTL to trade freshness for even less background work.
+API_SNAPSHOT_TTL = _envi("API_SNAPSHOT_TTL", 180)     # seconds before a snapshot is refreshed
+WARMUP_INTERVAL = _envi("WARMUP_INTERVAL", 120)       # how often warmup_loop re-primes snapshots
 LISTING_GAP = _envf("LISTING_GAP", 0.6)               # min seconds between per-item refreshes
 LISTING_HOT_STALE = _envi("LISTING_HOT_STALE", 45)    # re-check heavily-listed items at least this often
 LISTING_COLD_STALE = _envi("LISTING_COLD_STALE", 300) # re-check quiet items this often
@@ -464,6 +469,43 @@ def api_cache_put(key, payload):
     with _api_cache_lock:
         _api_payload_cache[key] = (time.time(), payload)
     return payload
+
+
+_swr_building = set()
+
+
+def _swr_refresh(key, builder):
+    try:
+        api_cache_put(key, builder())
+    except Exception as e:
+        print(f"[{now_iso()}] cache refresh failed for {key}: {e}")
+    finally:
+        with _api_cache_lock:
+            _swr_building.discard(key)
+
+
+def api_cache_swr(key, ttl, builder):
+    """Stale-while-revalidate: **always serve the cached payload instantly** when we have one,
+    and refresh it in the background once it ages past `ttl`. Only a true cold start (nothing
+    cached at all) blocks on the build.
+
+    This is what makes first paint fast: the expensive payloads (per-item Index summary, market
+    caps) are heavy SQLite passes, and with a plain TTL cache every visitor unlucky enough to
+    arrive right after expiry paid the full rebuild (seconds). Now that cost is paid off the
+    request path by a background thread, and readers only ever see a slightly-older snapshot.
+    Freshness is preserved by the warmup loop, which keeps rebuilding these on a timer."""
+    now = time.time()
+    with _api_cache_lock:
+        hit = _api_payload_cache.get(key)
+        spawn = False
+        if hit and (now - hit[0] >= ttl) and key not in _swr_building:
+            _swr_building.add(key)
+            spawn = True
+    if hit:
+        if spawn:
+            threading.Thread(target=_swr_refresh, args=(key, builder), daemon=True).start()
+        return hit[1]                     # instant: fresh or stale, never blocks
+    return api_cache_put(key, builder())  # cold start only
 
 
 def single_flight(name):
@@ -1504,17 +1546,63 @@ def icon_candidates(item_type):
 _LISTINGS_HEADERS = {"User-Agent": "kintara-tracker/1.0 (personal market tracker)"}
 
 
+# --- listings-API circuit breaker -------------------------------------------------------
+# On 2026-07-28 kintara put /api/marketplace/listings behind a login (401 for anonymous
+# callers) — the live order book is no longer public. Without a breaker every loop kept
+# retrying it forever (93k+ failures), burning the 1-vCPU box and saturating the SHARED
+# pace_kintara() budget, which starved the endpoints that DO still work (/stats, icons).
+# So: the first 401/403 latches "listings unavailable", all listing fetches become instant
+# no-ops, and we re-probe once every LISTINGS_REPROBE_SEC so the site self-heals the moment
+# kintara reopens it. Everything else (sales /stats, world index, property, on-chain) is
+# unaffected — see listings_available() / the Index's sales-based valuation fallback.
+LISTINGS_REPROBE_SEC = _envi("LISTINGS_REPROBE_SEC", 900)
+_listings_gate = {"blocked_at": 0.0, "last_probe": 0.0, "status": None}
+
+
+def listings_available():
+    """False while the listings API is known-unauthorized (auto re-probed periodically)."""
+    g = _listings_gate
+    if not g["blocked_at"]:
+        return True
+    return (time.time() - g["blocked_at"]) >= LISTINGS_REPROBE_SEC
+
+
+def _listings_block(status):
+    g = _listings_gate
+    if not g["blocked_at"]:
+        print(f"[{now_iso()}] listings API unavailable (HTTP {status}) — pausing listing polls; "
+              f"re-probing every {LISTINGS_REPROBE_SEC}s. Sales/stats/on-chain data unaffected.")
+    g["blocked_at"] = time.time()
+    g["status"] = status
+
+
+def _listings_unblock():
+    g = _listings_gate
+    if g["blocked_at"]:
+        print(f"[{now_iso()}] listings API is reachable again — resuming listing polls.")
+    g.update(blocked_at=0.0, status=None)
+
+
 def _listings_page(params):
-    """Fetch ONE listings page (3 retries, paced). Returns the parsed dict or None on failure."""
+    """Fetch ONE listings page (3 retries, paced). Returns the parsed dict, or None on failure.
+    Returns None immediately while the circuit breaker is open (see listings_available)."""
     import requests
+    if not listings_available():
+        return None
     for attempt in range(3):
         try:
             pace_kintara()
             r = requests.get(BASE, params=params, headers=_LISTINGS_HEADERS, timeout=HTTP_TIMEOUT)
+            if r.status_code in (401, 407):
+                _listings_block(r.status_code)      # auth-gated: stop hammering it
+                return None
             if r.status_code in (429, 403):
                 kintara_rate_limited()
             r.raise_for_status()
-            return r.json()
+            data = r.json()
+            if data and data.get("ok"):
+                _listings_unblock()                 # confirmed working
+            return data
         except Exception:
             if attempt == 2:
                 return None
@@ -4069,6 +4157,64 @@ def recent_fair_usd(con, item_type, days=14):
     return (num / den, n_sales) if den else (None, 0)
 
 
+def recent_avg_usd_map(con, days=30):
+    """{item_type: sales-weighted avg per-unit USD} over the last `days`, in ONE pass over the
+    daily archive (`sales_daily`), gold days converted at that day's gold price.
+
+    This is the bulk sibling of recent_fair_usd() and the valuation fallback that keeps the Index
+    and market caps alive now that the live order book is login-gated: it's built purely from
+    kintara's still-public completed-sale stats, so it reflects what things ACTUALLY sold for
+    rather than a (now unobtainable) live ask."""
+    cutoff = (datetime.now(timezone.utc) - _td(days=days)).strftime("%Y-%m-%d")
+    gusd = gold_daily_usd(con)
+    gdates = sorted(gusd)
+
+    def gold_on(d):
+        prior = [x for x in gdates if x <= d]
+        return gusd[prior[-1]] if prior else (gusd[gdates[0]] if gdates else None)
+
+    acc = {}
+    for r in con.execute(
+            """SELECT item_type, currency, date, sales, avg_price FROM sales_daily
+               WHERE date>=? AND sales>0 AND avg_price IS NOT NULL AND avg_price>0""",
+            (cutoff,)):
+        if r["currency"] == "token":
+            usd = r["avg_price"]
+        else:
+            g = gold_on(r["date"])
+            usd = r["avg_price"] * g if g else None
+        if usd is None:
+            continue
+        w = r["sales"] or 0
+        if w <= 0:
+            continue
+        a = acc.setdefault(r["item_type"], [0.0, 0.0])
+        a[0] += usd * w
+        a[1] += w
+    return {k: v[0] / v[1] for k, v in acc.items() if v[1]}
+
+
+def retire_stale_listings(con, days=2):
+    """Mark long-unseen `active` listings as removed.
+
+    The poller re-saw every live listing every cycle, so an 'active' row we haven't seen in days
+    is definitively gone (cancelled, sold, or — since 2026-07-28 — simply unverifiable because
+    kintara login-gated the listings API). Leaving them active was both a correctness bug (9-day-old
+    asks quoted as live floors) and the main performance problem: ~292k phantom rows made every
+    `WHERE active=1` scan ~36x heavier (2.6s per floor pass).
+
+    IMPORTANT: `removed_at` is set to the row's own `last_seen`, never to now — the sale matcher
+    only considers removals inside SALE_MATCH_WINDOW_MS, so back-dating guarantees this cleanup
+    can never be mistaken for a wave of fresh sales."""
+    cutoff = (datetime.now(timezone.utc) - _td(days=days)).isoformat()
+    cur = con.execute(
+        """UPDATE listings SET active=0, removed_at=COALESCE(removed_at, last_seen)
+           WHERE active=1 AND (last_seen IS NULL OR last_seen < ?)""", (cutoff,))
+    n = cur.rowcount
+    con.commit()
+    return n
+
+
 def item_floors(con, rate, item_type=None):
     """Current floor per item from live buyable listings, with the bulk-material rule
     (materials ignore listings < MIN_BULK_QTY). Returns {item: {gold, usd, usd_equiv}}:
@@ -4356,6 +4502,11 @@ def poll_loop(interval):
     itself is event-driven (refresh_item_listings fires on a /stats tick), so this loop's job is
     freshness, not catching every sale. Load scales with activity, not catalog size."""
     while True:
+        if not listings_available():
+            # listings API is auth-gated — don't burn CPU/pacer; the breaker re-probes for us
+            _state.update(last=now_iso(), error="listings API unavailable (login-gated upstream)")
+            time.sleep(30)
+            continue
         con = connect()
         try:
             it = _next_listing_item(con)
@@ -4398,6 +4549,9 @@ def firstpage_loop(interval):
     listings are recorded almost immediately and can be matched to sales. Removal detection
     stays with the full per-item poll, which scopes removals to fully-covered item types."""
     while True:
+        if not listings_available():
+            time.sleep(30)                  # auth-gated upstream — breaker handles re-probing
+            continue
         con = connect()
         try:
             listings, _ = fetch_all_active(max_pages=1)
@@ -4733,42 +4887,51 @@ def make_app():
         }
         return jsonify(api_cache_put("market-watch", payload))
 
-    @app.route("/api/market-caps")
-    @single_flight("market-caps")
-    def market_caps():
-        """Every item ranked by **market cap** = total world units × per-unit USD floor (the
-        lesser of the USD floor and the gold floor converted to USD, i.e. `item_floors()`'s
-        `usd_equiv`). Drives the Market Watch market-cap leaderboard. Items missing either a
-        live floor or a world-supply number can't be valued and are omitted."""
-        cached = api_cache_get("market-caps", 30)
-        if cached is not None:
-            return jsonify(cached)
+    def _build_market_caps():
+        """Every item ranked by **market cap** = total world units × per-unit USD value.
+
+        Value basis, in order of preference:
+          1. `live_floor`  — cheapest live ask (`item_floors()`'s `usd_equiv`), when the listings
+             API is available.
+          2. `avg_sale`    — sales-weighted avg per-unit USD actually paid over the last 14 days
+             (`recent_avg_usd_map()`, built from kintara's still-public completed-sale stats).
+        Since kintara login-gated the order book (2026-07-28) basis 2 carries the site. Each row
+        reports its own `basis` so the UI can label it honestly."""
         con = connect(readonly=True)
         try:
             rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
-            floors = item_floors(con, rate)
+            floors = item_floors(con, rate) if listings_available() else {}
+            avg = recent_avg_usd_map(con)
         finally:
             con.close()
         sup = world_item_supply()
         smap = sup["map"]
         items = []
-        for it in set(list(floors.keys()) + list(smap.keys())):
-            feq = floors.get(it, {}).get("usd_equiv")
+        for it in set(list(floors.keys()) + list(smap.keys()) + list(avg.keys())):
             s = smap.get(it)
-            if feq is None or s is None:
+            if s is None:
+                continue
+            feq = floors.get(it, {}).get("usd_equiv")
+            basis, val = ("live_floor", feq) if feq is not None else ("avg_sale", avg.get(it))
+            if val is None:
                 continue
             items.append({
                 "item_type": it, "label": item_label(it), "category": categorize(it),
-                "supply": s, "floor_usd": feq, "market_cap": feq * s,
+                "supply": s, "floor_usd": val, "basis": basis, "market_cap": val * s,
             })
         items.sort(key=lambda x: x["market_cap"], reverse=True)
-        payload = {
+        return {
             "ok": True, "items": items,
             "total_market_cap": sum(x["market_cap"] for x in items),
             "players": sup["players"], "generated": sup["generated"],
             "kins_price": current_kins_usd(),
+            "listings_live": listings_available(),
         }
-        return jsonify(api_cache_put("market-caps", payload))
+
+    @app.route("/api/market-caps")
+    def market_caps():
+        """Market-cap leaderboard. Served stale-while-revalidate so it's instant on every hit."""
+        return jsonify(api_cache_swr("market-caps", API_SNAPSHOT_TTL, _build_market_caps))
 
     @app.route("/api/settings", methods=["GET", "POST"])
     def settings():
@@ -5504,27 +5667,21 @@ def make_app():
             "last_sale": (dict(last) if last else None),
         })
 
-    @app.route("/api/sales-summary")
-    @single_flight("sales-summary")
-    def sales_summary():
+    def _build_sales_summary(window):
         """Per-item marketplace summary over a window (1/7/30 days ending on the
         most recent trading day): total sales, sales-weighted avg gold & USD
         price, and the USD price in $KINS. Reads the archive."""
         from datetime import date as _date, timedelta as _td
-        window = max(1, int(float(request.args.get("window", 1) or 1)))
-        cache_key = ("sales-summary", window)
-        cached = api_cache_get(cache_key, 20)
-        if cached is not None:
-            return jsonify(cached)
         con = connect(readonly=True)
         ref = con.execute("SELECT MAX(date) d FROM sales_daily").fetchone()["d"]
         # item universe = anything we've seen listed/sold ∪ kintara's full live item index, so a
         # brand-new item appears in the Index immediately (with its in-world supply) even before it
-        # has any marketplace listing or sale.
+        # has any marketplace listing or sale. DISTINCT lets the item_type index do the work
+        # instead of scanning ~1M listing rows.
         items = {r["item_type"] for r in con.execute(
-            """SELECT item_type FROM listings
-               UNION SELECT item_type FROM sales_daily
-               UNION SELECT item_type FROM sales_events""") if r["item_type"]}
+            """SELECT DISTINCT item_type FROM listings
+               UNION SELECT DISTINCT item_type FROM sales_daily
+               UNION SELECT DISTINCT item_type FROM sales_events""") if r["item_type"]}
         items |= set(world_item_supply()["map"].keys())
         items = sorted(items)
         agg = {}
@@ -5538,7 +5695,10 @@ def make_app():
                    FROM sales_daily WHERE date>=? GROUP BY item_type, currency""", (start,)):
                 agg[(r["item_type"], r["currency"])] = r
         rate, _ = gold_rate_usd(con, get_setting(con, "gold_item"))
-        floors = item_floors(con, rate)        # current floor per item (bulk-material rule)
+        # Live floors only while the listings API is reachable; otherwise fall back to what items
+        # actually SOLD for (still-public /stats archive) so the Index keeps real prices.
+        floors = item_floors(con, rate) if listings_available() else {}
+        avg_usd_map = recent_avg_usd_map(con)
         # all-time first sale date per item (drives the Index "newest/oldest added" sort)
         firsts = {r["item_type"]: r["f"] for r in con.execute(
             "SELECT item_type, MIN(date) f FROM sales_daily WHERE sales>0 GROUP BY item_type")}
@@ -5558,8 +5718,14 @@ def make_app():
             f_usd = ff.get("usd")            # raw cheapest USD listing
             f_equiv = ff.get("usd_equiv")    # cheaper of USD / gold→USD — the per-unit USD floor
             supply = supply_map.get(it)
-            # market cap = total world units × the per-unit USD floor (lesser of USD/gold→USD)
-            mcap = (f_equiv * supply) if (f_equiv is not None and supply is not None) else None
+            # market cap = total world units × per-unit USD value. Prefer the live floor; when the
+            # order book is login-gated, value at the avg price actually paid recently.
+            if f_equiv is not None:
+                basis, val = "live_floor", f_equiv
+            else:
+                val = avg_usd_map.get(it)
+                basis = "avg_sale" if val is not None else None
+            mcap = (val * supply) if (val is not None and supply is not None) else None
             out.append({
                 "item_type": it, "label": item_label(it), "category": categorize(it),
                 "sales": gs + ts, "avg_gold": ga, "avg_usd": ta, "kins": kins,
@@ -5567,12 +5733,22 @@ def make_app():
                 "floor_kins": (f_equiv / kins_px) if (f_equiv and kins_px) else None,
                 "first_sale": firsts.get(it),
                 "world_supply": supply,   # total units of this item across all players
-                "market_cap": mcap,       # world_supply × USD floor
+                "value_usd": val, "value_basis": basis,
+                "market_cap": mcap,       # world_supply × per-unit USD value
             })
-        payload = {"ok": True, "ref_day": ref, "window": window,
-                   "kins_price": kins_px, "gold_rate": rate, "items": out,
-                   "world_players": wsupply["players"], "world_generated": wsupply["generated"]}
-        return jsonify(api_cache_put(cache_key, payload))
+        return {"ok": True, "ref_day": ref, "window": window,
+                "kins_price": kins_px, "gold_rate": rate, "items": out,
+                "world_players": wsupply["players"], "world_generated": wsupply["generated"],
+                "listings_live": listings_available()}
+
+    @app.route("/api/sales-summary")
+    def sales_summary():
+        """Index payload, served stale-while-revalidate so it's instant on every hit."""
+        window = max(1, int(float(request.args.get("window", 1) or 1)))
+        if window not in (1, 7, 30):
+            window = 1                      # bound the cache keyspace
+        return jsonify(api_cache_swr(("sales-summary", window), API_SNAPSHOT_TTL,
+                                     lambda: _build_sales_summary(window)))
 
     @app.route("/api/gold-history")
     def gold_history():
@@ -6168,6 +6344,30 @@ def make_app():
             con.close()
         return jsonify({"ok": True, "wallet": wallet, "mint": kins_mint(), **agg})
 
+    def warmup_loop(interval=None):
+        """Keep the expensive payloads pre-built so page loads never pay for them.
+
+        Builds the Index summary (all three windows) + the market-cap leaderboard immediately at
+        startup and then re-primes them every `interval`s. Combined with api_cache_swr this means
+        the first visitor after a deploy is fast too, and nobody ever blocks on a rebuild — the
+        site always has a warm snapshot to serve and freshness comes from this timer."""
+        interval = WARMUP_INTERVAL if interval is None else interval
+        jobs = [(("sales-summary", w), (lambda w=w: _build_sales_summary(w))) for w in (1, 7, 30)]
+        jobs.append(("market-caps", _build_market_caps))
+        first = True
+        while True:
+            for key, builder in jobs:
+                try:
+                    t0 = time.time()
+                    api_cache_put(key, builder())
+                    if first:
+                        print(f"[{now_iso()}] warmup {key} in {time.time() - t0:.1f}s")
+                except Exception as e:
+                    print(f"[{now_iso()}] warmup {key} failed: {e}")
+            first = False
+            time.sleep(interval)
+
+    app.warmup_loop = warmup_loop      # started by main() once the app exists
     return app
 
 
@@ -8026,17 +8226,27 @@ function renderHist(){
     expensive:(a,b)=>(b.floor_kins==null?-Infinity:b.floor_kins)-(a.floor_kins==null?-Infinity:a.floor_kins),
   };
   rows.sort(HSORT[state.histSort]||HSORT.most);
+  // Price columns prefer the live floor; when the order book is unavailable upstream we show the
+  // avg price items ACTUALLY sold for (from the public sales stats), marked with a ~ and a tip.
+  const gr=d.gold_rate||null, kpx=d.kins_price||null;
   const body=rows.map(r=>{
     const open=r.item_type===state.histOpen;
+    const est=r.value_basis==='avg_sale' && r.value_usd!=null;
+    const vg = r.floor_gold!=null ? r.floor_gold : (est&&gr ? r.value_usd/gr : null);
+    const vu = r.floor_usd!=null ? r.floor_usd : (est ? r.value_usd : null);
+    const vk = r.floor_kins!=null ? r.floor_kins : (est&&kpx ? r.value_usd/kpx : null);
+    const tip = est ? 'avg price actually paid (last 30d of completed sales) — live asks are unavailable upstream'
+                    : 'cheapest live listing';
+    const m = est?'<span class="mut" style="font-size:10px">~</span>':'';
     return `<div class="gw-row ${open?'open':''}" data-item="${r.item_type}">
       <div class="gw-item"><span class="gw-chev">▸</span>${iconImg(r)}
         <span class="gw-name" title="${r.item_type}">${r.label}</span></div>
       <div class="gw-num r">${r.sales?fmtK(r.sales):"—"}</div>
       <div class="gw-num mut r" data-tip="total units of this item across every player's inventory, bank &amp; bag (kintara.gg world index)">${r.world_supply!=null?abbr(r.world_supply):"—"}</div>
-      <div class="gw-num mut r" data-tip="cheapest live gold listing (items per gold when under 1g each)">${fGold(r.floor_gold)}</div>
-      <div class="gw-num r">${fUsd(r.floor_usd,r.category)}</div>
-      <div class="gw-num gw-kins r">${fKins(r.floor_kins,r.category)}</div>
-      <div class="gw-num r" data-tip="market cap = in-world supply × USD floor (lesser of USD / gold→USD)" style="color:var(--gold2);font-weight:600">${r.market_cap!=null?mwUsd(r.market_cap):"—"}</div>
+      <div class="gw-num mut r" data-tip="${tip}">${fGold(vg)}</div>
+      <div class="gw-num r" data-tip="${tip}">${m}${fUsd(vu,r.category)}</div>
+      <div class="gw-num gw-kins r" data-tip="${tip}">${fKins(vk,r.category)}</div>
+      <div class="gw-num r" data-tip="market cap = in-world supply × per-unit USD value${est?' (avg sold price)':' (live floor)'}" style="color:var(--gold2);font-weight:600">${r.market_cap!=null?mwUsd(r.market_cap):"—"}</div>
     </div>`+(open?`<div class="gw-exp" id="gwexp"></div>`:"");
   }).join("");
   const kp=d.kins_price?("$"+(+d.kins_price.toFixed(4))):"—";
@@ -8059,7 +8269,7 @@ function renderHist(){
         <span style="width:14px"></span>
         <button class="gw-pill" id="histRefresh" data-tip="Refresh now">↻</button>
       </div>
-      <div class="gw-note">${state.histWindow==1?"Most recent trading day":("Last "+state.histWindow+" days")} · through ${d.ref_day||"—"} · live $KINS price ${kp} per token${d.world_players?` · in-world supply across ${(+d.world_players).toLocaleString()} players`:''}</div>
+      <div class="gw-note">${state.histWindow==1?"Most recent trading day":("Last "+state.histWindow+" days")} · through ${d.ref_day||"—"} · live $KINS price ${kp} per token${d.world_players?` · in-world supply across ${(+d.world_players).toLocaleString()} players`:''}${d.listings_live===false?` · <span style="color:var(--gold2)">prices marked ~ are avg <b>sold</b> prices</span> (Kintara's live listings API now requires login)`:''}</div>
       <div class="gw-head"><span>Item</span><span class="r">Sales</span><span class="r">In world</span><span class="r">Floor Gold</span><span class="r">Floor USD</span><span class="r">Floor $KINS</span><span class="r">Mkt cap</span></div>
       <div id="gwrows">${body||`<div class="gw-empty">No items in this category.</div>`}</div>
     </div></div>`;
@@ -9755,8 +9965,21 @@ def main():
     import requests  # noqa: F401  (force the import tree to load now)
     app = make_app()
 
+    # Retire listings we haven't re-seen in days before anything reads them: phantom 'active'
+    # rows both quote stale asks as live and make every floor pass scan ~36x the real book.
+    try:
+        _c = connect()
+        _n = retire_stale_listings(_c)
+        _c.close()
+        if _n:
+            print(f"[{now_iso()}] retired {_n:,} stale active listings (unseen >2d)")
+    except Exception as _e:
+        print(f"[{now_iso()}] stale-listing cleanup skipped: {_e}")
+
     threading.Thread(target=prime_request_caches, args=(app,), daemon=True,
                      name="public-cache-warmup").start()
+    threading.Thread(target=app.warmup_loop, daemon=True,
+                     name="snapshot-warmup").start()   # pre-build Index/market-cap payloads
     threading.Thread(target=analytics_flush_loop, daemon=True,
                      name="analytics-flush").start()
     threading.Thread(target=poll_loop, args=(LISTING_GAP,), daemon=True).start()  # tiered per-item refresher
