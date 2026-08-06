@@ -1,0 +1,251 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>KinScan UI Directions</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Inter:wght@400;500;600;700&family=Marcellus&display=swap" rel="stylesheet">
+  <script src="https://unpkg.com/lucide@0.468.0/dist/umd/lucide.min.js"></script>
+  <style>
+    *{box-sizing:border-box}html,body{margin:0;min-height:100%;letter-spacing:0}button,input,select{font:inherit}
+    button{cursor:pointer}.concept-bar{height:54px;background:#080b10;color:#d8dee8;border-bottom:1px solid #27303b;
+      display:flex;align-items:center;padding:0 18px;gap:14px;font:600 12px Inter,sans-serif;position:sticky;top:0;z-index:20}
+    .concept-bar strong{color:#f0c66a;font:700 13px Marcellus,serif;white-space:nowrap}.concept-switch{display:flex;gap:4px;overflow:auto}
+    .concept-switch button{border:1px solid transparent;color:#8f9bab;background:transparent;border-radius:5px;padding:7px 11px;white-space:nowrap}
+    .concept-switch button.active{color:#f7f8fa;border-color:#4b5665;background:#181d25}.concept-number{color:#f0c66a;margin-right:5px}
+    .prototype{--bg:#080d13;--surface:#101822;--surface2:#151f2b;--line:#263443;--text:#e7edf3;--muted:#8fa0b2;
+      --gold:#e6b95f;--gold2:#f2d58d;--green:#45c89a;--red:#ef7474;--blue:#69a9db;--accent:#e6b95f;
+      min-height:calc(100vh - 54px);background:var(--bg);color:var(--text);font:13px/1.45 Inter,sans-serif}
+    .prototype button,.prototype input,.prototype select{color:var(--text)}.app-shell{min-height:calc(100vh - 54px)}
+    .side{background:var(--surface);border-right:1px solid var(--line);padding:18px 12px;display:flex;flex-direction:column;gap:18px}
+    .brand{display:flex;align-items:center;gap:10px;padding:0 6px}.brand img{width:34px;height:34px;object-fit:contain;background:#222;border:1px solid var(--line);border-radius:7px;padding:4px}
+    .brand b{font:18px Marcellus,serif;color:var(--gold2)}.brand small{display:block;color:var(--muted);font:9px IBM Plex Mono,monospace;text-transform:uppercase}
+    .nav-list{display:flex;flex-direction:column;gap:4px}.nav-btn{border:0;background:transparent;display:flex;align-items:center;gap:10px;
+      min-height:38px;border-radius:5px;padding:8px 10px;color:var(--muted)!important;text-align:left;font-weight:600}.nav-btn svg{width:16px;height:16px}
+    .nav-btn:hover,.nav-btn.active{background:var(--surface2);color:var(--text)!important}.nav-btn.active{box-shadow:inset 3px 0 var(--accent)}
+    .side-foot{margin-top:auto;border-top:1px solid var(--line);padding:14px 7px 0;display:flex;align-items:center;gap:8px;color:var(--muted);font:11px IBM Plex Mono,monospace}
+    .pulse{width:7px;height:7px;border-radius:50%;background:var(--green);box-shadow:0 0 8px color-mix(in srgb,var(--green) 70%,transparent)}
+    .top{height:62px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 24px;gap:12px;background:color-mix(in srgb,var(--bg) 90%,transparent)}
+    .top-nav{display:none}.page-name{font-size:16px;font-weight:700}.page-sub{color:var(--muted);font-size:11px}.top-spacer{flex:1}
+    .price{font:600 11px IBM Plex Mono,monospace;border-left:1px solid var(--line);padding-left:14px}.price b{color:var(--gold2);display:block;font-size:13px}
+    .online{display:flex;align-items:center;gap:7px;color:var(--muted);border:1px solid var(--line);padding:7px 9px;border-radius:6px;font-size:11px}
+    .icon-btn{width:34px;height:34px;display:grid;place-items:center;border:1px solid var(--line);background:var(--surface);border-radius:6px}
+    .icon-btn svg{width:16px}.main{padding:22px 24px 38px;max-width:1480px;width:100%;margin:auto}.page{display:none}.page.active{display:block}
+    .section-head{display:flex;align-items:end;gap:12px;margin-bottom:14px}.section-head h1{margin:0;font-size:21px;line-height:1.2}.section-head p{margin:0;color:var(--muted)}
+    .section-head .actions{margin-left:auto;display:flex;gap:7px}.control{border:1px solid var(--line);background:var(--surface);border-radius:6px;padding:8px 10px;font-size:11px}
+    .kpis{display:grid;grid-template-columns:repeat(4,1fr);border:1px solid var(--line);border-radius:7px;overflow:hidden;background:var(--surface)}
+    .kpi{padding:15px 16px;border-right:1px solid var(--line);min-width:0}.kpi:last-child{border:0}.kpi span{display:block;color:var(--muted);font:10px IBM Plex Mono,monospace;text-transform:uppercase}
+    .kpi strong{font:700 24px IBM Plex Mono,monospace;display:block;margin:5px 0 2px}.kpi small{color:var(--muted)}.up{color:var(--green)!important}.down{color:var(--red)!important}
+    .grid-main{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(280px,.65fr);gap:16px;margin-top:16px}.panel{border:1px solid var(--line);background:var(--surface);border-radius:7px;min-width:0}
+    .panel-head{height:46px;border-bottom:1px solid var(--line);display:flex;align-items:center;padding:0 14px;gap:8px}.panel-head b{font-size:12px}.panel-head span{color:var(--muted);font-size:10px;margin-left:auto}
+    .chart-wrap{padding:14px 14px 6px;height:290px}.chart{width:100%;height:100%}.chart-grid line{stroke:var(--line);stroke-width:1}.chart-area{fill:color-mix(in srgb,var(--accent) 10%,transparent)}
+    .chart-line{fill:none;stroke:var(--accent);stroke-width:2.5;vector-effect:non-scaling-stroke}.chart-label{fill:var(--muted);font:9px IBM Plex Mono,monospace}
+    .tape{list-style:none;margin:0;padding:0}.tape li{display:grid;grid-template-columns:34px 1fr auto;gap:9px;align-items:center;padding:10px 12px;border-bottom:1px solid var(--line)}
+    .tape li:last-child{border:0}.item-img{width:32px;height:32px;object-fit:contain;background:color-mix(in srgb,var(--surface2) 80%,transparent);border:1px solid var(--line);border-radius:5px;padding:4px}
+    .tape b{display:block;font-size:11px}.tape small{color:var(--muted);font:9px IBM Plex Mono,monospace}.money{text-align:right;font:600 11px IBM Plex Mono,monospace}.money small{display:block}
+    .table-wrap{overflow:auto}.data-table{width:100%;border-collapse:collapse;min-width:720px}.data-table th{text-align:left;color:var(--muted);font:600 9px IBM Plex Mono,monospace;text-transform:uppercase;background:var(--surface2)}
+    .data-table th,.data-table td{padding:10px 12px;border-bottom:1px solid var(--line)}.data-table tr:last-child td{border:0}.data-table tr:hover td{background:color-mix(in srgb,var(--accent) 4%,var(--surface))}.data-table .num{text-align:right;font-family:IBM Plex Mono,monospace}
+    .item-cell{display:flex;align-items:center;gap:10px}.item-cell b{display:block}.item-cell small{color:var(--muted)}.badge{display:inline-flex;padding:3px 6px;border:1px solid var(--line);border-radius:4px;font:600 9px IBM Plex Mono,monospace;color:var(--muted)}
+    .toolbar{display:flex;gap:8px;margin-bottom:12px}.search{flex:1;min-width:180px;position:relative}.search svg{position:absolute;left:10px;top:9px;width:15px;color:var(--muted)}.search input{width:100%;padding:8px 10px 8px 34px}
+    .merchant-hero{display:grid;grid-template-columns:1.2fr .8fr;border:1px solid var(--line);background:var(--surface);border-radius:7px;overflow:hidden}
+    .merchant-copy{padding:24px;border-right:1px solid var(--line)}.eyebrow{font:600 10px IBM Plex Mono,monospace;color:var(--gold);text-transform:uppercase}.merchant-copy h1{font:26px Marcellus,serif;margin:7px 0}.merchant-copy p{color:var(--muted);max-width:620px}
+    .stock{padding:24px;display:flex;flex-direction:column;justify-content:center}.stock-line{display:flex;justify-content:space-between;font:11px IBM Plex Mono,monospace}.meter{height:8px;background:var(--surface2);border:1px solid var(--line);margin:10px 0;border-radius:4px;overflow:hidden}.meter i{display:block;height:100%;width:72%;background:var(--gold)}
+    .recipe-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-top:14px}.recipe{padding:14px;display:grid;grid-template-columns:42px 1fr;gap:10px;align-items:center}.recipe img{width:42px;height:42px;object-fit:contain}.recipe b{display:block}.recipe small{color:var(--muted)}
+    .realm-layout{display:grid;grid-template-columns:minmax(0,1.55fr) minmax(300px,.65fr);gap:16px}.map-panel{min-height:590px;position:relative;overflow:hidden;background:#17211b url('../MapImages/The Mainland.png') center/cover no-repeat;border:1px solid var(--line);border-radius:7px}
+    .map-panel:after{content:"";position:absolute;inset:0;background:rgba(4,8,10,.22);pointer-events:none}.map-top{position:absolute;z-index:2;left:14px;right:14px;top:14px;display:flex;gap:8px}.map-top .control{background:rgba(9,14,18,.9)}
+    .map-pin{position:absolute;z-index:3;width:13px;height:13px;border:3px solid #fff;border-radius:50%;background:var(--green);box-shadow:0 2px 10px #000}.map-pin.boss{width:18px;height:18px;background:var(--red);border-color:#ffe0b8}.map-pin.gold{background:var(--gold)}
+    .realm-side .panel{margin-bottom:14px}.server-row{display:flex;align-items:center;padding:11px 13px;border-bottom:1px solid var(--line);gap:9px}.server-row:last-child{border:0}.server-row b{font-size:11px}.server-row span{margin-left:auto;font:600 10px IBM Plex Mono,monospace;color:var(--muted)}
+    .player-list{display:grid;grid-template-columns:repeat(2,1fr);padding:8px}.player{padding:8px;color:var(--muted);display:flex;align-items:center;gap:7px;font-size:11px}.player i{width:6px;height:6px;border-radius:50%;background:var(--green)}
+
+    /* All four are evolutions of KinScan's current header + horizontal tab shell. */
+    .prototype .app-shell{display:grid;grid-template-rows:112px 1fr}.prototype .side{display:none}.prototype .top{height:112px;grid-column:1;padding:12px 24px 8px;flex-wrap:wrap;align-content:center;position:relative;z-index:4}
+    .prototype .top .brand{display:flex}.prototype .page-title{display:none}.prototype .top-nav{display:flex;order:3;width:100%;gap:3px;border-top:1px solid var(--line);padding-top:7px;margin-top:4px;overflow:auto}
+    .prototype .top-nav .nav-btn{min-height:32px;padding:6px 10px;white-space:nowrap}.prototype .top-nav .nav-btn.active{box-shadow:inset 0 -2px var(--accent);background:color-mix(in srgb,var(--accent) 8%,transparent)}
+    .prototype .main{grid-column:1;max-width:1440px;padding-top:26px;position:relative;z-index:2}.prototype .brand b{font-size:18px}.prototype .brand img{box-shadow:0 4px 18px rgba(0,0,0,.35)}
+    .prototype .panel,.prototype .kpis,.prototype .merchant-hero{position:relative;background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 7%,var(--surface2)) 0,var(--surface) 42%,color-mix(in srgb,var(--blue) 4%,var(--surface)) 100%);box-shadow:0 14px 38px rgba(0,0,0,.18),inset 0 1px rgba(255,255,255,.035);transition:transform .18s ease,border-color .18s ease,box-shadow .18s ease}
+    .prototype .panel:before,.prototype .kpis:before,.prototype .merchant-hero:before{content:"";position:absolute;z-index:2;left:-1px;right:-1px;top:-1px;height:1px;background:linear-gradient(90deg,transparent,var(--accent),var(--blue),transparent);opacity:.58;pointer-events:none}
+    .prototype .panel:hover{border-color:color-mix(in srgb,var(--accent) 48%,var(--line));box-shadow:0 18px 44px rgba(0,0,0,.28),inset 0 1px rgba(255,255,255,.055)}
+    .prototype .kpi{position:relative;transition:background .18s ease,transform .18s ease}.prototype .kpi:after{content:"";position:absolute;left:16px;right:16px;bottom:0;height:2px;transform:scaleX(0);transform-origin:left;background:linear-gradient(90deg,var(--accent),var(--blue));transition:transform .2s ease}
+    .prototype .kpi:hover,.prototype .kpi.selected{background:linear-gradient(145deg,color-mix(in srgb,var(--accent) 12%,transparent),transparent 65%);transform:translateY(-2px)}.prototype .kpi:hover:after,.prototype .kpi.selected:after{transform:scaleX(1)}
+    .prototype .data-table tbody tr:not(.detail-row){cursor:pointer}.prototype .data-table tbody tr:not(.detail-row) td{transition:background .16s ease,color .16s ease}.prototype .data-table tbody tr.selected td{background:color-mix(in srgb,var(--accent) 10%,var(--surface));color:var(--text)}
+    .detail-row td{padding:0!important;background:linear-gradient(90deg,color-mix(in srgb,var(--accent) 9%,var(--surface2)),var(--surface))!important}.row-detail{display:grid;grid-template-columns:repeat(4,1fr);gap:1px;background:var(--line);animation:detailIn .18s ease}.row-detail div{padding:13px 16px;background:color-mix(in srgb,var(--surface) 94%,transparent)}.row-detail span{display:block;color:var(--muted);font:9px IBM Plex Mono,monospace;text-transform:uppercase}.row-detail b{display:block;margin-top:4px;font:600 12px IBM Plex Mono,monospace}
+    .prototype .recipe{cursor:pointer;transition:transform .18s ease,border-color .18s ease,background .18s ease}.prototype .recipe:hover,.prototype .recipe.selected{transform:translateY(-3px);border-color:var(--gold);background:linear-gradient(135deg,color-mix(in srgb,var(--gold) 13%,var(--surface2)),var(--surface))}
+    .chart-wrap{position:relative;cursor:crosshair}.chart-inspector{position:absolute;top:14px;bottom:25px;width:1px;background:linear-gradient(180deg,transparent,var(--gold),transparent);pointer-events:none;opacity:0;transition:opacity .12s}.chart-inspector:after{content:"";position:absolute;top:var(--dot-y,50%);left:-4px;width:7px;height:7px;border-radius:50%;background:var(--gold);border:1px solid #fff;box-shadow:0 0 12px var(--gold)}.chart-tip{position:absolute;top:18px;left:18px;padding:6px 8px;border:1px solid var(--line);border-radius:5px;background:color-mix(in srgb,var(--surface) 92%,transparent);backdrop-filter:blur(8px);font:600 10px IBM Plex Mono,monospace;opacity:0;pointer-events:none;white-space:nowrap}.chart-wrap.inspecting .chart-inspector,.chart-wrap.inspecting .chart-tip{opacity:1}
+    @keyframes detailIn{from{opacity:0;transform:translateY(-5px)}to{opacity:1;transform:none}}
+
+    /* 01: current KinScan, with restrained gilded depth. */
+    .theme-1{--bg:#080d13;--surface:#101823;--surface2:#172231;--line:#2a3a4b;--text:#e8eef4;--muted:#8ea0b2;--gold:#e6b95f;--gold2:#f5d98d;--green:#45c89a;--red:#ef7474;--blue:#5f9fc9;--accent:#e6b95f;background:linear-gradient(135deg,#080d13 0,#0c151d 52%,#111714 100%)}
+    .theme-1 .top{background:linear-gradient(110deg,#101925 0,#0d141d 56%,#171811 100%);box-shadow:0 12px 34px rgba(0,0,0,.22)}.theme-1 .brand b{font-family:Marcellus,serif;color:var(--gold2)}.theme-1 .section-head h1{font-family:Marcellus,serif;font-size:25px}.theme-1 .kpi:nth-child(1) strong{color:var(--gold2)}.theme-1 .kpi:nth-child(2) strong{color:#f4f6f8}.theme-1 .kpi:nth-child(3) strong{color:var(--blue)}.theme-1 .kpi:nth-child(4) strong{color:var(--green)}
+
+    /* 02: crystalline realm glass, still using the current shell. */
+    .theme-2{--bg:#071312;--surface:rgba(9,25,24,.92);--surface2:#102b28;--line:#28504a;--text:#e8f4ef;--muted:#8cafaa;--gold:#e7c06a;--gold2:#f7dd9c;--green:#55d3a6;--red:#ee7a70;--blue:#62bcc2;--accent:#62bcc2;background:linear-gradient(145deg,rgba(4,14,14,.96),rgba(9,31,28,.94)),url('../MapImages/The Mainland.png') center/cover fixed}
+    .theme-2 .top{background:linear-gradient(110deg,rgba(7,24,23,.97),rgba(12,42,38,.96),rgba(24,31,21,.97));backdrop-filter:blur(14px)}.theme-2 .panel,.theme-2 .kpis,.theme-2 .merchant-hero{backdrop-filter:blur(11px);border-color:#315b54}.theme-2 .section-head h1,.theme-2 .merchant-copy h1{font-family:Marcellus,serif}.theme-2 .chart-area{fill:rgba(98,188,194,.12)}.theme-2 .map-panel{box-shadow:inset 0 0 70px rgba(3,14,13,.6),0 18px 50px rgba(0,0,0,.28)}
+
+    /* 03: a royal exchange treatment with oxblood, emerald, and gold. */
+    .theme-3{--bg:#120d0f;--surface:#201619;--surface2:#2b1c20;--line:#50323a;--text:#f6edef;--muted:#b39aa1;--gold:#edc46b;--gold2:#ffe2a0;--green:#63c7a5;--red:#e87678;--blue:#74a9bc;--accent:#edc46b;background:linear-gradient(140deg,#130d10 0,#1a1013 46%,#0d1816 100%);position:relative}
+    .theme-3:before{content:"";position:absolute;inset:0;background:repeating-linear-gradient(120deg,transparent 0,transparent 46px,rgba(255,255,255,.015) 47px,transparent 48px);pointer-events:none}.theme-3 .top{background:linear-gradient(105deg,#211419,#171114 58%,#10201d);border-bottom-color:#5a3940}.theme-3 .brand b,.theme-3 .section-head h1,.theme-3 .merchant-copy h1{font-family:Marcellus,serif;color:var(--gold2)}.theme-3 .badge{background:#352128;color:#f3c2c6}.theme-3 .recipe{border-left:2px solid var(--red)}.theme-3 .merchant-hero{border-top:2px solid var(--gold)}
+
+    /* 04: sharper midnight relic detailing with icy data accents. */
+    .theme-4{--bg:#08090b;--surface:#111317;--surface2:#191d22;--line:#303842;--text:#eef1f4;--muted:#939ea9;--gold:#dcae52;--gold2:#f0d18a;--green:#52c69b;--red:#e66f70;--blue:#78b9dd;--accent:#78b9dd;background:linear-gradient(125deg,#07090b 0,#10151a 58%,#15120c 100%)}
+    .theme-4 .top{background:linear-gradient(90deg,#11151b,#0c1014 58%,#1b170e);border-bottom-color:#3d4650}.theme-4 .brand b{font:700 17px IBM Plex Mono,monospace;text-transform:uppercase;color:var(--gold2)}.theme-4 .section-head h1{font:700 22px IBM Plex Mono,monospace}.theme-4 .panel,.theme-4 .kpis,.theme-4 .merchant-hero{border-color:#343e49}.theme-4 .panel:before,.theme-4 .kpis:before,.theme-4 .merchant-hero:before{background:linear-gradient(90deg,transparent,var(--blue),var(--gold),transparent)}.theme-4 .kpi strong{color:#f5f7f9}.theme-4 .data-table th{background:linear-gradient(90deg,#1b2128,#15191e)}
+
+    @media(prefers-reduced-motion:reduce){.prototype *{animation:none!important;transition:none!important}}
+
+    @media(max-width:980px){.kpis{grid-template-columns:repeat(2,1fr)}.kpi:nth-child(2){border-right:0}.kpi:nth-child(-n+2){border-bottom:1px solid var(--line)}.grid-main,.realm-layout{grid-template-columns:1fr}.recipe-grid{grid-template-columns:1fr 1fr}.top-nav{max-width:50vw;overflow:auto}.price{display:none}}
+    @media(max-width:700px){.concept-bar{padding:0 10px}.concept-bar strong{display:none}.prototype{min-height:calc(100vh - 54px)}
+      .prototype .app-shell{display:block}.side{display:none!important}.top{height:auto!important;min-height:104px;padding:10px 12px 7px!important;flex-wrap:wrap}.top .brand{display:flex!important}.top-nav{display:flex!important;order:3;width:100%;max-width:none;overflow:auto}.top-nav .nav-btn{white-space:nowrap}.page-title{display:none}.main{padding:16px 12px 30px}.section-head{align-items:start}.section-head p{display:none}.section-head .actions{margin-left:auto}.kpis{grid-template-columns:1fr 1fr}.kpi{padding:12px}.kpi strong{font-size:19px}.grid-main{gap:12px}.chart-wrap{height:230px}.merchant-hero{grid-template-columns:1fr}.merchant-copy{border-right:0;border-bottom:1px solid var(--line);padding:18px}.stock{padding:18px}.recipe-grid{grid-template-columns:1fr}.map-panel{min-height:440px}.online{display:none}.row-detail{grid-template-columns:1fr 1fr}}
+  </style>
+</head>
+<body>
+  <div class="concept-bar">
+    <strong>KinScan UI Directions</strong>
+    <div class="concept-switch" role="tablist">
+      <button class="active" data-theme="1"><span class="concept-number">01</span>Gilded Depth</button>
+      <button data-theme="2"><span class="concept-number">02</span>Realm Glass</button>
+      <button data-theme="3"><span class="concept-number">03</span>Royal Exchange</button>
+      <button data-theme="4"><span class="concept-number">04</span>Midnight Relic</button>
+    </div>
+  </div>
+  <div class="prototype theme-1" id="prototype">
+    <div class="app-shell">
+      <aside class="side">
+        <div class="brand"><img src="../icons_cache/gold.png" alt=""><div><b>KinScan</b><small>Market intelligence</small></div></div>
+        <nav class="nav-list">
+          <button class="nav-btn active" data-page="market" title="Market Watch"><i data-lucide="chart-no-axes-combined"></i><span>Market Watch</span></button>
+          <button class="nav-btn" data-page="index" title="Index"><i data-lucide="library-big"></i><span>Index</span></button>
+          <button class="nav-btn" data-page="merchant" title="Merchant"><i data-lucide="store"></i><span>Merchant</span></button>
+          <button class="nav-btn" data-page="sales" title="Sales Feed"><i data-lucide="receipt-text"></i><span>Sales Feed</span></button>
+          <button class="nav-btn" data-page="world" title="Live World"><i data-lucide="map"></i><span>Live World</span></button>
+        </nav>
+        <div class="side-foot"><i class="pulse"></i><span>24 users online</span></div>
+      </aside>
+      <header class="top">
+        <div class="brand"><img src="../icons_cache/gold.png" alt=""><div><b>KinScan</b><small>Market intelligence</small></div></div>
+        <nav class="top-nav">
+          <button class="nav-btn active" data-page="market">Market Watch</button>
+          <button class="nav-btn" data-page="index">Index</button>
+          <button class="nav-btn" data-page="merchant">Merchant</button>
+          <button class="nav-btn" data-page="sales">Sales Feed</button>
+          <button class="nav-btn" data-page="world">Live World</button>
+        </nav>
+        <div class="page-title"><div class="page-name">Market Watch</div><div class="page-sub">Realm-wide marketplace intelligence</div></div>
+        <div class="top-spacer"></div>
+        <div class="price"><span>$KINS</span><b>$0.0068</b></div>
+        <div class="online"><i class="pulse"></i>24 online</div>
+        <button class="icon-btn" title="Search"><i data-lucide="search"></i></button>
+      </header>
+      <main class="main">
+        <section class="page active" id="market-page">
+          <div class="section-head"><div><h1>Marketplace pulse</h1><p>All currencies normalized at current realm rates</p></div><div class="actions"><select class="control"><option>24 hours</option><option>7 days</option></select><button class="icon-btn" title="Refresh"><i data-lucide="refresh-cw"></i></button></div></div>
+          <div class="kpis">
+            <div class="kpi"><span>Trading volume</span><strong>$28.4K</strong><small class="up">+18.4% vs prior day</small></div>
+            <div class="kpi"><span>Marketplace trades</span><strong>5,842</strong><small>243 per hour</small></div>
+            <div class="kpi"><span>Gold spot</span><strong>$2.83</strong><small class="down">-3.2% today</small></div>
+            <div class="kpi"><span>Active listings</span><strong>8,196</strong><small class="up">412 added today</small></div>
+          </div>
+          <div class="grid-main">
+            <div class="panel"><div class="panel-head"><b>Marketplace volume</b><span>USD at trade time</span></div><div class="chart-wrap">
+              <svg class="chart" viewBox="0 0 760 250" preserveAspectRatio="none"><g class="chart-grid"><line x1="0" y1="45" x2="760" y2="45"/><line x1="0" y1="105" x2="760" y2="105"/><line x1="0" y1="165" x2="760" y2="165"/><line x1="0" y1="225" x2="760" y2="225"/></g><path class="chart-area" d="M0 218 L38 198 L76 203 L114 178 L152 190 L190 146 L228 160 L266 128 L304 142 L342 95 L380 118 L418 89 L456 103 L494 68 L532 84 L570 51 L608 72 L646 39 L684 59 L722 26 L760 42 L760 230 L0 230Z"/><path class="chart-line" d="M0 218 L38 198 L76 203 L114 178 L152 190 L190 146 L228 160 L266 128 L304 142 L342 95 L380 118 L418 89 L456 103 L494 68 L532 84 L570 51 L608 72 L646 39 L684 59 L722 26 L760 42"/><g class="chart-label"><text x="0" y="248">00:00</text><text x="240" y="248">08:00</text><text x="495" y="248">16:00</text><text x="714" y="248">NOW</text></g></svg>
+            </div></div>
+            <div class="panel"><div class="panel-head"><b>Live tape</b><span>just now</span></div><ul class="tape">
+              <li><img class="item-img" src="../icons_cache/wood.png" alt=""><div><b>Wood</b><small>1,900 units · ZknUnknown</small></div><div class="money">$0.20<small class="up">15s ago</small></div></li>
+              <li><img class="item-img" src="../icons_cache/molten_rock.png" alt=""><div><b>Molten Rock</b><small>240 units · firelord</small></div><div class="money">$14.80<small>42s ago</small></div></li>
+              <li><img class="item-img" src="../icons_cache/potion_health.svg" alt=""><div><b>Health Potion</b><small>25 units · Midas</small></div><div class="money">3 gold<small>1m ago</small></div></li>
+              <li><img class="item-img" src="../icons_cache/mount_spider.png" alt=""><div><b>Web Weaver</b><small>1 mount · SnakeEyes</small></div><div class="money">$800<small>3m ago</small></div></li>
+            </ul></div>
+          </div>
+        </section>
+
+        <section class="page" id="index-page">
+          <div class="section-head"><div><h1>Market index</h1><p>Live floors, supply, liquidity, and price movement</p></div><div class="actions"><button class="icon-btn" title="Export"><i data-lucide="download"></i></button></div></div>
+          <div class="toolbar"><div class="search"><i data-lucide="search"></i><input class="control" placeholder="Search items"></div><select class="control"><option>All categories</option><option>Materials</option><option>Mounts</option></select><select class="control"><option>Most sold</option><option>Cheapest</option><option>Newest</option></select></div>
+          <div class="panel table-wrap"><table class="data-table"><thead><tr><th>Item</th><th>Market</th><th class="num">Floor</th><th class="num">24h</th><th class="num">7d volume</th><th class="num">In world</th><th class="num">Liquidity</th></tr></thead><tbody>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/molten_rock.png" alt=""><div><b>Molten Rock</b><small>Material · Emberstone</small></div></div></td><td><span class="badge">HOT</span></td><td class="num">1,842 $KINS</td><td class="num up">+14.8%</td><td class="num">18,420</td><td class="num">204K</td><td class="num">92</td></tr>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/wood.png" alt=""><div><b>Wood</b><small>Material · Mainland</small></div></div></td><td><span class="badge">DEEP</span></td><td class="num">29 $KINS</td><td class="num down">-2.1%</td><td class="num">2.8M</td><td class="num">41.2M</td><td class="num">99</td></tr>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/mount_spider.png" alt=""><div><b>Web Weaver</b><small>Mount · Spider Lair</small></div></div></td><td><span class="badge">RARE</span></td><td class="num">112K $KINS</td><td class="num up">+36.0%</td><td class="num">7</td><td class="num">184</td><td class="num">38</td></tr>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/potion_health.svg" alt=""><div><b>Health Potion</b><small>Potion · Crafted</small></div></div></td><td><span class="badge">STEADY</span></td><td class="num">148 $KINS</td><td class="num up">+0.8%</td><td class="num">86K</td><td class="num">1.7M</td><td class="num">86</td></tr>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/gold.png" alt=""><div><b>Gold</b><small>Currency · Realm</small></div></div></td><td><span class="badge">BENCHMARK</span></td><td class="num">416 $KINS</td><td class="num down">-3.2%</td><td class="num">3,819</td><td class="num">29,065</td><td class="num">74</td></tr>
+          </tbody></table></div>
+        </section>
+
+        <section class="page" id="merchant-page">
+          <div class="section-head"><div><h1>Traveling merchant</h1><p>Live stock, recipe economics, and realm progress</p></div><div class="actions"><span class="badge up">SELLING NOW</span></div></div>
+          <div class="merchant-hero"><div class="merchant-copy"><div class="eyebrow">Realm merchant · active phase</div><h1>The gold cart is open</h1><p>Trade resource bundles for gold while stock remains. Current market costs are normalized against the cheapest live stacks.</p><div style="margin-top:16px"><span class="badge">Next phase forecast: 6h 18m</span></div></div><div class="stock"><div class="stock-line"><span>Gold remaining</span><b>2,164 / 3,000</b></div><div class="meter"><i></i></div><div class="stock-line"><span>Claimed this phase</span><span>836 gold</span></div></div></div>
+          <div class="recipe-grid">
+            <div class="panel recipe"><img src="../icons_cache/wood.png" alt=""><div><b>Wood bundle</b><small>600 wood + 80 metal</small><div class="up">Cost $2.18 · Receive 1 gold</div></div></div>
+            <div class="panel recipe"><img src="../icons_cache/stone.png" alt=""><div><b>Stone bundle</b><small>450 stone + 80 metal</small><div>Cost $2.66 · Receive 1 gold</div></div></div>
+            <div class="panel recipe"><img src="../icons_cache/cooked_fish_meat.png" alt=""><div><b>Cooked fish</b><small>120 fish + 80 metal</small><div class="down">Cost $3.12 · Receive 1 gold</div></div></div>
+          </div>
+          <div class="grid-main"><div class="panel"><div class="panel-head"><b>Gold stock burn-down</b><span>current phase</span></div><div class="chart-wrap"><svg class="chart" viewBox="0 0 760 250" preserveAspectRatio="none"><g class="chart-grid"><line x1="0" y1="45" x2="760" y2="45"/><line x1="0" y1="105" x2="760" y2="105"/><line x1="0" y1="165" x2="760" y2="165"/><line x1="0" y1="225" x2="760" y2="225"/></g><path class="chart-line" d="M0 28 L95 38 L190 58 L285 74 L380 110 L475 129 L570 164 L665 180 L760 202"/></svg></div></div><div class="panel"><div class="panel-head"><b>Best route</b><span>live books</span></div><ul class="tape"><li><img class="item-img" src="../icons_cache/wood.png" alt=""><div><b>Buy wood bundle</b><small>23% below gold value</small></div><div class="money up">+$0.65</div></li><li><img class="item-img" src="../icons_cache/stone.png" alt=""><div><b>Buy stone bundle</b><small>6% below gold value</small></div><div class="money up">+$0.17</div></li><li><img class="item-img" src="../icons_cache/cooked_fish_meat.png" alt=""><div><b>Avoid fish bundle</b><small>10% above gold value</small></div><div class="money down">-$0.29</div></li></ul></div></div>
+        </section>
+
+        <section class="page" id="sales-page">
+          <div class="section-head"><div><h1>Verified sales</h1><p>Completed marketplace transactions, newest first</p></div><div class="actions"><button class="icon-btn" title="Pause live feed"><i data-lucide="pause"></i></button></div></div>
+          <div class="toolbar"><div class="search"><i data-lucide="search"></i><input class="control" placeholder="Item or seller"></div><select class="control"><option>All currencies</option><option>Gold</option><option>$KINS</option></select><select class="control"><option>All categories</option></select></div>
+          <div class="panel table-wrap"><table class="data-table"><thead><tr><th>Sale</th><th>Seller</th><th class="num">Quantity</th><th class="num">Total paid</th><th class="num">Unit price</th><th class="num">Listed for</th><th class="num">When</th></tr></thead><tbody>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/wood.png" alt=""><b>Wood</b></div></td><td>ZknUnknown</td><td class="num">1,900</td><td class="num">$0.20</td><td class="num">0.015 $KINS</td><td class="num">12.1h</td><td class="num up">15s ago</td></tr>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/molten_rock.png" alt=""><b>Molten Rock</b></div></td><td>firelord</td><td class="num">240</td><td class="num">$14.80</td><td class="num">9.1 $KINS</td><td class="num">38m</td><td class="num">42s ago</td></tr>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/mount_spider.png" alt=""><b>Web Weaver</b></div></td><td>SnakeEyes</td><td class="num">1</td><td class="num">$800.00</td><td class="num">118K $KINS</td><td class="num">4.2d</td><td class="num">3m ago</td></tr>
+            <tr><td><div class="item-cell"><img class="item-img" src="../icons_cache/potion_health.svg" alt=""><b>Health Potion</b></div></td><td>Midas</td><td class="num">25</td><td class="num">3 gold</td><td class="num">0.12 gold</td><td class="num">2.8h</td><td class="num">5m ago</td></tr>
+          </tbody></table></div>
+        </section>
+
+        <section class="page" id="world-page">
+          <div class="section-head"><div><h1>Live world</h1><p>Realm activity and marketplace traffic</p></div><div class="actions"><select class="control"><option>Mainland 1</option><option>Mainland 2</option></select></div></div>
+          <div class="realm-layout"><div class="map-panel"><div class="map-top"><button class="control">Mainland 1 · 184 online</button><button class="icon-btn" title="Center map"><i data-lucide="locate-fixed"></i></button></div><i class="map-pin" style="left:48%;top:46%"></i><i class="map-pin gold" style="left:56%;top:41%"></i><i class="map-pin" style="left:42%;top:54%"></i><i class="map-pin" style="left:61%;top:58%"></i><i class="map-pin boss" style="left:76%;top:24%"></i></div><div class="realm-side"><div class="panel"><div class="panel-head"><b>Realm population</b><span>live</span></div><div class="server-row"><i class="pulse"></i><b>Mainland 1</b><span>184</span></div><div class="server-row"><i class="pulse"></i><b>Mainland 2</b><span>132</span></div><div class="server-row"><i class="pulse"></i><b>Frostmere</b><span>88</span></div><div class="server-row"><i class="pulse"></i><b>Emberstone</b><span>74</span></div></div><div class="panel"><div class="panel-head"><b>Nearby traders</b><span>12 visible</span></div><div class="player-list"><div class="player"><i></i>ZknUnknown</div><div class="player"><i></i>Midas</div><div class="player"><i></i>firelord</div><div class="player"><i></i>SnakeEyes</div><div class="player"><i></i>KinsKing</div><div class="player"><i></i>StoneMan</div></div></div><div class="panel"><div class="panel-head"><b>Area signal</b><span>last 10m</span></div><ul class="tape"><li><img class="item-img" src="../icons_cache/gold.png" alt=""><div><b>Merchant plaza</b><small>42 players · high traffic</small></div><div class="money up">+18%</div></li><li><img class="item-img" src="../icons_cache/molten_rock.png" alt=""><div><b>Emberstone gate</b><small>Boss crowd forming</small></div><div class="money">26</div></li></ul></div></div></div>
+        </section>
+      </main>
+    </div>
+  </div>
+  <script>
+    const prototype=document.querySelector('#prototype');
+    const names={market:['Market Watch','Realm-wide marketplace intelligence'],index:['Index','Live item pricing and supply'],merchant:['Merchant','Traveling merchant economics'],sales:['Sales Feed','Verified marketplace transactions'],world:['Live World','Realm population and activity']};
+    function refreshIcons(){if(window.lucide)lucide.createIcons({attrs:{'stroke-width':1.8}})}
+    document.querySelectorAll('.concept-switch button').forEach(button=>button.addEventListener('click',()=>{
+      document.querySelectorAll('.concept-switch button').forEach(x=>x.classList.toggle('active',x===button));
+      prototype.className='prototype theme-'+button.dataset.theme;refreshIcons();
+    }));
+    document.querySelectorAll('.nav-btn[data-page]').forEach(button=>button.addEventListener('click',()=>{
+      const page=button.dataset.page;
+      document.querySelectorAll('.nav-btn[data-page]').forEach(x=>x.classList.toggle('active',x.dataset.page===page));
+      document.querySelectorAll('.page').forEach(x=>x.classList.toggle('active',x.id===page+'-page'));
+      document.querySelector('.page-name').textContent=names[page][0];
+      document.querySelector('.page-sub').textContent=names[page][1];
+      refreshIcons();
+    }));
+    document.querySelectorAll('.kpi').forEach(card=>card.addEventListener('click',()=>{
+      card.parentElement.querySelectorAll('.kpi').forEach(x=>x.classList.toggle('selected',x===card));
+    }));
+    document.querySelectorAll('.recipe').forEach(card=>card.addEventListener('click',()=>{
+      document.querySelectorAll('.recipe').forEach(x=>x.classList.toggle('selected',x===card));
+    }));
+    document.querySelectorAll('#index-page tbody tr').forEach(row=>row.addEventListener('click',()=>{
+      const open=row.classList.contains('selected');
+      document.querySelectorAll('#index-page tbody tr').forEach(x=>x.classList.remove('selected'));
+      document.querySelectorAll('#index-page .detail-row').forEach(x=>x.remove());
+      if(open)return;
+      row.classList.add('selected');
+      const cells=row.querySelectorAll('td'),name=row.querySelector('.item-cell b').textContent;
+      const detail=document.createElement('tr');detail.className='detail-row';
+      detail.innerHTML='<td colspan="7"><div class="row-detail"><div><span>Selected asset</span><b>'+name+'</b></div><div><span>Current floor</span><b>'+cells[2].textContent+'</b></div><div><span>Seven-day activity</span><b>'+cells[4].textContent+' units</b></div><div><span>Market signal</span><b class="up">Open full scorecard →</b></div></div></td>';
+      row.after(detail);
+    }));
+    document.querySelectorAll('.chart-wrap').forEach(wrap=>{
+      const line=document.createElement('i'),tip=document.createElement('div');
+      line.className='chart-inspector';tip.className='chart-tip';wrap.append(line,tip);
+      wrap.addEventListener('pointermove',event=>{
+        const rect=wrap.getBoundingClientRect(),x=Math.max(14,Math.min(rect.width-14,event.clientX-rect.left)),pct=x/rect.width;
+        line.style.left=x+'px';line.style.setProperty('--dot-y',(78-pct*60)+'%');
+        tip.style.left=Math.max(12,Math.min(rect.width-145,x+12))+'px';
+        if(wrap.closest('#merchant-page'))tip.textContent=Math.round(3000-pct*836).toLocaleString()+' gold remaining';
+        else tip.textContent=String(Math.floor(pct*24)).padStart(2,'0')+':00 · $'+Math.round(540+pct*1860).toLocaleString()+' volume';
+        wrap.classList.add('inspecting');
+      });
+      wrap.addEventListener('pointerleave',()=>wrap.classList.remove('inspecting'));
+    });
+    refreshIcons();
+  </script>
+</body>
+</html>

@@ -38,6 +38,9 @@ defaults to `./market.db` locally, `/opt/kintara-data/market.db` when hosted —
 before they can be created+sold inside a full-poll window — see "Two-tier polling"),
 `KINTARA_MIN_GAP` (0.5 — global min seconds between **any** two
 kintara.gg requests, a shared pacer across all loops ⇒ ≈ ≤2 req/s total),
+`API_SNAPSHOT_TTL` (180 — age at which a cached Index/market-cap snapshot is refreshed in the
+background; readers are never blocked), `WARMUP_INTERVAL` (120 — how often `warmup_loop` re-primes
+those snapshots), `LISTINGS_REPROBE_SEC` (900 — how often to re-probe the login-gated listings API),
 `KINTARA_BACKOFF` (45 — pause after a 429/403), `STATS_STALE_HOT`/`STATS_STALE_COLD`
 (120/900 — per-item stats refresh cadence). All kintara.gg requests go through
 `pace_kintara()` so it can run continuously without bursting the marketplace.
@@ -154,7 +157,7 @@ endpoints when first probed.
 
 | What | Endpoint | Notes |
 |---|---|---|
-| Active listings | `GET kintara.gg/api/marketplace/listings?sort=cheapest&currency=all&category=all&limit=100&offset=0&q=<itemType>` | Returns `{ok, listings[], total, limit, offset, hasMore}`. Each listing: `id, sellerId, sellerName, itemType, quantity, priceGold, currency, priceUsd, createdAt, reservedBy, reservedUntilMs, itemDurability`. **Page size caps at 100; `offset` caps at ~500** (deep offsets return an empty page with `total:null` — a hard upstream limit). `currency`/`category` are **ignored**, but **`q=` filters server-side** (substring match on itemType) — that's how we page the whole book: query **per item type** (`fetch_book_by_item()`), since almost every item is under the 500 cap. **No public sales-history here;** we build it ourselves. |
+| Active listings — **⚠ LOGIN-GATED since 2026-07-28** | `GET kintara.gg/api/marketplace/listings?sort=cheapest&currency=all&category=all&limit=100&offset=0&q=<itemType>` | **Now returns `401 {"ok":false,"error":"unauthorized"}` to anonymous callers** (any UA/Referer; `/api/marketplace/stats` on the same host still works, so it's a real auth gate, not a bot block). The live order book is therefore unavailable to the tracker: floors/arbitrage/live-listings degrade and the Index + market caps fall back to `recent_avg_usd_map()` (avg price actually paid). `listings_available()` latches this on the first 401 and re-probes every 15 min so it self-heals if reopened. Historic shape, for when it returns: `{ok, listings[], total, limit, offset, hasMore}`. Each listing: `id, sellerId, sellerName, itemType, quantity, priceGold, currency, priceUsd, createdAt, reservedBy, reservedUntilMs, itemDurability`. **Page size caps at 100; `offset` caps at ~500** (deep offsets return an empty page with `total:null` — a hard upstream limit). `currency`/`category` are **ignored**, but **`q=` filters server-side** (substring match on itemType) — that's how we page the whole book: query **per item type** (`fetch_book_by_item()`), since almost every item is under the 500 cap. **No public sales-history here;** we build it ourselves. |
 | Daily completed sales | `GET kintara.gg/api/marketplace/stats?[currency=token&]itemType=<x>` | `{ok, currency, avg30d, samples:[{date, avgUnitPrice, sales}]}`. **Daily only** (ignores interval params), ~30 days, **sparse** (only days with sales). `avgUnitPrice` is per single item; gold prices are rounded to 2 decimals (sub-cent gold collapses to 0). Omit `currency` = gold; `currency=token` = USD. |
 | Live KINS price (USD) | `GET kintara.gg/api/token/blimp-stats` | `{priceUsd, ...}` — kintara's own KINS/USD, matches their index page. |
 | Item art | `kintara.gg/assets/hud/<category>/<name>.(png|svg)` | Real in-game icons. Mapping is per-item (`ICON_OVERRIDES` + `icon_asset()`); cosmetics = `cosmetics/<itemType>.png`, keys = bronze/silver/gold. **Pets/furniture**: the exact per-item paths aren't in the override map, so `icon_candidates()` probes likely schemes (`pets/<name>.png`, `furniture/<name>.png`, …) and `/icon` caches the first 200. Cache misses return immediately and enter a bounded 2-worker background discovery queue; failed guesses are negative-cached for 1h, so missing art cannot tie up visitor threads. Cached under a `__art` namespace so the old generic-paw files don't shadow real art. **The probed paths are unverified guesses** — confirm a real one in-browser and add it to `ICON_OVERRIDES` if a pet/furniture stays blank. |
@@ -163,6 +166,7 @@ endpoints when first probed.
 | **Gold USD price history (fallback)** | (ripped from `kintaragold.xyz` HTML) | The page embeds `"history":[{t,price}]` + `"spotPriceUsd"` in its RSC payload (escaped, can straddle chunk boundaries — we regex the `t`/`price` pairs). Independent gold-USD series (~10-min, ~25 days), NOT derived from KINS. `fetch_kintara_gold_history()`, cached ~3 min. Used **only to backfill the stretch before our own `gold_price` data begins** (see `gold_series_for_chart()`) and as the gold-rate fallback when no live gold listings exist. |
 | **KINS/USD price history** | `GET api.geckoterminal.com/api/v2/networks/solana/pools/<POOL>/ohlcv/<tf>?aggregate=&limit=&currency=usd&token=base` | Pool `F42tZnKPavq1VUcrL6ymhc6YqVpt84fWwgzbNTv2wb3W` (KINS/SOL on pumpswap). `currency=usd` already converts SOL→USD (no separate SOL feed needed). Valid aggregates: minute 1/5/15, hour 1/4/12, day 1. **Rate-limits if hammered** — we cache (see below). |
 | **Treasury KINS ledger** | Solana JSON-RPC on the treasury's KINS token account | `build_treasury_index.py` resolves the KINS mint from the GeckoTerminal pool, finds the treasury wallet's KINS token account, pages Helius `getTransactionsForAddress` when available (full transactions, cursor pagination), otherwise falls back to `getSignaturesForAddress` + parallel `getTransaction`, decodes each transaction's KINS owner deltas, and writes every KINS balance-changing treasury row to `treasury_txns`. It classifies flow shapes (`marketplace_trade`, `treasury_income`, `treasury_payout`, etc.) and also writes proven 5% marketplace-fee trades to `market_txns`. Live sample: marketplace fee is 500 bps and recent marketplace rows use program `L2TExMFKdjpN9kozasaurPirfHy9P8sbXoAN1qA3S95`. Default treasury owner: `4zW4zuZb9rXpvw3cTYyGoQ2iHTtG9E17YpdeNUbwuQVt`; current token account: `FawpB6tqFaZybcQjUzHaSXFASmRRzxuFzTEsbGzxHFq4`. Use archival `SOLANA_RPC`/`RPC`; public RPC is okay for probes but not complete history. Helius 413/403 batch errors are avoided by default (`BATCH=1`) and handled by adaptive splitting when batching is enabled. Fallback throughput is governed by `TX_WORKERS`, `TX_CHUNK`, and `RPC_RPS`. |
+| **Chest definitions / opening** | Authenticated `GET /api/chests/kiosk`, `GET /api/chests/defs?ids=...`; `POST /api/chests/buy`, `/api/chests/open-ticker`, `/api/chests/open-quote`, `/api/chests/open` | Current client odds are Blue 80%, Purple 15.92%, Pink 3.19%, Red 0.64%, Gold 0.25%; conditional Gold A/B/C weights are 10/30/60 (overall 0.025%/0.075%/0.15%). Blue is a shared fixed pool of L1/L2 sword, pickaxe and axe plus wood/stone/coal/metal (materials roll 5-200); each chest definition supplies one Purple, Pink and Red reward plus three Gold rewards. Current definitions are Angel and Demon chests. They are bought from the Mainland machine, become tradeable inventory items, and yield one server-rolled reward when opened. Opening quotes peg the debit to $2 of KINS. Despite the community wiki saying it is burned, the shipped `spinner-paid-wallet.mjs` explicitly treats chest unlocks as zero burn and a 100% treasury transfer. Rewards spill to bank when inventory is full; both full rejects the open. Definitions are dynamic and account-protected, so exact active pools/prices should be refreshed from an authenticated client rather than baked into the tracker. |
 | **Server list** | `GET kintara.gg/api/servers` | `{ok, servers:[{id, name, populationLabel, full, queueLength, minLevel}]}`. Live population + queue per game server. Drives the top status bar. `fetch_servers()`, cached ~30s (last-good on failure). |
 | **Traveling-merchant state** | `GET kintara.gg/api/world/merchant-campaign` | kintara.gg's **own** public endpoint (no auth; the game client reads it the same way via `KINTARA_READ_FANOUT_ORIGIN`, also reachable at `ktra-server-b.onrender.com`). Returns `{ok, mode, wood, stone, coal, cooked_fish_meat, metal, goals:{...}, complete, goldTradeEnabled, goldStock, goldStockFull}`. **No overall %** — we compute it as the mean of the five per-resource (capped) percentages. `fetch_merchant()`, cached ~60s (last-good on failure). |
 | **Merchant gold-mint recipe** | (from `kintara.gg/game.js` `MERCHANT_TRADE_COST`) | `MERCHANT_RECIPE` = resources consumed per 1 gold minted: 2500 wood + 1500 stone + 700 coal + 30 cooked_fish_meat. This is now separate from the **donation campaign** resources (`MERCHANT_CAMPAIGN_RESOURCES`: wood, stone, coal, cooked fish, **metal**); the cost calculator follows the current gold-trade recipe, while the left progress tracker follows the live campaign goals. |
@@ -852,6 +856,38 @@ A site-wide quality-of-life pass that sits under every tab:
 Keep a short running note here of meaningful changes (newest first), so a fresh chat
 sees the latest state at a glance.
 
+- **Listings API login-gated upstream → circuit breaker, sales-based valuation, instant first load.**
+  On **2026-07-28** kintara put `GET /api/marketplace/listings` behind a login (`401 {"ok":false,
+  "error":"unauthorized"}` for anonymous callers, with any UA/Referer) — the live order book is no
+  longer public, which is why listing data froze 9 days out while `/stats` kept flowing. Fixes:
+  - **Circuit breaker** (`listings_available()` / `LISTINGS_REPROBE_SEC`=900): the first 401 latches
+    "unavailable", all listing fetches become instant no-ops, and we re-probe every 15 min so the site
+    self-heals if kintara reopens it. Previously every loop retried forever (**93k+** failures),
+    pegging the 1-vCPU box and saturating the shared `pace_kintara()` budget — starving `/stats`,
+    icons, and everything else that still works. `poll_loop`/`firstpage_loop` now idle instead.
+  - **Valuation fallback:** new `recent_avg_usd_map()` prices every item from the still-public
+    completed-sale archive (30-day sales-weighted avg per-unit USD, gold days converted at that day's
+    gold rate). The Index price columns and market caps therefore keep **real** numbers — what items
+    actually SOLD for rather than an unobtainable ask. Rows carry `value_usd` + `value_basis`
+    (`live_floor` | `avg_sale`), the payload carries `listings_live`, and the UI marks fallback prices
+    with a `~` plus a note. Reverts to live floors automatically if the API reopens.
+  - **`retire_stale_listings()`:** ~**292k** phantom `active` rows (unseen 9+ days) were both quoting
+    dead asks as live floors and making every `WHERE active=1` floor pass scan ~36× the real ~8.3k book
+    (**2.6s**). Runs at startup; back-dates `removed_at` to the row's own `last_seen` so the sale
+    matcher (45-min window) can never read the cleanup as a wave of fresh sales.
+  - **Cache-first serving (launch-critical):** `api_cache_swr()` serves the heavy Index/market-cap
+    payloads **stale-while-revalidate** — always instant from cache, refreshed in a background thread
+    once older than `API_SNAPSHOT_TTL` (180s) — and `warmup_loop` pre-builds all three Index windows +
+    the leaderboard at startup and every `WARMUP_INTERVAL` (120s). Only a true cold start can block.
+    `/api/sales-summary` went from ~3.8s to ~3ms; the window param is bounded to 1/7/30 to cap the
+    cache keyspace, and the item-universe query now uses `DISTINCT` so the `item_type` index does the
+    work instead of scanning ~1M listing rows.
+
+- **Chest system reverse-engineered (research only; no app behavior changed).** Recorded the protected
+  kiosk/definition/buy/open endpoints, exact rarity and Gold-subtier weights, fixed Blue pool, dynamic
+  premium-pool structure, inventory/bank grant behavior, and server-authoritative roll flow. Corrected
+  an upstream-wiki discrepancy: the current wallet code sends the $2 KINS unlock payment 100% to the
+  treasury; it does not burn it.
 - **Free first-party analytics + live visitor count + production request concurrency.** Added a
   compact header bubble showing unique anonymous browsers active in the last 75s, deduplicated across
   tabs. Privacy-preserving daily visitor/visit/tab and performance aggregates are batched into SQLite,
