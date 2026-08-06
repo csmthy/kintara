@@ -4801,23 +4801,21 @@ def make_app():
                    "labels": labels, "gold_item": gold_item}
         return jsonify(api_cache_put("items", payload))
 
-    @app.route("/api/market-watch")
-    @single_flight("market-watch")
-    def market_watch():
-        """Stats for the Market Watch home page, aggregated live from market.db (95k
-        treasury-derived txns, each priced in USD at the trade's own minute).
+    def _build_market_watch():
+        """Stats for the Market Watch home page, aggregated from market.db (treasury-derived
+        txns, each priced in USD at the trade's own minute).
 
         Trading volume = the **marketplace** category ONLY (player↔player item trades). The
         **spin wheel** (the `sink` category — the only txns that burn ~50% of what the player
         pays) is gambling, NOT trading, so it's reported in its own `spinwheel` block and kept
-        out of every market total. Cached briefly because the all-history aggregates
-        grow with the ledger and otherwise repeat for every visitor."""
-        cached = api_cache_get("market-watch", 60)
-        if cached is not None:
-            return jsonify(cached)
+        out of every market total.
+
+        This is the HOME PAGE payload and the heaviest read we have — it scans the whole ledger
+        (~522k rows / 281MB and growing), which is ~10s on the production box. It is therefore
+        never built on a request: warmup_loop pre-builds it and api_cache_swr serves it."""
         mcon = market_connect()
         if mcon is None:
-            return jsonify({"ok": False, "error": "market dataset not loaded"}), 503
+            return {"ok": False, "error": "market dataset not loaded"}
         try:
             meta = {r["k"]: r["v"] for r in mcon.execute("SELECT k, v FROM meta")}
             cats = {}
@@ -4887,7 +4885,13 @@ def make_app():
             "daily": daily,
             "top_trades": top,
         }
-        return jsonify(api_cache_put("market-watch", payload))
+        return payload
+
+    @app.route("/api/market-watch")
+    def market_watch():
+        """Home-page payload, served stale-while-revalidate (never built on a request)."""
+        payload = api_cache_swr("market-watch", API_SNAPSHOT_TTL, _build_market_watch)
+        return (jsonify(payload), 503) if not payload.get("ok") else jsonify(payload)
 
     def _build_market_caps():
         """Every item ranked by **market cap** = total world units × per-unit USD value.
@@ -6354,7 +6358,9 @@ def make_app():
         the first visitor after a deploy is fast too, and nobody ever blocks on a rebuild — the
         site always has a warm snapshot to serve and freshness comes from this timer."""
         interval = WARMUP_INTERVAL if interval is None else interval
-        jobs = [(("sales-summary", w), (lambda w=w: _build_sales_summary(w))) for w in (1, 7, 30)]
+        # market-watch first: it's the landing page and the heaviest read (whole ledger scan).
+        jobs = [("market-watch", _build_market_watch)]
+        jobs += [(("sales-summary", w), (lambda w=w: _build_sales_summary(w))) for w in (1, 7, 30)]
         jobs.append(("market-caps", _build_market_caps))
         first = True
         while True:
