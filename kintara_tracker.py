@@ -4737,7 +4737,9 @@ def make_app():
         n = con.execute("SELECT COUNT(*) c FROM listings").fetchone()["c"]
         con.close()
         meta = api_cache_put("status-meta", {"tracking_since": since, "total_rows": n})
-        return jsonify({**_state, **meta})
+        # listings_live tells the UI whether the live order book is obtainable, so the
+        # listings/arbitrage tabs can explain themselves instead of looking broken.
+        return jsonify({**_state, **meta, "listings_live": listings_available()})
 
     @app.route("/api/analytics/heartbeat", methods=["POST"])
     def analytics_heartbeat_route():
@@ -7703,11 +7705,30 @@ async function loadStatus(){
   // Only surface a quiet note once it's *persistently* failing (several misses AND no
   // successful update in a few minutes) — i.e. the data is actually going stale.
   let s; try{ s=await (await fetch("/api/status")).json(); }catch(e){ return; }
+  if(s.listings_live!==undefined) LISTINGS_LIVE=s.listings_live;
+  // Sales/price/on-chain data keep flowing even when the order book is login-gated, so a
+  // gated order book is NOT a "reconnecting" state — don't cry wolf in the header.
   const staleMs = s.last_success ? (Date.now()-new Date(s.last_success)) : Infinity;
-  const persistent = (s.fail_streak||0) >= 3 && staleMs > 4*60*1000;
+  const persistent = LISTINGS_LIVE!==false && (s.fail_streak||0) >= 3 && staleMs > 4*60*1000;
   $("#status").innerHTML = persistent
     ? `<span class="dot err"></span>reconnecting to kintara… <span class="mut">data ${s.last_success?ago(s.last_success)+' old':'unavailable'}</span>`
     : "";
+}
+/* Kintara login-gated its live-listings API (2026-07-28). Everything price-related still works
+   from completed-sale data, but the order-book-only views (live asks, arbitrage) can't. Explain
+   that in place rather than showing an empty table that reads as broken. */
+let LISTINGS_LIVE=null;
+function orderBookNotice(extra){
+  return `<div class="empty" style="text-align:left;max-width:760px;margin:0 auto;line-height:1.65">
+    <div style="font:700 15px var(--ui);color:var(--gold2);margin-bottom:6px">Kintara's live listings API now requires a login</div>
+    Kintara made <code>/api/marketplace/listings</code> private, so live <b>asks</b> (and anything
+    derived from them, like arbitrage) can't be read anymore. We re-check automatically and this page
+    will fill back in the moment it reopens.
+    <div style="margin-top:10px;color:var(--mut)">Still fully live from Kintara's public sale data:
+    <b>Index</b> prices (avg price actually paid), <b>market caps</b>, <b>Sales feed</b>,
+    <b>Gold price</b>, and on-chain <b>Market Watch</b> volume.</div>
+    ${extra?`<div style="margin-top:10px;color:var(--mut)">${extra}</div>`:''}
+  </div>`;
 }
 async function loadItems(){
   if(state.items.length) return;
@@ -7799,7 +7820,9 @@ async function loadArb(){
   const soldHdr = (dirA ? "sold KINS" : "sold gold")+(d.ref_day?` · ${d.ref_day.slice(5)}`:"");
   const intN = v => v==null ? "—" : Number(v).toLocaleString();
 
-  const table = (d.gold_rate==null) ?
+  const table = (LISTINGS_LIVE===false && !rows.length) ?
+    orderBookNotice("Arbitrage compares live <b>asks</b> across currencies, so it needs the order book specifically.")
+    : (d.gold_rate==null) ?
     `<div class="empty">Set the gold rate first: choose which item is tradeable gold above. Need at least one live KINS (token) listing of it.</div>`
     : (!rows.length ?
       `<div class="empty">Nothing matches the current filters. Clear the search, enable more categories, or turn off "profitable only".</div>`
@@ -7968,7 +7991,9 @@ async function loadMispricing(){
 
   const priceHdr = cur==="gold"?"price (gold)":cur==="kins"?"price ($KINS)":"price";
   const table = !rows.length
-    ? `<div class="empty">Nothing matches the current filters. Clear the search, enable more categories, or turn off "profitable only". (An item appears once it has a live listing and a recent recorded sale.)</div>`
+    ? (LISTINGS_LIVE===false
+        ? orderBookNotice("This scan compares live <b>asks</b> against recent sales, so it needs the order book specifically.")
+        : `<div class="empty">Nothing matches the current filters. Clear the search, enable more categories, or turn off "profitable only". (An item appears once it has a live listing and a recent recorded sale.)</div>`)
     : `<table><thead><tr>
         <th>item</th>
         <th class="num">${priceHdr}</th>
@@ -8120,7 +8145,7 @@ async function loadLive(){
   const rows=await (await fetch("/api/current?"+lqs())).json();
   if(TAB!=="live" || !$("#ltable") || myseq!==fstate.seq) return;   // tab changed or a newer fetch superseded this one — don't clobber
   $("#ltable").innerHTML = !rows.length
-    ? `<div class="empty">No live listings match.</div>`
+    ? (LISTINGS_LIVE===false ? orderBookNotice() : `<div class="empty">No live listings match.</div>`)
     : `<table><thead><tr><th>item</th><th>seller</th><th class="num">qty</th>
         <th class="num">price</th><th class="num">listed</th>
         </tr></thead><tbody>`+rows.map(r=>`<tr>

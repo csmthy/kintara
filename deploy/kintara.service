@@ -23,6 +23,9 @@ Environment=KINSCAN_TRUSTED_PROXY=127.0.0.1
 # 24/7 politeness (tweak if you ever see 403/429 in the logs)
 Environment=POLL_INTERVAL=90
 Environment=KINTARA_MIN_GAP=0.5
+# Unbuffered stdout so print() diagnostics reach journalctl immediately (Python buffers
+# ~8KB when stdout isn't a TTY, which previously hid startup/poller logs for hours).
+Environment=PYTHONUNBUFFERED=1
 # Optional personal config / secrets, kept OFF git on the data volume (survives deploys).
 # Put your ntfy topic here for the merchant donation-drive phone alert, e.g.:
 #   NOTIFY_NTFY_TOPIC=your-secret-topic
